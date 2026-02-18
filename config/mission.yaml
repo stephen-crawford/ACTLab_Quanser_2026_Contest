@@ -1,0 +1,118 @@
+# =============================================================================
+# Stage I Mission Configuration - ACC Self Driving Competition
+# =============================================================================
+# This file defines the mission goals per the Virtual Detailed Scenario:
+# https://quanser.github.io/student-competitions/events/common/Rules_and_Objectives/Virtual_Detailed_Scenario.html
+#
+# COORDINATE SYSTEM:
+# The scenario specifies QLabs world coordinates. Since Cartographer builds
+# its map starting from the car's initial position, we need to transform
+# QLabs coordinates to Cartographer's map frame.
+#
+# QCar2 spawn position in QLabs: [-1.205, -0.83], heading: -44.7 degrees
+# Transform: translate by (+1.205, +0.83), then rotate by +44.7 degrees
+#
+# SCENARIO REQUIREMENTS:
+# 1. Start at Taxi Hub Area - LED: Magenta
+# 2. Navigate to Pickup [0.125, 4.395] - LED: Green, then Blue when stopped
+# 3. Navigate to Dropoff [-0.905, 0.800] - LED: Orange when stopped
+# 4. Return to Taxi Hub Area - LED: Magenta
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Coordinate Transformation Parameters
+# -----------------------------------------------------------------------------
+# Set use_qlabs_coords: true to use QLabs world coordinates (recommended)
+# The mission_manager will transform them to map frame automatically
+use_qlabs_coords: true
+
+# QLabs to Map frame transformation parameters
+transform:
+  # Translation: where the car starts in QLabs
+  origin_x: -1.205
+  origin_y: -0.83
+  # Rotation: car's initial heading in QLabs (degrees)
+  origin_heading_deg: -44.7
+  # Empirically calibrated transform angle (radians) from reference repo.
+  # This accounts for actual SLAM heading vs nominal spawn heading.
+  # Overrides the degrees-based conversion when present.
+  origin_heading_rad: 0.7177
+
+# -----------------------------------------------------------------------------
+# Mission Locations (QLabs World Coordinates - as per scenario specification)
+# -----------------------------------------------------------------------------
+
+# Pickup location - where passengers board
+# Scenario specifies: [0.125, 4.395] meters
+pickup:
+  x: 0.125
+  y: 4.395
+  yaw: 1.57     # Face toward passenger boarding (90 degrees = +Y direction)
+
+# Dropoff location - destination
+# Scenario specifies: [-0.905, 0.800] meters
+dropoff:
+  x: -0.905
+  y: 0.800
+  yaw: 3.14     # Face -X direction (toward hub)
+
+# Hub: Starting/ending location (Taxi Hub Area)
+# This is where the QCar2 spawns
+hub:
+  x: -1.205
+  y: -0.83
+  yaw: -0.78    # -44.7 degrees initial heading
+
+# -----------------------------------------------------------------------------
+# Waypoints Configuration (QLabs World Coordinates)
+# -----------------------------------------------------------------------------
+# SIMPLIFIED: Let Nav2 plan the routes. Only use critical waypoints to ensure
+# the vehicle follows roads and doesn't cut across obstacles.
+#
+# QLabs Map Layout (based on Setup_Real_Scenario.py):
+# - Hub/Start: [-1.205, -0.83]
+# - Traffic light intersection around (0.15, 0.9)
+# - Stop signs at various locations
+# - Roundabout in upper area around (1.5, 3.3)
+# -----------------------------------------------------------------------------
+
+# Waypoints from hub TO pickup - simplified to key road points
+pickup_waypoints:
+  # WP1: Exit hub, reach main road heading north
+  - { x: -0.4, y: 0.5, yaw: 1.2 }
+  # WP2: Pass through intersection area (traffic lights at ~0.15, 0.9)
+  - { x: 0.0, y: 1.8, yaw: 1.57 }
+  # WP3: Continue north on main road
+  - { x: 0.1, y: 3.5, yaw: 1.57 }
+
+# Waypoints from pickup TO dropoff - go back through intersection
+dropoff_waypoints:
+  # WP1: Head south from pickup
+  - { x: 0.1, y: 3.0, yaw: -1.57 }
+  # WP2: Approach intersection from north
+  - { x: 0.0, y: 1.5, yaw: -1.57 }
+
+# Waypoints from dropoff back TO hub - direct path
+return_waypoints:
+  # WP1: Exit dropoff heading toward hub
+  - { x: -1.0, y: 0.2, yaw: -2.5 }
+
+# -----------------------------------------------------------------------------
+# Timing Parameters
+# -----------------------------------------------------------------------------
+
+# Stop dwell time at pickup/dropoff (seconds)
+# Simulates loading/unloading passengers - scenario requires full stop
+dwell_s: 3.0
+
+# Dwell at waypoints (seconds)
+# Set to 0 for drive-through waypoints, >0 for stop-and-go
+waypoint_dwell_s: 0.0
+
+# -----------------------------------------------------------------------------
+# Navigation Parameters
+# -----------------------------------------------------------------------------
+
+# Goal tolerance (m) - how close to get to each goal
+# Tightened for precise pickup/dropoff stops as required by scenario
+goal_tol_m: 0.25

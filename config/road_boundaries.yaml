@@ -1,0 +1,164 @@
+# =============================================================================
+# Road Boundary Definitions for SDCS Competition Track
+# =============================================================================
+# This file defines road boundaries as centerline + left/right widths for the
+# MPCC controller to use as constraints. All coordinates are in QLabs world
+# frame (same as mission.yaml).
+#
+# The road boundaries are represented as spline control points that define
+# the centerline of each road segment, along with variable left/right widths.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Global Road Parameters
+# -----------------------------------------------------------------------------
+
+# Default road half-width in meters (total road width ~0.60m for 1:10 scale)
+# INCREASED from 0.24 to give more driving room
+road_width: 0.30
+
+# QCar2 half-width for constraint margin (prevents wheel over edge)
+# REDUCED from 0.12 - vehicle is narrower than originally estimated
+vehicle_half_width: 0.08
+
+# Safety margin added to constraints (accounts for localization uncertainty)
+# REDUCED from 0.05 - localization is reasonably accurate
+safety_margin: 0.02
+
+# -----------------------------------------------------------------------------
+# Coordinate Transformation (same as mission.yaml)
+# -----------------------------------------------------------------------------
+transform:
+  origin_x: -1.205
+  origin_y: -0.83
+  origin_heading_deg: -44.7
+  # Empirically calibrated transform angle (radians) from reference repo.
+  origin_heading_rad: 0.7177
+
+# -----------------------------------------------------------------------------
+# Road Segments as Spline Control Points
+# -----------------------------------------------------------------------------
+# Each segment contains centerline points with:
+#   s: arc-length parameter (cumulative distance along segment)
+#   x, y: position in QLabs world coordinates
+#   width_left, width_right: half-widths from centerline to boundary
+#
+# The MPCC controller will interpolate between these points to get
+# boundary constraints at any path progress value.
+# -----------------------------------------------------------------------------
+
+road_segments:
+  # Main north-south road (from hub area going north toward pickup)
+  - name: "main_ns_road_north"
+    centerline:
+      - {s: 0.0, x: -0.5, y: 0.0, width_left: 0.30, width_right: 0.30}
+      - {s: 0.5, x: -0.4, y: 0.5, width_left: 0.30, width_right: 0.30}
+      - {s: 1.0, x: -0.3, y: 1.0, width_left: 0.30, width_right: 0.30}
+      - {s: 1.5, x: -0.3, y: 1.5, width_left: 0.30, width_right: 0.30}
+      - {s: 2.5, x: -0.2, y: 2.5, width_left: 0.30, width_right: 0.30}
+      - {s: 3.5, x: -0.15, y: 3.5, width_left: 0.30, width_right: 0.30}
+      - {s: 4.5, x: 0.0, y: 4.0, width_left: 0.30, width_right: 0.30}
+      - {s: 5.0, x: 0.125, y: 4.395, width_left: 0.30, width_right: 0.30}
+
+  # Road from pickup heading south (toward intersection)
+  - name: "main_ns_road_south"
+    centerline:
+      - {s: 0.0, x: 0.125, y: 4.395, width_left: 0.30, width_right: 0.30}
+      - {s: 0.5, x: 0.0, y: 4.0, width_left: 0.30, width_right: 0.30}
+      - {s: 1.0, x: 0.0, y: 3.5, width_left: 0.30, width_right: 0.30}
+      - {s: 2.0, x: -0.1, y: 2.5, width_left: 0.30, width_right: 0.30}
+      - {s: 3.0, x: -0.2, y: 2.0, width_left: 0.30, width_right: 0.30}
+      - {s: 4.0, x: -0.3, y: 1.5, width_left: 0.30, width_right: 0.30}
+      - {s: 4.5, x: -0.4, y: 1.2, width_left: 0.30, width_right: 0.30}
+
+  # Intersection area (wider for turns)
+  - name: "intersection"
+    type: "circular"
+    center: {x: 0.15, y: 0.9}
+    radius: 0.5
+    width: 0.30  # Wider for turning maneuvers
+
+  # Road from intersection to dropoff (heading west/southwest)
+  - name: "road_to_dropoff"
+    centerline:
+      - {s: 0.0, x: -0.3, y: 1.0, width_left: 0.30, width_right: 0.30}
+      - {s: 0.5, x: -0.5, y: 1.0, width_left: 0.30, width_right: 0.30}
+      - {s: 1.0, x: -0.7, y: 0.9, width_left: 0.30, width_right: 0.30}
+      - {s: 1.5, x: -0.905, y: 0.800, width_left: 0.30, width_right: 0.30}
+
+  # Road from dropoff back to hub
+  - name: "road_to_hub"
+    centerline:
+      - {s: 0.0, x: -0.905, y: 0.800, width_left: 0.30, width_right: 0.30}
+      - {s: 0.5, x: -0.8, y: 0.5, width_left: 0.30, width_right: 0.30}
+      - {s: 1.0, x: -0.8, y: 0.3, width_left: 0.30, width_right: 0.30}
+      - {s: 1.5, x: -0.9, y: 0.0, width_left: 0.30, width_right: 0.30}
+      - {s: 2.0, x: -1.0, y: -0.3, width_left: 0.30, width_right: 0.30}
+      - {s: 2.5, x: -1.1, y: -0.6, width_left: 0.30, width_right: 0.30}
+      - {s: 3.0, x: -1.205, y: -0.83, width_left: 0.30, width_right: 0.30}
+
+  # Hub area (wider for parking/maneuvering)
+  - name: "hub_area"
+    type: "circular"
+    center: {x: -1.205, y: -0.83}
+    radius: 0.4
+    width: 0.35  # Wider for parking maneuvers
+
+# -----------------------------------------------------------------------------
+# Traffic Control Locations
+# -----------------------------------------------------------------------------
+# Defines locations of traffic controls with stop line distances.
+# The stop_line_distance indicates how far before the control the vehicle
+# should stop (measured from the sign/light position).
+# -----------------------------------------------------------------------------
+
+traffic_controls:
+  # Traffic light at main intersection
+  - type: "traffic_light"
+    name: "intersection_light"
+    position: {x: 0.15, y: 0.9}
+    stop_line_distance: 0.3  # Stop 0.3m before intersection center
+    approach_angles: [1.57, -1.57, 0.0, 3.14]  # Headings that approach this light
+
+  # Stop sign near hub exit
+  - type: "stop_sign"
+    name: "hub_exit_stop"
+    position: {x: -0.5, y: 0.0}
+    stop_line_distance: 0.2  # Stop 0.2m before sign
+    approach_angles: [0.5]  # Heading when approaching from hub
+
+  # Potential yield/stop near intersection approach
+  - type: "stop_sign"
+    name: "intersection_approach_stop"
+    position: {x: -0.4, y: 1.1}
+    stop_line_distance: 0.2
+    approach_angles: [1.57, -2.5]
+
+# -----------------------------------------------------------------------------
+# Obstacle Zones (areas where obstacles are more likely)
+# -----------------------------------------------------------------------------
+# These zones can have reduced speed limits or increased caution.
+# -----------------------------------------------------------------------------
+
+obstacle_zones:
+  # Pedestrian crossing near pickup
+  - name: "pickup_crossing"
+    type: "rectangle"
+    center: {x: 0.0, y: 4.2}
+    width: 0.6
+    height: 0.3
+    max_velocity: 0.2  # Reduced speed in this zone
+
+  # Intersection area - watch for cross traffic
+  - name: "intersection_zone"
+    type: "circle"
+    center: {x: 0.15, y: 0.9}
+    radius: 0.6
+    max_velocity: 0.3
+
+  # Hub area - watch for pedestrians/other vehicles
+  - name: "hub_zone"
+    type: "circle"
+    center: {x: -1.205, y: -0.83}
+    radius: 0.5
+    max_velocity: 0.25
