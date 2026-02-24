@@ -1,0 +1,33 @@
+# YOLOv8 Dataset Configuration for QLabs Competition
+# 8 classes matching ACC2025_Quanser_Student_Competition model (best.pt)
+#
+# IMPORTANT: Class ordering MUST match the pretrained best.pt model.
+# Source: ACC2025_Quanser_Student_Competition/polyctrl/polyctrl/data.yaml
+#
+# Usage:
+#   1. Annotate images using Roboflow or CVAT with these class names
+#   2. Export in YOLO format to training/dataset/
+#   3. Run: python3 training/train.py
+#
+# Directory structure expected:
+#   training/dataset/
+#     train/
+#       images/
+#       labels/
+#     val/
+#       images/
+#       labels/
+
+path: dataset
+train: train/images
+val: val/images
+
+names:
+  0: cone
+  1: green
+  2: person
+  3: red
+  4: round
+  5: stop
+  6: yellow
+  7: yield

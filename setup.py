@@ -13,6 +13,11 @@ setup(
         ('share/' + package_name + '/config', [
             'config/mission.yaml',
             'config/road_boundaries.yaml',
+            'config/modules.yaml',
+        ]),
+        ('share/' + package_name + '/config/presets', [
+            'config/presets/default.yaml',
+            'config/presets/legacy_2025.yaml',
         ]),
         ('share/' + package_name + '/launch', [
             'launch/mission_launch.py',
@@ -24,6 +29,12 @@ setup(
             'scripts/run_stage1.sh',
             'scripts/run_stage1_dev.sh',
             'scripts/rebuild_docker.sh',
+        ]),
+        ('share/' + package_name + '/models', [
+            'models/.gitkeep',
+        ]),
+        ('share/' + package_name + '/training', [
+            'training/data.yaml',
         ]),
     ],
     install_requires=['setuptools', 'PyYAML'],
@@ -41,6 +52,9 @@ setup(
             'yolo_bridge = acc_stage1_mission.yolo_bridge:main',
             'mpcc_controller = acc_stage1_mission.mpcc_controller:main',
             'odom_from_tf = acc_stage1_mission.odom_from_tf:main',
+            'dashboard = acc_stage1_mission.dashboard:main',
+            'path_overlay = acc_stage1_mission.path_overlay:main',
+            'capture_data = training.capture_data:main',
         ],
     },
 )

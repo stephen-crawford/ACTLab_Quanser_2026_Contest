@@ -9,7 +9,7 @@
  *   2. Threshold for red (stop signs, red lights), green (green lights),
  *      orange (cones), yellow (yield signs)
  *   3. Find contours, classify shape (octagon, triangle, circle)
- *   4. State machine: stop sign timing, traffic light state, yield pause
+ *   4. State machine: stop sign timing, traffic light state (yield detected but not acted on)
  *   5. Publish /traffic_control_state (JSON) and /motion_enable (Bool)
  *
  * Subscriptions:
@@ -72,8 +72,8 @@ struct DetectorConfig {
     double light_min_aspect = 0.3;
     double light_max_aspect = 3.5;
 
-    // Minimum circularity for traffic light blobs
-    double light_min_circularity = 0.3;
+    // Minimum circularity for traffic light blobs (raised to reduce false positives)
+    double light_min_circularity = 0.5;
 
     // Distance estimation: focal_length * real_size / pixel_size
     // QCar2 camera: ~640x480, ~60 deg FOV
@@ -84,11 +84,9 @@ struct DetectorConfig {
 
     // Timing (seconds)
     double stop_sign_pause = 3.0;
-    double yield_sign_pause = 2.0;
     double stop_sign_cooldown = 5.0;
-    double yield_sign_cooldown = 5.0;
     double traffic_light_cooldown = 6.0;
-    double cross_waiting_timeout = 15.0;  // Max wait at red light
+    double cross_waiting_timeout = 8.0;   // Max wait at red light (short to prevent deadlock)
 
     // Detection persistence
     int detection_threshold = 2;     // Consecutive frames to trigger
@@ -150,7 +148,10 @@ public:
             std::chrono::milliseconds(100),
             std::bind(&SignDetectorNode::publish_state, this));
 
-        RCLCPP_INFO(this->get_logger(), "Sign detector started (HSV + contour)");
+        node_start_time_ = this->now().seconds();
+
+        RCLCPP_INFO(this->get_logger(),
+            "Sign detector started (HSV + contour) [v3 - anti-deadlock + startup gate]");
     }
 
 private:
@@ -188,6 +189,7 @@ private:
         detect_red_objects(hsv, frame, detections);
         detect_green_lights(hsv, frame, detections);
         detect_orange_cones(hsv, frame, detections);
+        detect_yield_signs(hsv, frame, detections);
 
         // Process detections through state machine
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -233,19 +235,26 @@ private:
             // Check circularity (4 * pi * area / perimeter^2)
             double circularity = (4.0 * M_PI * area) / (peri * peri);
 
+            // Aspect ratio of bounding box
+            double aspect = static_cast<double>(bbox.width) / std::max(1, bbox.height);
+
             if (vertices >= cfg_.stop_sign_min_vertices &&
                 vertices <= cfg_.stop_sign_max_vertices &&
-                circularity > 0.6) {
-                // Octagonal, high circularity -> stop sign
+                circularity > 0.5 && aspect > 0.7 && aspect < 1.4) {
+                // Octagonal/polygonal, roughly circular and square -> stop sign
+                // Stop signs have near-1.0 aspect ratio (square-ish)
                 det.type = SignType::STOP_SIGN;
                 det.distance = estimate_distance(bbox.width, cfg_.stop_sign_real_width);
                 det.confidence = std::min(1.0, area / 2000.0);
             } else if (circularity > cfg_.light_min_circularity &&
-                       bbox.width < frame.cols * 0.15) {
-                // Small circular red blob -> red traffic light
+                       bbox.width < frame.cols * 0.10 &&
+                       vertices <= 8) {
+                // Small, circular red blob with few vertices -> red traffic light
+                // Exclude shapes with many vertices (likely stop signs at distance)
+                // Exclude large blobs (likely signs, not light bulbs)
                 // Check if it's in the upper portion of the frame
                 double y_ratio = static_cast<double>(bbox.y) / frame.rows;
-                if (y_ratio < 0.7) {
+                if (y_ratio < 0.6) {
                     det.type = SignType::TRAFFIC_LIGHT_RED;
                     det.distance = estimate_distance(bbox.width, cfg_.light_real_width);
                     det.confidence = std::min(1.0, circularity);
@@ -283,8 +292,8 @@ private:
             // Green circular blob in upper part of frame -> green light
             double y_ratio = static_cast<double>(bbox.y) / frame.rows;
             if (circularity > cfg_.light_min_circularity &&
-                y_ratio < 0.7 &&
-                bbox.width < frame.cols * 0.15) {
+                y_ratio < 0.6 &&
+                bbox.width < frame.cols * 0.10) {
                 Detection det;
                 det.type = SignType::TRAFFIC_LIGHT_GREEN;
                 det.bbox = bbox;
@@ -328,6 +337,50 @@ private:
         }
     }
 
+    // ---- Yellow yield sign detection ----
+    void detect_yield_signs(const cv::Mat& hsv, const cv::Mat& /*frame*/,
+                            std::vector<Detection>& detections) {
+        cv::Mat yellow_mask;
+        cv::inRange(hsv, cfg_.yellow_lower, cfg_.yellow_upper, yellow_mask);
+
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+        cv::morphologyEx(yellow_mask, yellow_mask, cv::MORPH_OPEN, kernel);
+        cv::morphologyEx(yellow_mask, yellow_mask, cv::MORPH_CLOSE, kernel);
+
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(yellow_mask, contours, cv::RETR_EXTERNAL,
+                         cv::CHAIN_APPROX_SIMPLE);
+
+        for (const auto& cnt : contours) {
+            double area = cv::contourArea(cnt);
+            if (area < cfg_.min_contour_area || area > cfg_.max_contour_area)
+                continue;
+
+            cv::Rect bbox = cv::boundingRect(cnt);
+
+            // Approximate polygon — yield signs are triangular
+            std::vector<cv::Point> approx;
+            double peri = cv::arcLength(cnt, true);
+            cv::approxPolyDP(cnt, approx, 0.04 * peri, true);
+            int vertices = static_cast<int>(approx.size());
+
+            if (vertices >= cfg_.yield_min_vertices &&
+                vertices <= cfg_.yield_max_vertices) {
+                // Triangular yellow shape -> yield sign
+                // Check aspect ratio (yield signs are roughly equilateral)
+                double aspect = static_cast<double>(bbox.width) / std::max(bbox.height, 1);
+                if (aspect > 0.5 && aspect < 2.0) {
+                    Detection det;
+                    det.type = SignType::YIELD_SIGN;
+                    det.bbox = bbox;
+                    det.distance = estimate_distance(bbox.width, cfg_.stop_sign_real_width);
+                    det.confidence = std::min(1.0, area / 1500.0);
+                    detections.push_back(det);
+                }
+            }
+        }
+    }
+
     // ---- Distance estimation from bounding box width ----
     double estimate_distance(int bbox_width, double real_width) {
         if (bbox_width <= 0) return 10.0;
@@ -338,12 +391,28 @@ private:
     void process_detections(const std::vector<Detection>& detections) {
         double now = this->now().seconds();
 
+        // Post-action suppression: after completing a stop/light action,
+        // ignore all detections briefly so the vehicle can drive away from
+        // the sign. This prevents the deadlock where the stopped vehicle
+        // keeps seeing the same sign and never resumes.
+        if (now < post_action_suppress_until_) {
+            should_stop_ = false;
+            motion_enabled_ = true;
+            control_type_ = "none";
+            light_state_ = "unknown";
+            stop_distance_ = 0.0;
+            stop_duration_ = 0.0;
+            clear_frames_ = cfg_.clear_threshold;
+            return;
+        }
+
         // Find the most relevant detection of each type
-        Detection best_stop, best_red, best_green, best_cone;
+        Detection best_stop, best_red, best_green, best_cone, best_yield;
         best_stop.distance = 999.0;
         best_red.distance = 999.0;
         best_green.distance = 999.0;
         best_cone.distance = 999.0;
+        best_yield.distance = 999.0;
 
         for (const auto& det : detections) {
             switch (det.type) {
@@ -353,9 +422,19 @@ private:
                         best_stop = det;
                     }
                     break;
-                case SignType::TRAFFIC_LIGHT_RED:
-                    if (det.distance < best_red.distance &&
+                case SignType::YIELD_SIGN:
+                    if (det.distance < best_yield.distance &&
                         det.distance < cfg_.sign_stop_distance) {
+                        best_yield = det;
+                    }
+                    break;
+                case SignType::TRAFFIC_LIGHT_RED:
+                    // Only consider red lights that are NOT also near a stop sign
+                    // (red octagonal stop signs can be misclassified as red lights)
+                    if (det.distance < best_red.distance &&
+                        det.distance < cfg_.sign_stop_distance &&
+                        !(stop_sign_cooldown_start_ > 0 &&
+                          (now - stop_sign_cooldown_start_) < cfg_.stop_sign_cooldown)) {
                         best_red = det;
                     }
                     break;
@@ -386,7 +465,11 @@ private:
             bool is_new_sign = !last_stop_bbox_valid_ ||
                 std::abs(bbox_center_y - last_stop_bbox_y_) > cfg_.stop_sign_bbox_threshold;
 
-            if (is_new_sign || (now - stop_sign_cooldown_start_) > cfg_.stop_sign_cooldown) {
+            // Only detect if not on cooldown
+            bool on_cooldown = stop_sign_cooldown_start_ > 0 &&
+                (now - stop_sign_cooldown_start_) < cfg_.stop_sign_cooldown;
+
+            if ((is_new_sign || !on_cooldown) && !on_cooldown) {
                 stop_detect_frames_++;
                 if (stop_detect_frames_ >= cfg_.detection_threshold && !at_stop_sign_) {
                     at_stop_sign_ = true;
@@ -409,7 +492,14 @@ private:
                 stop_wait_complete_ = true;
                 at_stop_sign_ = false;
                 stop_sign_cooldown_start_ = now;
-                RCLCPP_INFO(this->get_logger(), "Stop sign wait complete, resuming");
+                // Force immediate resume and suppress detections
+                should_stop_ = false;
+                motion_enabled_ = true;
+                post_action_suppress_until_ = now + POST_ACTION_SUPPRESS_S;
+                RCLCPP_INFO(this->get_logger(),
+                    "Stop sign wait complete, resuming (suppressing for %.1fs)",
+                    POST_ACTION_SUPPRESS_S);
+                return;  // Skip rest of detection logic this frame
             } else {
                 any_stop_trigger = true;
                 should_stop_ = true;
@@ -420,8 +510,39 @@ private:
             }
         }
 
+        // --- Yield sign logic ---
+        // Reference code (PolyCtrl 2025) ignores yield signs entirely — the YOLO
+        // model detects them but MPC_node.py never acts on them. The competition
+        // "failure to yield" infraction only applies when conflicting traffic is
+        // present, and the scenario has no conflicting vehicle traffic at yield signs.
+        // The yield sign near the hub at QLabs (0.0, -1.3) was causing an unnecessary
+        // 2-second stop at startup before the vehicle even began driving.
+        //
+        // We log yield detections for awareness but do NOT stop.
+        if (best_yield.type == SignType::YIELD_SIGN && !any_stop_trigger) {
+            yield_detect_frames_++;
+            if (yield_detect_frames_ >= cfg_.detection_threshold) {
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "Yield sign seen at %.2fm (not stopping — reference behavior)",
+                    best_yield.distance);
+                yield_detect_frames_ = 0;  // Reset to prevent log spam
+            }
+        } else {
+            yield_detect_frames_ = 0;
+        }
+
         // --- Traffic light logic ---
-        if (best_red.type == SignType::TRAFFIC_LIGHT_RED && !any_stop_trigger) {
+        // Startup gate: ignore red lights for the first N seconds (reference: self.jaman)
+        // The vehicle starts at hub and needs to drive before encountering real traffic lights
+        double time_since_start = now - node_start_time_;
+        if (best_red.type == SignType::TRAFFIC_LIGHT_RED && !any_stop_trigger &&
+            time_since_start <= RED_LIGHT_STARTUP_DELAY_S) {
+            // Startup gate: ignore red light during startup period
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "Ignoring red light during startup gate (%.0f/%.0fs)",
+                time_since_start, RED_LIGHT_STARTUP_DELAY_S);
+        } else if (best_red.type == SignType::TRAFFIC_LIGHT_RED && !any_stop_trigger &&
+            time_since_start > RED_LIGHT_STARTUP_DELAY_S) {
             red_detect_frames_++;
             green_detect_frames_ = 0;
 
@@ -430,8 +551,25 @@ private:
                     cross_waiting_ = true;
                     cross_waiting_start_ = now;
                     cross_no_red_frames_ = 0;
-                    RCLCPP_INFO(this->get_logger(), "RED LIGHT detected at %.2fm",
-                                best_red.distance);
+                    RCLCPP_INFO(this->get_logger(), "RED LIGHT detected at %.2fm (%.0fs after startup)",
+                                best_red.distance, time_since_start);
+                }
+                // Timeout even while red is still visible — prevents permanent deadlock
+                // when red light stays in view (e.g., approaching intersection on hub_to_pickup)
+                if (cross_waiting_ &&
+                    (now - cross_waiting_start_) > cfg_.cross_waiting_timeout) {
+                    cross_waiting_ = false;
+                    should_stop_ = false;
+                    motion_enabled_ = true;
+                    // Use longer suppression so vehicle drives well past the light
+                    post_action_suppress_until_ = now + TRAFFIC_LIGHT_SUPPRESS_S;
+                    cross_cooldown_ = true;
+                    cross_cooldown_start_ = now;
+                    RCLCPP_WARN(this->get_logger(),
+                        "Red light timeout (%.0fs, still visible), "
+                        "force-resuming (suppressing for %.1fs)",
+                        cfg_.cross_waiting_timeout, TRAFFIC_LIGHT_SUPPRESS_S);
+                    return;
                 }
             }
         } else if (best_green.type == SignType::TRAFFIC_LIGHT_GREEN && !any_stop_trigger) {
@@ -442,7 +580,14 @@ private:
                 cross_waiting_ = false;
                 cross_cooldown_ = true;
                 cross_cooldown_start_ = now;
-                RCLCPP_INFO(this->get_logger(), "GREEN LIGHT detected, resuming");
+                // Force immediate resume and suppress
+                should_stop_ = false;
+                motion_enabled_ = true;
+                post_action_suppress_until_ = now + TRAFFIC_LIGHT_SUPPRESS_S;
+                RCLCPP_INFO(this->get_logger(),
+                    "GREEN LIGHT detected, resuming (suppressing for %.1fs)",
+                    TRAFFIC_LIGHT_SUPPRESS_S);
+                return;
             }
         } else if (!any_stop_trigger) {
             // No traffic light detected
@@ -451,15 +596,28 @@ private:
                 // Auto-expire if no red detected for ~2s (60 frames at 30Hz)
                 if (cross_no_red_frames_ > 60) {
                     cross_waiting_ = false;
+                    should_stop_ = false;
+                    motion_enabled_ = true;
+                    post_action_suppress_until_ = now + TRAFFIC_LIGHT_SUPPRESS_S;
+                    cross_cooldown_ = true;
+                    cross_cooldown_start_ = now;
                     RCLCPP_INFO(this->get_logger(),
-                        "Red light lost for 2s, resuming");
+                        "Red light lost for 2s, resuming (suppressing for %.1fs)",
+                        TRAFFIC_LIGHT_SUPPRESS_S);
+                    return;
                 }
                 // Timeout safety
                 if ((now - cross_waiting_start_) > cfg_.cross_waiting_timeout) {
                     cross_waiting_ = false;
+                    should_stop_ = false;
+                    motion_enabled_ = true;
+                    post_action_suppress_until_ = now + TRAFFIC_LIGHT_SUPPRESS_S;
+                    cross_cooldown_ = true;
+                    cross_cooldown_start_ = now;
                     RCLCPP_WARN(this->get_logger(),
-                        "Red light timeout (%.0fs), resuming",
-                        cfg_.cross_waiting_timeout);
+                        "Red light timeout (%.0fs, lost), resuming (suppressing for %.1fs)",
+                        cfg_.cross_waiting_timeout, TRAFFIC_LIGHT_SUPPRESS_S);
+                    return;
                 }
             }
             red_detect_frames_ = 0;
@@ -578,11 +736,29 @@ private:
     int red_detect_frames_ = 0;
     int green_detect_frames_ = 0;
 
+    // Yield sign state
+    // Yield sign state removed — yield signs are detected but not acted on
+    // (matches reference code behavior; see yield logic comment in process_detections)
+    int yield_detect_frames_ = 0;
+
     // Cone state
     int cone_detect_frames_ = 0;
 
     // Clear hysteresis
     int clear_frames_ = 0;
+
+    // Post-action suppression: after completing a stop or light wait,
+    // suppress all detections briefly so the vehicle can drive away
+    double post_action_suppress_until_ = 0.0;
+    static constexpr double POST_ACTION_SUPPRESS_S = 3.0;
+    static constexpr double TRAFFIC_LIGHT_SUPPRESS_S = 12.0;  // Suppression after traffic light action (must be > controller's 10s cooldown)
+
+    // Startup gate: ignore red light detections for the first N seconds.
+    // Matches reference code's approach (self.jaman) — the vehicle starts at hub
+    // and needs to drive to the first intersection before red lights are relevant.
+    // Also prevents false red-light detections on distant objects during startup.
+    static constexpr double RED_LIGHT_STARTUP_DELAY_S = 15.0;
+    double node_start_time_ = 0.0;
 };
 
 // ============================================================================

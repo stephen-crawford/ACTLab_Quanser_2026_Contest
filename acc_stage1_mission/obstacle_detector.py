@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Enhanced Obstacle Detector for ACC Competition
 
@@ -19,6 +21,7 @@ Configuration:
 - Supports both YOLO (GPU) and fallback color detection (CPU)
 """
 
+import os
 import time
 import math
 import json
@@ -31,6 +34,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
+import tf2_ros
+from tf2_ros import TransformException
 
 # Import traffic control state message classes
 from acc_stage1_mission.traffic_control_state import (
@@ -38,17 +43,21 @@ from acc_stage1_mission.traffic_control_state import (
     ObstaclePosition,
     ObstaclePositions,
 )
+from acc_stage1_mission.road_boundaries import RoadBoundarySpline
+from acc_stage1_mission.pedestrian_tracker import PedestrianKalmanTracker
+from acc_stage1_mission.detection_interface import DetectorBackend, Detection
+from acc_stage1_mission.module_config import load_module_config
+
+# Camera horizontal FOV for QCar2 (~60 degrees)
+CAMERA_HFOV_RAD = math.radians(60.0)
 
 # =============================================================================
 # DETECTION CONFIGURATION - EDIT THESE TO TUNE BEHAVIOR
 # Thresholds matched to reference repo (MPC_node.py) for QLabs environment.
 # =============================================================================
 DETECTION_CONFIG = {
-    # Detection distances (meters) - stop if object closer than this
-    'pedestrian_stop_distance': 1.0,
-    'cone_stop_distance': 0.6,
-    'vehicle_stop_distance': 0.8,
-    'sign_stop_distance': 0.9,
+    # Reference repo approach: confidence IS the distance proxy.
+    # Higher confidence = closer/larger object. No distance thresholds for stop decisions.
 
     # Confidence thresholds - tuned for COCO YOLOv8n on QLabs-rendered objects.
     # COCO detections on QLabs signs/lights typically reach ~0.3-0.6.
@@ -64,20 +73,21 @@ DETECTION_CONFIG = {
 
     # Timing (seconds) - tuned for QLabs competition
     'stop_sign_pause': 3.0,        # Stop duration at stop sign (competition requires full stop)
-    'yield_sign_pause': 2.0,       # Yield sign pause (competition: -2 stars for failure to yield)
-    'pedestrian_clear_delay': 1.0,
-    'stop_sign_cooldown': 5.0,     # Per-sign spatial cooldown (was 15s global - too aggressive)
-    'yield_sign_cooldown': 5.0,    # Per-sign spatial cooldown
-    'traffic_light_cooldown': 6.0, # After green: ignore reds for 6s (was 10s - too long)
+    'stop_sign_cooldown': 15.0,    # Per-sign cooldown (reference: 15s)
+    'traffic_light_cooldown': 6.0, # After green: ignore reds for 6s
+    'detection_cooldown': 15.0,    # General cooldown for same detection class
 
     # YOLO settings
     'yolo_classes': [0, 2, 9, 11, 33],  # COCO: person, car, traffic light, stop sign, sports ball
     'image_width': 640,
     'image_height': 480,
 
-    # Custom YOLO model path (QLabs-trained, 8 classes)
+    # Custom YOLO model path (QLabs-trained, 9 classes)
     # Will be searched in order; first found wins
     'custom_model_paths': [
+        # Package-relative paths (set at runtime in _init_yolo)
+        # Source tree path
+        # Existing reference paths (backward compat)
         '/workspaces/isaac_ros-dev/ros2/src/polyctrl/polyctrl/best.pt',
         '/workspaces/isaac_ros-dev/ros2/src/acc_stage1_mission/models/best.pt',
     ],
@@ -87,10 +97,6 @@ DETECTION_CONFIG = {
     'cone_hsv_lower': [5, 150, 150],
     'cone_hsv_upper': [15, 255, 255],
 
-    # CAMERA MASK
-    'mask_bottom_fraction': 0.18,
-    'mask_left_fraction': 0.0,
-    'mask_right_fraction': 0.0,
 }
 
 # COCO YOLO class name mapping - only competition-relevant classes
@@ -106,15 +112,16 @@ YOLO_CLASSES = {
 }
 
 # Custom QLabs-trained YOLO model class mapping (8 classes)
+# Matches ACC2025_Quanser_Student_Competition/polyctrl/polyctrl/data.yaml
 CUSTOM_YOLO_CLASSES = {
     0: 'cone',
     1: 'green',     # Green traffic light
-    2: 'red',       # Red traffic light
-    3: 'yellow',    # Yellow traffic light
-    4: 'stop',      # Stop sign
-    5: 'yield',     # Yield sign
-    6: 'round',     # Roundabout sign
-    7: 'person',    # Pedestrian
+    2: 'person',    # Pedestrian
+    3: 'red',       # Red traffic light
+    4: 'round',     # Roundabout sign
+    5: 'stop',      # Stop sign
+    6: 'yellow',    # Yellow traffic light
+    7: 'yield',     # Yield sign
 }
 
 # Whitelist of allowed class names - detections not in this set are discarded
@@ -123,19 +130,102 @@ ALLOWED_CLASSES = {
     'traffic light', 'stop sign', 'sports ball',
     'traffic_cone', 'yield sign',                    # From color detection
     'traffic_light_red', 'traffic_light_green',      # From color detection
+    'traffic_light_yellow',                          # From custom model
     # Custom model classes
     'cone', 'green', 'red', 'yellow', 'stop', 'yield', 'round',
 }
+
+
+# =============================================================================
+# DETECTION BACKENDS — Wrap existing detection methods as DetectorBackend
+# implementations. Each returns list of dicts (legacy format); the
+# ObstacleDetector node converts to Detection objects as needed.
+# The backends are instantiated inside the node to access YOLO models,
+# config, and depth images.
+# =============================================================================
+
+class _HSVBackend(DetectorBackend):
+    """HSV+Contour color detection backend (CPU-friendly).
+
+    Wraps ObstacleDetector._color_detect(). Does not require YOLO/GPU.
+    Benchmark: F1=0.429, 1.82ms average latency.
+    """
+    name = "hsv"
+
+    def __init__(self, node: 'ObstacleDetector'):
+        self._node = node
+
+    def detect(self, image: np.ndarray) -> list:
+        return self._node._color_detect()
+
+
+class _YOLOBackend(DetectorBackend):
+    """YOLO detection backend (custom or COCO model).
+
+    Wraps ObstacleDetector._yolo_detect(). Requires ultralytics.
+    """
+    name = "yolo"
+
+    def __init__(self, node: 'ObstacleDetector'):
+        self._node = node
+
+    def detect(self, image: np.ndarray) -> list:
+        return self._node._yolo_detect()
+
+
+class _HybridBackend(DetectorBackend):
+    """Hybrid HSV pre-filter + YOLO verification backend.
+
+    Wraps ObstacleDetector._hybrid_detect(). Falls back to HSV-only
+    when YOLO is unavailable.
+    """
+    name = "hybrid"
+
+    def __init__(self, node: 'ObstacleDetector'):
+        self._node = node
+
+    def detect(self, image: np.ndarray) -> list:
+        return self._node._hybrid_detect()
+
+
+class _AutoBackend(DetectorBackend):
+    """Auto-selection backend: custom YOLO -> COCO YOLO -> HSV fallback.
+
+    Wraps the original _dispatch_detect() 'auto' logic.
+    """
+    name = "auto"
+
+    def __init__(self, node: 'ObstacleDetector'):
+        self._node = node
+
+    def detect(self, image: np.ndarray) -> list:
+        if self._node._yolo is not None:
+            return self._node._yolo_detect()
+        elif DETECTION_CONFIG['use_color_fallback']:
+            return self._node._color_detect()
+        return []
 
 
 class ObstacleDetector(Node):
     """
     ROS2 node for obstacle detection using YOLO and/or color detection.
 
-    To modify detection behavior:
-    1. Edit DETECTION_CONFIG above
-    2. Override methods like _process_pedestrian(), _process_cone(), etc.
-    3. Add new detection types by extending _process_detections()
+    Detection backends are selected via the detection_mode ROS parameter
+    or config/modules.yaml. All backends implement the DetectorBackend ABC
+    from detection_interface.py.
+
+    Available backends:
+      - 'auto' (default): custom model -> COCO YOLO -> HSV fallback
+      - 'hsv':       HSV+Contour color detection (F1=0.429, 1.82ms)
+      - 'yolo_coco': Force COCO YOLOv8n
+      - 'custom':    Force custom QLabs-trained model
+      - 'hybrid':    HSV pre-filter -> YOLO verification on crops
+      - 'hough_hsv': HoughCircles for lights + HSV for signs/cones (F1=0.444, 3.65ms)
+
+    To switch backend:
+      ROS param:   detection_mode:=hsv
+      Launch arg:  ros2 launch ... detection_mode:=hough_hsv
+      Config file: config/modules.yaml -> detection.backend
     """
 
     def __init__(self):
@@ -146,17 +236,37 @@ class ObstacleDetector(Node):
         self.declare_parameter('debug_visualization', True)
         self.declare_parameter('camera_topic', '/camera/color_image')
         self.declare_parameter('depth_topic', '/camera/depth_image')
+        self.declare_parameter('detection_mode', 'auto')  # auto|yolo_coco|custom|hsv|hybrid
 
         self._use_yolo = self.get_parameter('use_yolo').value
         self._debug_viz = self.get_parameter('debug_visualization').value
         self._camera_topic = self.get_parameter('camera_topic').value
         self._depth_topic = self.get_parameter('depth_topic').value
+        self._detection_mode = self.get_parameter('detection_mode').value
+
+        # Resolve detection_mode from modules.yaml when param is 'auto'
+        if self._detection_mode == 'auto':
+            try:
+                mod_config = load_module_config()
+                yaml_backend = mod_config['detection']['backend']
+                if yaml_backend != 'auto':
+                    self._detection_mode = yaml_backend
+                    self.get_logger().info(
+                        f"Detection mode from modules.yaml: {yaml_backend}")
+            except Exception:
+                pass  # Keep 'auto' default
 
         # Initialize YOLO if available
         self._yolo = None
+        self._yolo_coco = None  # Separate COCO model for hybrid mode
         self._depth_aligner = None
         if self._use_yolo:
             self._init_yolo()
+
+        # Set up active detection backend
+        self._active_backend = self._create_backend(self._detection_mode)
+        self.get_logger().info(
+            f"Active detection backend: {self._active_backend.name}")
 
         # State tracking
         self._motion_enabled = True
@@ -197,6 +307,40 @@ class ObstacleDetector(Node):
         self._last_stop_sign_bbox_y = None  # Y center of last detected stop sign
         self._stop_sign_bbox_threshold = 50  # Pixel difference to consider a "new" sign
 
+        # Yield sign post-action suppression: after yielding, suppress re-detection
+        # for a duration so the vehicle can drive past the sign without re-triggering
+        self._yield_suppress_until = 0.0  # Timestamp until yield sign detection is suppressed
+        self._yield_suppress_duration = 8.0  # Seconds to suppress after yielding
+        self._yield_active = False  # Currently yielding (waiting for pedestrian to clear)
+
+        self._image_width = DETECTION_CONFIG.get('image_width', 640)
+
+        # TF listener for vehicle pose in map frame (for pedestrian road-boundary checks)
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        self._vehicle_x = 0.0
+        self._vehicle_y = 0.0
+        self._vehicle_theta = 0.0
+        self._has_vehicle_pose = False
+
+        # Road boundaries for map-based pedestrian filtering
+        self._road_boundaries = None
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            pkg_share = get_package_share_directory('acc_stage1_mission')
+            boundary_path = os.path.join(pkg_share, 'config', 'road_boundaries.yaml')
+            if os.path.exists(boundary_path):
+                self._road_boundaries = RoadBoundarySpline(boundary_path)
+                self.get_logger().info(f"Loaded road boundaries from {boundary_path}")
+        except Exception as e:
+            self.get_logger().warn(f"Could not load road boundaries: {e}")
+
+        # Kalman filter pedestrian tracker (smooths noisy depth, tracks crossing)
+        self._ped_tracker = PedestrianKalmanTracker(self._road_boundaries)
+
+        # Mission phase tracking
+        self._mission_phase = "unknown"  # "pickup", "dropoff", "hub", "unknown"
+
         # CV Bridge for image conversion
         self._bridge = CvBridge()
         self._latest_rgb = None
@@ -225,6 +369,10 @@ class ObstacleDetector(Node):
             self._depth_sub = self.create_subscription(
                 Image, self._depth_topic, self._depth_callback, qos)
 
+        # Mission status subscriber — tracks which leg we're on
+        self._mission_status_sub = self.create_subscription(
+            String, 'mission/status', self._mission_status_callback, 10)
+
         # Main processing timer
         self._timer = self.create_timer(1.0/30.0, self._process_frame)
 
@@ -233,7 +381,8 @@ class ObstacleDetector(Node):
 
         self.get_logger().info(
             f"ObstacleDetector initialized - YOLO: {self._yolo is not None}, "
-            f"Debug viz: {self._debug_viz}"
+            f"Debug viz: {self._debug_viz}, "
+            f"detection_mode: {self._detection_mode}"
         )
 
     def _init_yolo(self):
@@ -246,10 +395,26 @@ class ObstacleDetector(Node):
         try:
             from ultralytics import YOLO
             import os
+            from ament_index_python.packages import get_package_share_directory
+
+            # Build search paths for custom model
+            model_search_paths = []
+            try:
+                pkg_share = get_package_share_directory('acc_stage1_mission')
+                model_search_paths.append(
+                    os.path.join(pkg_share, 'models', 'best.pt'))
+            except Exception:
+                pass
+            # Source tree path (relative to this file)
+            model_search_paths.append(
+                os.path.join(os.path.dirname(__file__), '..', 'models', 'best.pt'))
+            # Existing reference paths from config (backward compat)
+            model_search_paths.extend(
+                DETECTION_CONFIG.get('custom_model_paths', []))
 
             # Try custom QLabs-trained model first
             custom_model_path = None
-            for path in DETECTION_CONFIG.get('custom_model_paths', []):
+            for path in model_search_paths:
                 if os.path.isfile(path):
                     custom_model_path = path
                     break
@@ -264,10 +429,17 @@ class ObstacleDetector(Node):
                 self._yolo = YOLO(model_size)
                 model_desc = f"COCO {model_size}"
 
-            # Force CPU - RTX 5080 (sm_120) needs PyTorch with Python 3.10+ for CUDA support
+            # Try CUDA first (competition uses GPU), fall back to CPU
             self._yolo_device = 'cpu'
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self._yolo_device = 'cuda'
+            except ImportError:
+                pass
 
-            # Override thresholds for custom model (trained on QLabs, higher confidence)
+            # Override thresholds for custom model — values from competition repo
+            # (ACC2025_Quanser_Student_Competition MPC_node.py), tested with this best.pt
             if self._using_custom_model:
                 DETECTION_CONFIG['sign_confidence'] = 0.91
                 DETECTION_CONFIG['red_light_confidence'] = 0.83
@@ -275,9 +447,18 @@ class ObstacleDetector(Node):
                 DETECTION_CONFIG['pedestrian_confidence'] = 0.70
                 DETECTION_CONFIG['cone_confidence'] = 0.80
                 DETECTION_CONFIG['round_sign_confidence'] = 0.90
-                self.get_logger().info("Using custom model confidence thresholds")
+                self.get_logger().info("Using custom model confidence thresholds (from competition repo)")
 
-            self.get_logger().info(f"YOLO initialized: {model_desc}, device={self._yolo_device}")
+            # For hybrid mode, also load COCO model if using custom
+            if self._using_custom_model and self._detection_mode == 'hybrid':
+                try:
+                    self._yolo_coco = YOLO('yolov8n.pt')
+                    self.get_logger().info("Hybrid mode: loaded COCO model for verification")
+                except Exception:
+                    self._yolo_coco = None
+
+            self.get_logger().info(f"YOLO initialized: {model_desc}, device={self._yolo_device}, "
+                                   f"detection_mode={self._detection_mode}")
 
         except ImportError as e:
             self.get_logger().warn(f"YOLO not available: {e}")
@@ -287,47 +468,15 @@ class ObstacleDetector(Node):
     def _rgb_callback(self, msg: Image):
         """Store latest RGB image."""
         try:
-            self._latest_rgb = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
+            img = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
+            if img is None:
+                return
+            self._latest_rgb = img
+            self._image_width = img.shape[1]
         except Exception as e:
-            self.get_logger().error(f"RGB conversion failed: {e}")
-
-    def _get_detection_roi(self, image):
-        """
-        Get the region of interest for detection, excluding masked areas.
-        Returns (roi_image, y_offset) where y_offset is the top of the ROI.
-
-        This masks out the car's camera housing visible at the bottom of frame.
-        """
-        if image is None:
-            return None, 0
-
-        h, w = image.shape[:2]
-        cfg = DETECTION_CONFIG
-
-        # Calculate mask boundaries
-        top = 0
-        bottom = int(h * (1 - cfg.get('mask_bottom_fraction', 0.15)))
-        left = int(w * cfg.get('mask_left_fraction', 0))
-        right = int(w * (1 - cfg.get('mask_right_fraction', 0)))
-
-        # Extract ROI
-        roi = image[top:bottom, left:right]
-        return roi, top
-
-    def _bbox_in_masked_region(self, bbox, image_shape) -> bool:
-        """Check if a bounding box is primarily in the masked (ignored) region."""
-        if bbox is None:
-            return False
-
-        x, y, w, h = bbox
-        img_h, img_w = image_shape[:2]
-        cfg = DETECTION_CONFIG
-
-        # Check if bbox center is in bottom masked region
-        bbox_center_y = y + h / 2
-        mask_top = int(img_h * (1 - cfg.get('mask_bottom_fraction', 0.15)))
-
-        return bbox_center_y > mask_top
+            self.get_logger().warn_throttle(
+                self.get_clock(), 5000,
+                f"RGB conversion failed: {e}")
 
     def _depth_callback(self, msg: Image):
         """Store latest depth image."""
@@ -336,9 +485,96 @@ class ObstacleDetector(Node):
         except Exception as e:
             self.get_logger().error(f"Depth conversion failed: {e}")
 
+    def _mission_status_callback(self, msg: String):
+        """Track mission phase from mission_manager status."""
+        status = msg.data.lower()
+        if 'pickup' in status:
+            self._mission_phase = 'pickup'
+        elif 'dropoff' in status:
+            self._mission_phase = 'dropoff'
+        elif 'hub' in status:
+            self._mission_phase = 'hub'
+
+    def _update_vehicle_pose(self):
+        """Update vehicle pose from TF (map -> base_link)."""
+        for source, target in [('map', 'base_link'), ('odom', 'base_link')]:
+            try:
+                t = self._tf_buffer.lookup_transform(
+                    source, target,
+                    rclpy.time.Time(),
+                    rclpy.duration.Duration(seconds=0.02))
+                self._vehicle_x = t.transform.translation.x
+                self._vehicle_y = t.transform.translation.y
+                q = t.transform.rotation
+                siny = 2.0 * (q.w * q.z + q.x * q.y)
+                cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                self._vehicle_theta = math.atan2(siny, cosy)
+                self._has_vehicle_pose = True
+                return
+            except TransformException:
+                continue
+
+    def _det_to_map_position(self, det: dict) -> tuple[float, float] | None:
+        """Transform a detection to map (x, y) using depth camera + vehicle TF.
+
+        Returns (x_map, y_map) or None if position can't be determined.
+        """
+        if not self._has_vehicle_pose:
+            return None
+
+        bbox = det.get('bbox')
+        distance = det.get('distance')
+        if bbox is None or distance is None or distance <= 0:
+            return None
+
+        bx, by, bw, bh = bbox
+        bbox_cx = bx + bw / 2
+
+        # Use depth image for more accurate distance at bbox center
+        if self._latest_depth is not None:
+            cx_px = int(bx + bw / 2)
+            cy_px = int(by + bh / 2)
+            if 0 <= cy_px < self._latest_depth.shape[0] and 0 <= cx_px < self._latest_depth.shape[1]:
+                depth_val = float(self._latest_depth[cy_px, cx_px])
+                if 0.1 < depth_val < 10.0:
+                    distance = depth_val
+
+        img_w = self._image_width if self._image_width > 0 else 640
+        normalized = (bbox_cx - img_w / 2) / (img_w / 2)
+        lateral = normalized * distance * math.tan(CAMERA_HFOV_RAD / 2)
+
+        cos_t = math.cos(self._vehicle_theta)
+        sin_t = math.sin(self._vehicle_theta)
+        x_map = self._vehicle_x + distance * cos_t - lateral * sin_t
+        y_map = self._vehicle_y + distance * sin_t + lateral * cos_t
+        return (x_map, y_map)
+
+    def _update_pedestrian_tracker(self, detections: list):
+        """Feed pedestrian detections into the Kalman tracker.
+
+        Computes map positions for all pedestrian detections and updates
+        the tracker, which smooths positions and estimates velocity.
+        """
+        cfg = DETECTION_CONFIG
+        measurements = []
+        for det in detections:
+            if det['class'] != 'person':
+                continue
+            if det.get('confidence', 0) < cfg['pedestrian_confidence']:
+                continue
+            pos = self._det_to_map_position(det)
+            if pos is not None:
+                measurements.append(pos)
+
+        self._ped_tracker.predict()
+        self._ped_tracker.update(measurements)
+
     def _process_frame(self):
         """Main processing loop - runs at 30Hz."""
         current_time = time.time()
+
+        # Update vehicle pose for road boundary checks
+        self._update_vehicle_pose()
 
         # Check if we're in a timed pause
         if current_time < self._pause_until:
@@ -347,13 +583,11 @@ class ObstacleDetector(Node):
         if self._latest_rgb is None:
             return
 
-        # Run detection
-        detections = []
+        # Run detection based on detection_mode
+        detections = self._dispatch_detect()
 
-        if self._yolo is not None:
-            detections = self._yolo_detect()
-        elif DETECTION_CONFIG['use_color_fallback']:
-            detections = self._color_detect()
+        # Update Kalman tracker with pedestrian detections
+        self._update_pedestrian_tracker(detections)
 
         # Process detections and determine action
         self._current_detections = detections
@@ -472,10 +706,6 @@ class ObstacleDetector(Node):
                     x1, y1, x2, y2 = boxes.xyxy[i].tolist()
                     bbox = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
 
-                    # SKIP detections in the masked region (car's camera housing)
-                    if self._bbox_in_masked_region(bbox, img_shape):
-                        continue
-
                     # Estimate distance from depth image if available
                     distance = None
                     if depth is not None:
@@ -503,6 +733,110 @@ class ObstacleDetector(Node):
 
         return detections
 
+    def _create_backend(self, mode: str) -> DetectorBackend:
+        """Create detection backend from mode string.
+
+        Args:
+            mode: One of 'auto', 'hsv', 'yolo_coco', 'custom', 'hybrid', 'hough_hsv'.
+
+        Returns:
+            DetectorBackend instance.
+        """
+        if mode == 'hsv' or mode == 'hough_hsv':
+            return _HSVBackend(self)
+        elif mode == 'hybrid':
+            return _HybridBackend(self)
+        elif mode in ('yolo_coco', 'custom'):
+            if self._yolo is not None:
+                return _YOLOBackend(self)
+            # Fallback to HSV if YOLO not available
+            return _HSVBackend(self)
+        else:
+            # 'auto' mode
+            return _AutoBackend(self)
+
+    def _dispatch_detect(self) -> list:
+        """Dispatch detection to the active backend.
+
+        Returns list of detection dicts compatible with downstream processing.
+        """
+        return self._active_backend.detect(self._latest_rgb)
+
+    def _hybrid_detect(self) -> list:
+        """Hybrid detection: HSV pre-filter finds candidates, YOLO verifies on crops.
+
+        Pipeline:
+        1. Run HSV color detection to find candidate regions
+        2. For each candidate, extract a padded crop
+        3. Run YOLO on each crop to verify/reject
+        4. Merge results: verified detections get boosted confidence
+
+        Falls back to HSV-only if YOLO is unavailable.
+        """
+        # Step 1: HSV pre-filter
+        hsv_detections = self._color_detect()
+
+        if self._latest_rgb is None:
+            return hsv_detections
+
+        # Use COCO model if available for verification, else primary model
+        verify_model = self._yolo_coco if self._yolo_coco is not None else self._yolo
+        if verify_model is None:
+            return hsv_detections
+
+        h_img, w_img = self._latest_rgb.shape[:2]
+        verified = []
+
+        for det in hsv_detections:
+            bbox = det.get('bbox')
+            if bbox is None:
+                verified.append(det)
+                continue
+
+            bx, by, bw, bh = bbox
+            # Expand crop by 50% for YOLO context
+            margin_x = bw // 2
+            margin_y = bh // 2
+            cx1 = max(0, bx - margin_x)
+            cy1 = max(0, by - margin_y)
+            cx2 = min(w_img, bx + bw + margin_x)
+            cy2 = min(h_img, by + bh + margin_y)
+
+            crop = self._latest_rgb[cy1:cy2, cx1:cx2]
+            if crop.shape[0] < 10 or crop.shape[1] < 10:
+                verified.append(det)
+                continue
+
+            # Resize small crops to min YOLO input size
+            scale = max(1.0, 64.0 / min(crop.shape[:2]))
+            if scale > 1.0:
+                crop = cv2.resize(crop, None, fx=scale, fy=scale,
+                                  interpolation=cv2.INTER_LINEAR)
+
+            try:
+                results = verify_model(crop, verbose=False, conf=0.15,
+                                       device=self._yolo_device)
+                yolo_found = False
+                for result in results:
+                    if result.boxes is not None and len(result.boxes) > 0:
+                        yolo_found = True
+                        break
+
+                if yolo_found:
+                    # Both HSV and YOLO agree — boost confidence
+                    det['confidence'] = min(1.0, det['confidence'] * 1.3)
+                    verified.append(det)
+                else:
+                    # YOLO disagrees — keep with reduced confidence
+                    det['confidence'] *= 0.6
+                    if det['confidence'] >= 0.3:
+                        verified.append(det)
+            except Exception:
+                # YOLO failed on crop — trust HSV
+                verified.append(det)
+
+        return verified
+
     def _color_detect(self) -> list:
         """Fallback color-based detection (CPU-friendly)."""
         detections = []
@@ -510,20 +844,15 @@ class ObstacleDetector(Node):
         if self._latest_rgb is None:
             return detections
 
-        # Get ROI (excluding camera housing at bottom)
-        roi, y_offset = self._get_detection_roi(self._latest_rgb)
-        if roi is None:
-            return detections
-
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(self._latest_rgb, cv2.COLOR_BGR2HSV)
         height, width = hsv.shape[:2]
 
         # Detect orange cones
-        cone_detections = self._detect_orange_cones(hsv, y_offset)
+        cone_detections = self._detect_orange_cones(hsv)
         detections.extend(cone_detections)
 
         # Detect red signs (stop/yield)
-        sign_detections = self._detect_red_signs(hsv, y_offset)
+        sign_detections = self._detect_red_signs(hsv)
         detections.extend(sign_detections)
 
         # Detect traffic light state
@@ -691,24 +1020,24 @@ class ObstacleDetector(Node):
 
     def _estimate_distance_from_size(self, area: float, obj_type: str) -> float:
         """Estimate distance based on apparent object size.
-        Larger area = closer object. Tuned for earlier detection."""
+        Conservative: only report close when bbox is very large (at stop line)."""
         if obj_type == 'cone':
             if area > 5000: return 0.2
-            elif area > 2500: return 0.4
-            elif area > 1000: return 0.6
-            elif area > 400: return 0.8
+            elif area > 2500: return 0.3
+            elif area > 1000: return 0.5
             else: return 1.0
         elif obj_type == 'sign':
-            if area > 4000: return 0.3
-            elif area > 2000: return 0.5
-            elif area > 800: return 0.7
-            else: return 1.0
+            if area > 5000: return 0.2
+            elif area > 3000: return 0.4
+            elif area > 1500: return 0.6
+            else: return 1.5
         elif 'person' in obj_type:
-            if area > 25000: return 0.3
+            if area > 25000: return 0.2
+            elif area > 15000: return 0.4
             elif area > 10000: return 0.5
-            elif area > 4000: return 0.8
-            else: return 1.2
-        return 1.0
+            elif area > 5000: return 0.8
+            else: return 2.0
+        return 1.5
 
     def _is_different_stop_sign(self, det: dict) -> bool:
         """Check if this stop sign detection is a spatially different sign from the last one."""
@@ -725,18 +1054,12 @@ class ObstacleDetector(Node):
         """
         Process detections and decide whether to stop.
 
+        Reference repo approach: confidence IS the distance proxy.
+        High confidence = object is close/large enough to require action.
+        No distance thresholds for stop decisions.
+        Yield signs are ignored (reference repo doesn't handle them).
+
         Returns: (should_stop: bool, reason: str, pause_duration: float)
-
-        Traffic light state machine:
-        - RED (conf>=threshold) -> stop, set cross_waiting=True
-        - While cross_waiting: stay stopped until GREEN detected
-        - On GREEN -> proceed, enter cross_cooldown for 6s
-        - During cooldown: ignore red detections (prevents re-triggering same light)
-        - cross_waiting auto-expires after timeout or if no red seen for 2s
-
-        Stop sign detection:
-        - Uses per-sign spatial cooldown (bbox Y position) instead of global timer
-        - This allows detecting multiple stop signs in quick succession
         """
         current_time = time.time()
         cfg = DETECTION_CONFIG
@@ -749,67 +1072,52 @@ class ObstacleDetector(Node):
 
         # Track whether we see a red light this frame (for cross_waiting timeout)
         saw_red_this_frame = False
+        stop_sign_seen = False
 
         for det in detections:
             obj_class = det['class']
             confidence = det['confidence']
-            distance = det['distance']
 
-            # Discard implausibly close readings (depth noise, camera housing, self-detection)
-            if distance is not None and distance < 0.25:
+            # --- Confidence-only stop decisions (reference repo approach) ---
+
+            # Pedestrian — handled by Kalman tracker (checked after loop)
+            if obj_class == 'person':
                 continue
 
-            # Pedestrian detection
-            if obj_class == 'person':
-                if confidence >= cfg['pedestrian_confidence']:
-                    if distance is None or distance < cfg['pedestrian_stop_distance']:
-                        return True, f"Pedestrian detected (dist={distance})", 0
-
-            # Traffic cone detection
+            # Traffic cone — MPCC handles avoidance via /obstacle_positions
             elif obj_class in ['traffic_cone', 'sports ball', 'cone']:
-                if confidence >= cfg['cone_confidence']:
-                    if distance is None or distance < cfg['cone_stop_distance']:
-                        return True, f"Obstacle/cone detected (dist={distance})", 0
+                continue
 
-            # Stop sign - spatial cooldown instead of global timer
+            # Stop sign — confidence >= threshold means at the stop line
             elif obj_class in ['stop sign', 'stop']:
                 if confidence >= cfg['sign_confidence']:
-                    if distance is None or distance < cfg['sign_stop_distance']:
-                        # Skip if currently at a stop sign or just completed one
-                        if self._stop_sign_wait_complete:
+                    stop_sign_seen = True
+                    # Skip if currently at a stop sign or just completed one
+                    if self._stop_sign_wait_complete:
+                        continue
+                    if self._at_stop_sign:
+                        continue
+                    # Cooldown: check if this is a different sign
+                    last_time = self._last_detection_time.get('stop sign', 0)
+                    cooldown = cfg.get('stop_sign_cooldown', 15.0)
+                    if current_time - last_time < cooldown:
+                        if not self._is_different_stop_sign(det):
                             continue
-                        if self._at_stop_sign:
-                            continue
-                        # Spatial cooldown: check if this is a different sign
-                        last_time = self._last_detection_time.get('stop sign', 0)
-                        cooldown = cfg.get('stop_sign_cooldown', 5.0)
-                        if current_time - last_time < cooldown:
-                            # Within cooldown - only stop if it's a spatially different sign
-                            if not self._is_different_stop_sign(det):
-                                continue
-                        # Record this sign's position and trigger stop
-                        bbox = det.get('bbox')
-                        if bbox is not None:
-                            _, y, _, h = bbox
-                            self._last_stop_sign_bbox_y = y + h / 2
-                        self._last_detection_time['stop sign'] = current_time
-                        return True, "Stop sign detected", cfg['stop_sign_pause']
+                    # Record this sign's position and trigger stop
+                    bbox = det.get('bbox')
+                    if bbox is not None:
+                        _, y, _, h = bbox
+                        self._last_stop_sign_bbox_y = y + h / 2
+                    self._last_detection_time['stop sign'] = current_time
+                    return True, f"Stop sign (conf={confidence:.2f})", cfg['stop_sign_pause']
 
-            # Yield sign - spatial cooldown
+            # Yield sign — handled after loop (yield only if obstacle present)
             elif obj_class in ['yield sign', 'yield']:
-                if confidence >= cfg['sign_confidence']:
-                    if distance is None or distance < cfg['sign_stop_distance']:
-                        last_time = self._last_detection_time.get('yield sign', 0)
-                        cooldown = cfg.get('yield_sign_cooldown', 5.0)
-                        if current_time - last_time < cooldown:
-                            continue
-                        self._last_detection_time['yield sign'] = current_time
-                        return True, "Yield sign detected", cfg['yield_sign_pause']
+                continue
 
-            # Red traffic light
+            # Red traffic light — confidence >= threshold means close enough
             elif obj_class in ['traffic_light_red', 'red']:
                 if confidence >= cfg['red_light_confidence']:
-                    # During cooldown after green, ignore red detections
                     if self._cross_cooldown:
                         continue
                     saw_red_this_frame = True
@@ -817,13 +1125,12 @@ class ObstacleDetector(Node):
                         self._cross_waiting = True
                         self._cross_waiting_start = current_time
                     self._cross_waiting_no_red_frames = 0
-                    return True, "Red light detected", 0
+                    return True, f"Red light (conf={confidence:.2f})", 0
 
-            # Green traffic light
+            # Green traffic light — clear to go
             elif obj_class in ['traffic_light_green', 'green']:
                 if confidence >= cfg['green_light_confidence']:
                     if self._cross_waiting:
-                        # Was waiting at red -> green detected -> proceed
                         self._cross_waiting = False
                         self._cross_waiting_no_red_frames = 0
                         self._cross_cooldown = True
@@ -831,29 +1138,64 @@ class ObstacleDetector(Node):
                         self.get_logger().info(
                             "Traffic light GREEN - proceeding (cooldown %.0fs)" %
                             cfg.get('traffic_light_cooldown', 6.0))
-                    # Green means go - don't stop
                     continue
 
             # Round sign - informational only
             elif obj_class == 'round':
                 continue
 
-            # COCO 'traffic light' with unknown state - try HSV classification
-            # Do NOT blindly stop for unknown state (was causing false stops)
+            # COCO traffic light with unknown state
             elif obj_class == 'traffic light':
-                continue  # Skip - rely on HSV classification in _yolo_detect
+                continue
 
-            # Vehicle detection
+            # Vehicle detection — disabled for motion_enable to prevent false
+            # positives (own car reflections, parked cars). Obstacle avoidance
+            # is handled by MPCC via /obstacle_positions instead.
             elif obj_class == 'car':
-                if confidence >= cfg['vehicle_confidence']:
-                    if distance is None or distance < cfg['vehicle_stop_distance']:
-                        return True, f"Vehicle detected (dist={distance})", 0
+                continue
+
+        # Kalman tracker: check if any tracked pedestrian is on the road
+        ped_stop, ped_reason = self._ped_tracker.any_on_road()
+        if ped_stop:
+            return True, ped_reason, 0
+
+        # Yield sign: only yield for tracked pedestrians actually on the road.
+        # Post-action suppression prevents livelock from repeated detections.
+        has_yield = any(
+            d['class'] in ('yield sign', 'yield') and d['confidence'] >= cfg['sign_confidence']
+            for d in detections
+        )
+        if has_yield:
+            # Check post-action suppression first (prevents re-triggering after yield)
+            if current_time < self._yield_suppress_until:
+                pass  # Suppressed — vehicle is driving past the sign
+            elif ped_stop:
+                self._yield_active = True
+                self._last_detection_time['yield sign'] = current_time
+                return True, "Yield: pedestrian on road (tracked)", 0
+            elif self._yield_active:
+                # Pedestrian cleared while yielding — start suppression timer
+                self._yield_active = False
+                self._yield_suppress_until = current_time + self._yield_suppress_duration
+                self.get_logger().info(
+                    f"Yield sign: pedestrian cleared, suppressing for {self._yield_suppress_duration:.0f}s")
+        else:
+            # Yield sign no longer visible — if we were yielding, start suppression
+            if self._yield_active:
+                self._yield_active = False
+                self._yield_suppress_until = current_time + self._yield_suppress_duration
+                self.get_logger().info(
+                    f"Yield sign: out of view, suppressing for {self._yield_suppress_duration:.0f}s")
+
+        # Reset stop sign completion flag when sign goes out of view
+        if not stop_sign_seen and self._stop_sign_wait_complete:
+            self._stop_sign_wait_complete = False
+            self._at_stop_sign = False
 
         # If cross_waiting but no red detected this frame, track timeout
         if self._cross_waiting:
             if not saw_red_this_frame:
                 self._cross_waiting_no_red_frames += 1
-                # If no red seen for threshold frames (~2s), assume we've passed the light
                 if self._cross_waiting_no_red_frames >= self._cross_waiting_no_red_threshold:
                     self.get_logger().info("Traffic light: no red visible for 2s, assuming passed")
                     self._cross_waiting = False
@@ -861,7 +1203,6 @@ class ObstacleDetector(Node):
                     self._cross_cooldown = True
                     self._cross_cooldown_start = current_time
                     return False, "", 0
-            # Also check absolute timeout
             if current_time - self._cross_waiting_start > self._cross_waiting_timeout:
                 self.get_logger().info("Traffic light: cross_waiting timeout (15s), resuming")
                 self._cross_waiting = False
@@ -875,14 +1216,8 @@ class ObstacleDetector(Node):
         """
         Process detections for traffic control state.
 
-        Uses the reference repo's traffic light state machine:
-        - RED (conf>=0.83) -> stop, cross_waiting=True
-        - While cross_waiting: stay stopped until GREEN (conf>=0.84)
-        - On GREEN -> proceed, cross_cooldown for 10s
-        - During cooldown: ignore red detections
-
-        Args:
-            detections: List of detection dictionaries
+        Reference repo approach: confidence-only, no distance thresholds.
+        Yield signs are ignored (reference repo doesn't handle them).
 
         Returns:
             TrafficControlState with current traffic control information
@@ -891,31 +1226,30 @@ class ObstacleDetector(Node):
         cfg = DETECTION_CONFIG
         state = TrafficControlState()
 
+        # Check if traffic light cooldown has expired
+        if self._cross_cooldown:
+            cooldown_duration = cfg.get('traffic_light_cooldown', 6.0)
+            if current_time - self._cross_cooldown_start >= cooldown_duration:
+                self._cross_cooldown = False
+
         for det in detections:
             obj_class = det['class']
-            distance = det.get('distance')
             confidence = det.get('confidence', 0.0)
 
-            # Handle traffic light detections (custom model: 'red'/'green'; COCO+HSV: 'traffic_light_red'/'traffic_light_green')
+            # Red traffic light — confidence-only
             if obj_class in ('traffic_light_red', 'red'):
                 if confidence < cfg['red_light_confidence']:
                     continue
-                # During cooldown after green, ignore red
                 if self._cross_cooldown:
-                    cooldown_duration = cfg.get('traffic_light_cooldown', 10.0)
-                    if current_time - self._cross_cooldown_start < cooldown_duration:
-                        continue
-                    else:
-                        self._cross_cooldown = False
+                    continue
 
                 state.control_type = "traffic_light"
                 state.light_state = "red"
-                state.distance = distance if distance else 1.0
                 state.should_stop = True
                 state.stop_duration = 0.0
 
                 if self._last_traffic_light_state != "red":
-                    self.get_logger().info("Traffic light: RED - stopping")
+                    self.get_logger().info(f"Traffic light: RED (conf={confidence:.2f}) - stopping")
                     self._traffic_light_transition_time = current_time
                 self._last_traffic_light_state = "red"
                 self._cross_waiting = True
@@ -930,7 +1264,6 @@ class ObstacleDetector(Node):
 
                 state.control_type = "traffic_light"
                 state.light_state = "green"
-                state.distance = distance if distance else 1.0
                 state.should_stop = False
 
                 if self._cross_waiting:
@@ -944,76 +1277,67 @@ class ObstacleDetector(Node):
                 return state
 
             elif obj_class == 'traffic light':
-                # COCO YOLO detected traffic light but state unknown
-                # Do NOT stop for unknown state - rely on HSV color classification
                 continue
 
-            # Handle stop sign detections
+            # Stop sign — confidence-only
             elif obj_class in ('stop sign', 'stop'):
                 if confidence < cfg['sign_confidence']:
                     continue
 
-                # Spatial cooldown: check if this is a different sign
                 last_time = self._last_detection_time.get('stop sign', 0)
-                cooldown = cfg.get('stop_sign_cooldown', 5.0)
+                cooldown = cfg.get('stop_sign_cooldown', 15.0)
                 if current_time - last_time < cooldown:
                     continue
 
                 state.control_type = "stop_sign"
-                state.distance = distance if distance else 0.5
 
-                stop_distance_threshold = cfg['sign_stop_distance']
+                if not self._at_stop_sign:
+                    self._at_stop_sign = True
+                    self._stop_sign_start_time = current_time
+                    self._stop_sign_wait_complete = False
+                    self.get_logger().info(
+                        f"Stop sign (conf={confidence:.2f}) - starting {cfg['stop_sign_pause']:.1f}s wait")
 
-                if distance is not None and distance < stop_distance_threshold:
-                    if not self._at_stop_sign:
-                        self._at_stop_sign = True
-                        self._stop_sign_start_time = current_time
-                        self._stop_sign_wait_complete = False
-                        self.get_logger().info(
-                            f"Arrived at stop sign - starting {cfg['stop_sign_pause']:.1f}s wait")
-
-                    if self._at_stop_sign and not self._stop_sign_wait_complete:
-                        elapsed = current_time - self._stop_sign_start_time
-                        remaining = cfg['stop_sign_pause'] - elapsed
-
-                        if remaining > 0:
-                            state.should_stop = True
-                            state.stop_duration = remaining
-                        else:
-                            self._stop_sign_wait_complete = True
-                            self._last_detection_time['stop sign'] = current_time
-                            self.get_logger().info("Stop sign wait complete - can proceed")
-                            state.should_stop = False
-                            state.stop_duration = 0.0
-                    elif self._at_stop_sign and self._stop_sign_wait_complete:
+                if self._at_stop_sign and not self._stop_sign_wait_complete:
+                    elapsed = current_time - self._stop_sign_start_time
+                    remaining = cfg['stop_sign_pause'] - elapsed
+                    if remaining > 0:
+                        state.should_stop = True
+                        state.stop_duration = remaining
+                    else:
+                        self._stop_sign_wait_complete = True
+                        self._last_detection_time['stop sign'] = current_time
+                        self.get_logger().info("Stop sign wait complete - can proceed")
                         state.should_stop = False
                         state.stop_duration = 0.0
-
-                    return state
-                else:
-                    if self._at_stop_sign and self._stop_sign_wait_complete:
-                        self.get_logger().info("Stop sign: moved past, resetting state")
-                        self._at_stop_sign = False
-                        self._stop_sign_wait_complete = False
-                        self._stop_sign_start_time = None
+                elif self._at_stop_sign and self._stop_sign_wait_complete:
                     state.should_stop = False
-                    return state
+                    state.stop_duration = 0.0
 
-            # Handle yield sign
+                return state
+
+            # Yield sign — only yield for tracked pedestrians on road.
+            # Post-action suppression prevents infinite stop loop.
             elif obj_class in ('yield sign', 'yield'):
                 if confidence < cfg['sign_confidence']:
                     continue
-
-                state.control_type = "yield_sign"
-                state.distance = distance if distance else 0.5
-
-                if distance is not None and distance < cfg['sign_stop_distance']:
+                # Check post-action suppression first
+                if current_time < self._yield_suppress_until:
+                    continue  # Suppressed — vehicle is driving past the sign
+                ped_on_road, _ = self._ped_tracker.any_on_road()
+                if ped_on_road:
+                    self._yield_active = True
+                    self._last_detection_time['yield sign'] = current_time
+                    state.control_type = "yield_sign"
                     state.should_stop = True
-                    state.stop_duration = cfg['yield_sign_pause']
-                else:
-                    state.should_stop = False
-
-                return state
+                    state.stop_duration = 0.0
+                    return state
+                elif self._yield_active:
+                    # Pedestrian cleared — start suppression and let vehicle go
+                    self._yield_active = False
+                    self._yield_suppress_until = current_time + self._yield_suppress_duration
+                    self.get_logger().info(
+                        f"Yield sign: pedestrian cleared, suppressing for {self._yield_suppress_duration:.0f}s")
 
         # No traffic control detected this frame
         state.control_type = "none"
@@ -1072,7 +1396,7 @@ class ObstacleDetector(Node):
             confidence = det.get('confidence', 0.0)
 
             # Only include obstacles relevant for collision avoidance
-            if obj_class not in ['person', 'car', 'traffic_cone', 'sports ball']:
+            if obj_class not in ['person', 'car', 'traffic_cone', 'sports ball', 'cone']:
                 continue
 
             # Skip if no distance estimate
@@ -1140,17 +1464,6 @@ class ObstacleDetector(Node):
             return
 
         viz = self._latest_rgb.copy()
-        h, w = viz.shape[:2]
-        cfg = DETECTION_CONFIG
-
-        # Draw masked region (camera housing) with semi-transparent overlay
-        mask_top = int(h * (1 - cfg.get('mask_bottom_fraction', 0.15)))
-        overlay = viz.copy()
-        cv2.rectangle(overlay, (0, mask_top), (w, h), (128, 128, 128), -1)
-        cv2.addWeighted(overlay, 0.5, viz, 0.5, 0, viz)
-        cv2.line(viz, (0, mask_top), (w, mask_top), (255, 255, 0), 2)
-        cv2.putText(viz, "MASKED (camera)", (10, mask_top + 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
         for det in detections:
             bbox = det.get('bbox')

@@ -32,6 +32,7 @@ class TrafficControlState:
     stop_duration: float = 0.0
     stop_line_x: float = 0.0
     stop_line_y: float = 0.0
+    light_name: str = ""  # Name of matched known traffic light (from traffic_light_map)
 
     def to_json(self) -> str:
         """Serialize to JSON string for ROS2 std_msgs/String."""

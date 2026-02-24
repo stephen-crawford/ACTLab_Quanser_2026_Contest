@@ -1,0 +1,83 @@
+# Module Configuration — ACC Self-Driving Stack
+# Each component lists available backends and the selected default.
+# Defaults are data-driven from benchmark results in scripts/*_results/.
+#
+# To override at runtime, use ROS parameters (e.g., detection_mode:=hsv)
+# or edit this file. ROS parameters take precedence over this file.
+
+detection:
+  # Backend selection: auto | hsv | yolo_coco | custom | hybrid | hough_hsv
+  #
+  # Benchmark results (scripts/compare_detectors.py on synthetic QLabs images):
+  #   HSV+Contour   F1=0.429  @ 1.82ms  (Pareto-optimal for speed)
+  #   Hough+HSV     F1=0.444  @ 3.65ms  (slightly better precision)
+  #   Custom YOLO   best when model available (not benchmarked offline)
+  #
+  # Rationale: 'auto' tries custom model -> COCO YOLO -> HSV fallback.
+  #   For competition, custom model trained on QLabs is most accurate.
+  #   HSV fallback guarantees detection even without GPU/ultralytics.
+  backend: auto
+
+path_planning:
+  # Backend selection: astar | dijkstra | weighted_astar | experience_astar
+  #
+  # Benchmark results (scripts/compare_pathfinding.py):
+  #   A*              optimal 9.891m, 14 expanded, 0.14ms
+  #   Experience A*   identical path, cached calls 13x faster (0.008ms)
+  #   Weighted A*     same path, fewer expansions (epsilon=1.5)
+  #   Dijkstra        optimal but more expansions than A*
+  #
+  # Rationale: 'experience_astar' gives optimal paths (same as A*) with
+  #   near-instant replanning for the repetitive taxi mission.
+  backend: experience_astar
+  # Heuristic inflation factor for weighted_astar (if selected)
+  weighted_epsilon: 1.5
+
+controller:
+  # Backend selection: auto | casadi | cpp | pure_pursuit
+  #
+  # Auto selection order: C++ SQP -> CasADi MPCC -> Pure Pursuit
+  # C++ is fastest (Eigen SQP + gradient projection).
+  # CasADi is proven stable (pympc_core, fresh Opti per solve).
+  # Pure Pursuit is safe fallback when no optimizer available.
+  #
+  # Rationale: 'cpp' directly selects the fastest backend. The launch file
+  #   defaults to the C++ MPCC controller node, so this mainly affects the
+  #   Python MPCC controller's solver selection when used as fallback.
+  backend: cpp
+
+pedestrian_tracking:
+  # Backend selection: kalman | simple
+  #
+  # Rationale: Kalman filter tracks through brief occlusions (1-2 frames),
+  #   reducing false-clear events that cause premature motion re-enable.
+  #   'simple' uses raw detections without filtering (not recommended).
+  backend: kalman
+
+state_estimation:
+  # Backend: ekf | raw
+  # 'ekf' uses C++ VehicleEKF fusing TF + encoder + odom (50Hz)
+  # 'raw' uses direct TF lookups (legacy behavior)
+  backend: ekf
+
+obstacle_tracking:
+  # Backend: kalman | simple
+  # 'kalman' uses C++ ObstacleTracker (all classes, lidar fusion)
+  # 'simple' uses raw per-frame detections (legacy)
+  backend: kalman
+  use_lidar: true
+
+obstacle_mapping:
+  # Enable persistent obstacle map + path avoidance
+  enabled: true
+  stale_timeout: 30.0  # Remove obstacles not seen for 30s
+
+traffic_light_mapping:
+  # Enable mapping detections to known positions
+  enabled: true
+  association_radius: 1.5  # Max distance to match detection to known light
+
+dashboard:
+  # Enable real-time telemetry dashboard
+  enabled: false  # Opt-in (requires display)
+  window_seconds: 15

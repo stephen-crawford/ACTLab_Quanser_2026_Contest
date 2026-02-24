@@ -1,0 +1,47 @@
+# Preset: PolyCtrl 2025 MPCC Weights
+#
+# Applies the MPCC tuning parameters from the ACC 2025 PolyCtrl reference
+# (ACC2025_Quanser_Student_Competition) to our C++ MPCC stack.
+#
+# Reference: /home/stephen/ACC2025_Quanser_Student_Competition/polyctrl/polyctrl/MPC_node.py
+#
+# This preset only changes MPCC weight parameters — the entire stack remains
+# C++ (controller, mission manager, sign detector, state estimator, etc.).
+# It is useful for comparing the 2025 PolyCtrl tuning against our current
+# tuning on the same C++ architecture.
+#
+# Original 2025 PolyCtrl architecture (for reference only):
+#   - Python MPCC via CasADi IPOPT solver (fresh NLP per solve)
+#   - Custom YOLOv8 detector (8 classes: cone, green, red, yellow, stop, yield, round, person)
+#   - D* path planning with traffic/crosswalk edge-weight penalties (+10 each)
+#   - Cartographer SLAM only (no Nav2 navigation stack)
+#   - Direct MotorCommands to qcar2_motor_speed_cmd
+#   - 10 Hz control loop, horizon K=10
+#   - Route: nodeSequence = [24, 20, 9, 10] on SDCSRoadMap
+#
+# Key parameter differences from default C++ stack:
+#   - Higher reference velocity (0.70 vs 0.50 m/s)
+#   - Different MPCC cost weights (q_c=1.8, q_l=7 vs contour=25, lag=5)
+#   - Smaller horizon (K=10 vs K=20)
+#   - Gentler curvature speed adaptation (exp(-0.4*k) vs exp(-1.2*k))
+#
+# Usage:
+#   ./run_mission.sh --2025
+#
+# WARNING: The 2025 weights prioritize speed (lag) over lane keeping (contour).
+# Root cause analysis showed this causes lane violations on tight curves.
+# Our default weights (contour=25, lag=5) were tuned to fix this.
+
+# --- MPCC parameters (from MPC_node.py lines 601-614) ---
+# Mapped from PolyCtrl naming to our launch arg naming:
+#   q_c (contouring) = 1.8  -> contour_weight
+#   q_l (lag)        = 7.0  -> lag_weight
+#   gamma (progress) = 1.0  (no direct equivalent; folded into lag_weight)
+#   u_ref_max        = 0.70 -> reference_velocity
+#   K (horizon)      = 10   -> horizon
+reference_velocity: 0.70
+contour_weight: 1.8
+lag_weight: 7.0
+horizon: 10
+boundary_weight: 30.0
+use_direct_motor: true

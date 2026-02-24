@@ -42,7 +42,7 @@ class MPCCConfig:
 
     # Vehicle
     wheelbase: float = 0.256
-    max_velocity: float = 0.40
+    max_velocity: float = 0.60
     min_velocity: float = 0.0
     max_steering: float = 0.45
     max_acceleration: float = 0.6
@@ -73,7 +73,7 @@ class MPCCConfig:
     tolerance: float = 1e-5
 
     # Reference velocity
-    reference_velocity: float = 0.35
+    reference_velocity: float = 0.50
 
 
 @dataclass
@@ -311,7 +311,14 @@ class MPCCSolver:
         n_obs = min(len(obstacles), cfg.max_obstacles)
         for k in range(N):
             for i in range(n_obs):
-                obs_x, obs_y, obs_r = obstacles[i]
+                obs_x, obs_y, obs_r = obstacles[i][0], obstacles[i][1], obstacles[i][2]
+                obs_vx = obstacles[i][3] if len(obstacles[i]) > 3 else 0.0
+                obs_vy = obstacles[i][4] if len(obstacles[i]) > 4 else 0.0
+                # Predict obstacle position at this time step
+                t_k = k * cfg.dt
+                pred_obs_x = obs_x + obs_vx * t_k
+                pred_obs_y = obs_y + obs_vy * t_k
+                obs_x, obs_y = pred_obs_x, pred_obs_y
                 safe_r = obs_r + cfg.robot_radius + cfg.safety_margin
 
                 # Linearization point
@@ -422,7 +429,8 @@ class MPCCSolver:
         x, y, theta = x0[0], x0[1], x0[2]
         v = x0[3] if len(x0) > 3 else 0.0
 
-        # --- Pure Pursuit steering ---
+        # --- Stanley cross-track correction blended with Pure Pursuit ---
+        # Use a lookahead that scales with speed but stays reasonable
         L_d = np.clip(0.30 + 0.8 * abs(v), 0.30, 0.80)
         la_progress = min(current_progress + L_d, path.total_length - 0.01)
         la_x, la_y = path.get_position(la_progress)
@@ -442,31 +450,49 @@ class MPCCSolver:
         # --- Velocity ---
         curvature = abs(path.get_curvature(current_progress))
         v_cmd = cfg.reference_velocity * np.exp(-1.2 * curvature)
-        v_cmd = np.clip(v_cmd, 0.08, cfg.max_velocity)
+        v_cmd = np.clip(v_cmd, 0.12, cfg.max_velocity)
 
-        # Heading error reduction - progressive slowdown
-        path_tangent = path.get_tangent(current_progress)
-        heading_err = abs(self._normalize_angle(path_tangent - theta))
-        if heading_err > np.radians(60):
-            v_cmd = min(v_cmd, 0.08)
-        elif heading_err > np.radians(30):
-            scale = 1.0 - (heading_err - np.radians(30)) / np.radians(30)
+        # Heading error reduction - smoother progressive slowdown
+        # Use lookahead tangent instead of tangent at current progress,
+        # which can be distorted by spline boundary effects
+        la_tangent = path.get_tangent(min(current_progress + 0.15, path.total_length - 0.01))
+        heading_err = abs(self._normalize_angle(la_tangent - theta))
+        if heading_err > np.radians(90):
+            # Very large error: creep forward to let Pure Pursuit correct
+            v_cmd = min(v_cmd, 0.10)
+        elif heading_err > np.radians(45):
+            # Large error: proportional slowdown
+            scale = 1.0 - (heading_err - np.radians(45)) / np.radians(45)
             v_cmd = min(v_cmd, cfg.reference_velocity * max(scale, 0.25))
 
-        # Obstacle slowdown
+        # Obstacle slowdown (velocity-aware for moving obstacles)
         if obstacles:
-            for obs_x, obs_y, obs_r in obstacles:
+            for i, obs in enumerate(obstacles):
+                obs_x, obs_y, obs_r = obs[0], obs[1], obs[2]
+                obs_vx = obs[3] if len(obs) > 3 else 0.0
+                obs_vy = obs[4] if len(obs) > 4 else 0.0
+
                 ddx = obs_x - x
                 ddy = obs_y - y
+                dist = np.sqrt(ddx**2 + ddy**2)
                 angle_to_obs = np.arctan2(ddy, ddx)
                 if abs(self._normalize_angle(angle_to_obs - theta)) > np.pi / 3:
                     continue
-                dist = np.sqrt(ddx**2 + ddy**2)
+
+                # Predict obstacle position at time of closest approach
+                if obs_vx != 0.0 or obs_vy != 0.0:
+                    t_approach = dist / max(abs(v_cmd), 0.01)
+                    pred_x = obs_x + obs_vx * t_approach
+                    pred_y = obs_y + obs_vy * t_approach
+                    ddx = pred_x - x
+                    ddy = pred_y - y
+                    dist = np.sqrt(ddx**2 + ddy**2)
+
                 eff = dist - obs_r - cfg.robot_radius
-                if eff < 0.08:
+                if eff < 0.05:
                     v_cmd = 0.0
                 elif eff < 0.8:
-                    scale = (eff - 0.08) / 0.72
+                    scale = (eff - 0.05) / 0.75
                     v_cmd = min(v_cmd, cfg.reference_velocity * np.clip(scale, 0.1, 1.0))
 
         v_cmd = np.clip(v_cmd, 0.0, cfg.max_velocity)

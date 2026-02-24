@@ -1,51 +1,49 @@
 """
 MPCC Mission Launch File
 
-Launches the mission with MPCC (Model Predictive Contouring Control)
-instead of Nav2's MPPI controller.
+Launches the full C++ stack for the ACC competition:
+- odom_from_tf_node: C++ TF -> /odom bridge
+- mpcc_controller_node: C++ MPCC path following controller (SQP solver)
+- mission_manager_node: C++ mission state machine + road graph path planning
+- sign_detector_node: C++ HSV traffic sign/light/cone detection
+- state_estimator_node: C++ EKF state estimator
+- obstacle_tracker_node: C++ multi-class Kalman + lidar tracker
+- traffic_light_map_node: C++ spatial traffic light mapping
 
-Includes:
-- odom_from_tf: Converts TF (odom->base_link) to /odom topic
-- mpcc_controller: MPCC path following controller (Python or C++)
-- mission_manager: Mission waypoint management (MPCC mode)
-- sign_detector: C++ HSV traffic sign detector (optional)
+All nodes are C++. No Python fallbacks.
 
 Usage:
     ros2 launch acc_stage1_mission mpcc_mission_launch.py
-    ros2 launch acc_stage1_mission mpcc_mission_launch.py use_cpp_controller:=true
-    ros2 launch acc_stage1_mission mpcc_mission_launch.py use_cpp_sign_detector:=true
+    ros2 launch acc_stage1_mission mpcc_mission_launch.py reference_velocity:=0.40
+    ros2 launch acc_stage1_mission mpcc_mission_launch.py boundary_weight:=40.0
 """
 
-import os
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.conditions import IfCondition, UnlessCondition
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # Get package directory
-    pkg_dir = get_package_share_directory('acc_stage1_mission')
 
-    # Launch arguments - tuned from root cause analysis
+    # Launch arguments - aligned with reference (PolyCtrl 2025)
     reference_velocity_arg = DeclareLaunchArgument(
         'reference_velocity',
-        default_value='0.35',
-        description='Target velocity (m/s) - reduced for safe cornering'
+        default_value='0.65',
+        description='Target velocity (m/s) - ref uses 0.70'
     )
 
     contour_weight_arg = DeclareLaunchArgument(
         'contour_weight',
-        default_value='25.0',
-        description='Weight for path contouring (lateral) error - PRIMARY weight'
+        default_value='8.0',
+        description='Weight for path contouring (lateral) error - lane keeping'
     )
 
     lag_weight_arg = DeclareLaunchArgument(
         'lag_weight',
-        default_value='5.0',
-        description='Weight for lag (progress) error - secondary to lane keeping'
+        default_value='12.0',
+        description='Weight for lag (progress) error - prioritize forward motion'
     )
 
     horizon_arg = DeclareLaunchArgument(
@@ -56,26 +54,42 @@ def generate_launch_description():
 
     boundary_weight_arg = DeclareLaunchArgument(
         'boundary_weight',
-        default_value='30.0',
+        default_value='20.0',
         description='Road boundary constraint penalty weight'
     )
 
-    use_cpp_controller_arg = DeclareLaunchArgument(
-        'use_cpp_controller',
-        default_value='false',
-        description='Use C++ MPCC controller instead of Python'
+    use_direct_motor_arg = DeclareLaunchArgument(
+        'use_direct_motor',
+        default_value='true',
+        description='Publish MotorCommands directly (bypass nav2_qcar_command_convert)'
     )
 
-    use_cpp_sign_detector_arg = DeclareLaunchArgument(
-        'use_cpp_sign_detector',
-        default_value='false',
-        description='Use C++ HSV sign detector instead of Python YOLO'
+    use_state_estimator_arg = DeclareLaunchArgument(
+        'use_state_estimator',
+        default_value='true',
+        description='Use EKF state estimator (fuses TF + encoder + odom)'
     )
 
-    # Odom From TF Node
+    use_dashboard_arg = DeclareLaunchArgument(
+        'use_dashboard',
+        default_value='false',
+        description='Launch real-time telemetry dashboard (requires display)'
+    )
+
+    use_overlay_arg = DeclareLaunchArgument(
+        'use_overlay',
+        default_value='false',
+        description='Launch path overlay map visualizer (requires display)'
+    )
+
+    # =========================================================================
+    # C++ Nodes — the entire stack
+    # =========================================================================
+
+    # Odom From TF Node (C++)
     odom_from_tf_node = Node(
-        package='acc_stage1_mission',
-        executable='odom_from_tf',
+        package='acc_mpcc_controller_cpp',
+        executable='odom_from_tf_node',
         name='odom_from_tf',
         output='screen',
         parameters=[{
@@ -85,60 +99,82 @@ def generate_launch_description():
         }]
     )
 
-    # Python MPCC Controller Node (default)
-    mpcc_python_node = Node(
-        package='acc_stage1_mission',
-        executable='mpcc_controller',
-        name='mpcc_controller',
-        output='screen',
-        condition=UnlessCondition(LaunchConfiguration('use_cpp_controller')),
-        parameters=[{
-            'reference_velocity': LaunchConfiguration('reference_velocity'),
-            'contour_weight': LaunchConfiguration('contour_weight'),
-            'lag_weight': LaunchConfiguration('lag_weight'),
-            'horizon': LaunchConfiguration('horizon'),
-        }],
-        remappings=[
-            ('/odom', '/odom'),
-            ('/plan', '/plan'),
-            ('/cmd_vel_nav', '/cmd_vel_nav'),
-        ]
-    )
-
-    # C++ MPCC Controller Node (optional)
-    mpcc_cpp_node = Node(
+    # C++ MPCC Controller Node
+    mpcc_controller_node = Node(
         package='acc_mpcc_controller_cpp',
         executable='mpcc_controller_node',
         name='mpcc_controller_cpp',
         output='screen',
-        condition=IfCondition(LaunchConfiguration('use_cpp_controller')),
         parameters=[{
             'reference_velocity': LaunchConfiguration('reference_velocity'),
             'contour_weight': LaunchConfiguration('contour_weight'),
             'lag_weight': LaunchConfiguration('lag_weight'),
             'horizon': LaunchConfiguration('horizon'),
             'boundary_weight': LaunchConfiguration('boundary_weight'),
+            'use_direct_motor': LaunchConfiguration('use_direct_motor'),
         }],
     )
 
-    # C++ Sign Detector Node (optional)
+    # C++ Sign Detector Node (HSV + contour detection)
     sign_detector_node = Node(
         package='acc_mpcc_controller_cpp',
         executable='sign_detector_node',
         name='sign_detector',
         output='screen',
-        condition=IfCondition(LaunchConfiguration('use_cpp_sign_detector')),
     )
 
-    # Mission Manager Node
-    mission_node = Node(
-        package='acc_stage1_mission',
-        executable='mission_manager',
+    # C++ Mission Manager Node
+    mission_manager_node = Node(
+        package='acc_mpcc_controller_cpp',
+        executable='mission_manager_node',
         name='mission_manager',
         output='screen',
         parameters=[{
             'mpcc_mode': True,
         }],
+    )
+
+    # State Estimator Node (C++ EKF, conditional)
+    state_estimator_node = Node(
+        package='acc_mpcc_controller_cpp',
+        executable='state_estimator_node',
+        name='state_estimator',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('use_state_estimator')),
+    )
+
+    # Obstacle Tracker Node (C++ multi-class Kalman + lidar)
+    obstacle_tracker_node = Node(
+        package='acc_mpcc_controller_cpp',
+        executable='obstacle_tracker_node',
+        name='obstacle_tracker',
+        output='screen',
+    )
+
+    # Traffic Light Map Node (C++)
+    traffic_light_map_node = Node(
+        package='acc_mpcc_controller_cpp',
+        executable='traffic_light_map_node',
+        name='traffic_light_map',
+        output='screen',
+    )
+
+    # Dashboard Node (Python, opt-in — no C++ equivalent yet)
+    dashboard_node = Node(
+        package='acc_stage1_mission',
+        executable='dashboard',
+        name='dashboard',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('use_dashboard')),
+    )
+
+    # Path Overlay Node (Python, opt-in — bird's-eye track + planned path)
+    path_overlay_node = Node(
+        package='acc_stage1_mission',
+        executable='path_overlay',
+        name='path_overlay',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('use_overlay')),
     )
 
     return LaunchDescription([
@@ -147,11 +183,17 @@ def generate_launch_description():
         lag_weight_arg,
         horizon_arg,
         boundary_weight_arg,
-        use_cpp_controller_arg,
-        use_cpp_sign_detector_arg,
+        use_direct_motor_arg,
+        use_state_estimator_arg,
+        use_dashboard_arg,
+        use_overlay_arg,
         odom_from_tf_node,
-        mpcc_python_node,
-        mpcc_cpp_node,
+        state_estimator_node,
+        obstacle_tracker_node,
+        traffic_light_map_node,
+        mpcc_controller_node,
         sign_detector_node,
-        mission_node,
+        mission_manager_node,
+        dashboard_node,
+        path_overlay_node,
     ])

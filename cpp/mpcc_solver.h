@@ -33,27 +33,32 @@ struct Config {
     int horizon = 20;
     double dt = 0.1;
     double wheelbase = 0.256;
-    double max_velocity = 0.40;
-    double min_velocity = 0.0;
+    double max_velocity = 1.2;   // Raised from 0.70 (ref uses 2.0; qcar2_hardware PD handles speed control)
+    double min_velocity = 0.05;  // Always move forward (prevents v=0 equilibrium)
     double max_steering = 0.45;
-    double max_acceleration = 0.6;
-    double max_steering_rate = 0.6;
-    double reference_velocity = 0.35;
+    double max_acceleration = 0.8;  // Raised from 0.6 for faster response
+    double max_steering_rate = 0.8; // Raised from 0.6 for faster steering response
+    double reference_velocity = 0.65;  // Raised from 0.55 (ref uses 0.70)
 
-    // Cost weights — CONTOUR > LAG to prevent lane violations.
-    // Previous ratio (8:15) caused vehicle to prioritize forward progress
-    // over staying centered in lane, resulting in corner cutting.
-    double contour_weight = 25.0;
-    double lag_weight = 5.0;
-    double velocity_weight = 2.0;
-    double steering_weight = 3.0;
-    double acceleration_weight = 1.5;
-    double steering_rate_weight = 4.0;
-    double jerk_weight = 0.5;
+    // Cost weights — Aligned with reference (PolyCtrl 2025):
+    // Reference: contour=1.8, lag=7.0, R_ref[0]=17.0 (velocity tracking)
+    // Key insight: reference prioritizes PROGRESS over lane centering.
+    // Previous over-tuning (contour=25, lag=5) caused vehicle to find
+    // "staying still in lane" as the optimal solution.
+    double contour_weight = 8.0;   // Reduced from 25.0 (ref: 1.8) — lane keeping still weighted
+    double lag_weight = 12.0;      // Raised from 5.0 (ref: 7.0) — prioritize forward progress
+    double velocity_weight = 15.0; // Raised from 8.0 (ref: 17.0) — track v_ref strongly
+    double steering_weight = 2.0;  // Reduced from 3.0 for more responsive steering
+    double acceleration_weight = 1.0;  // Reduced from 1.5 for faster speed changes
+    double steering_rate_weight = 3.0; // Reduced from 4.0 for more agile steering
+    double jerk_weight = 0.3;      // Reduced from 0.5 for smoother response
+    double heading_weight = 3.0;   // Penalize (theta - path_tangent)^2 to help initial alignment
 
     // Startup ramp: for the first startup_ramp_duration_s seconds,
     // use lower reference velocity to let the controller settle.
-    double startup_ramp_duration_s = 3.0;
+    // Reduced from 3.0 to 1.5s: the heading-aligned path makes the initial
+    // trajectory smooth, so the solver no longer needs a long low-speed phase.
+    double startup_ramp_duration_s = 1.5;
     double startup_elapsed_s = 0.0;  // Set by the caller each solve
 
     // Obstacle
@@ -62,7 +67,7 @@ struct Config {
     double obstacle_weight = 200.0;
 
     // Boundary
-    double boundary_weight = 30.0;
+    double boundary_weight = 20.0;  // Reduced from 30.0 — was too restrictive with high contour
 
     // Road half-width for boundary generation
     double boundary_default_width = 0.22;
@@ -330,7 +335,7 @@ public:
         has_warmstart = true;
 
         // Extract result (use step 1, not step 0, for one-step delay)
-        result.v_cmd = clamp(X[1](3), 0.0, config.max_velocity);
+        result.v_cmd = clamp(X[1](3), config.min_velocity, config.max_velocity);
         result.delta_cmd = clamp(X[1](4), -config.max_steering, config.max_steering);
 
         // Compute angular velocity for Twist message
@@ -399,15 +404,17 @@ private:
         cost += config.contour_weight * e_c * e_c;
         cost += config.lag_weight * e_l * e_l;
 
-        // Curvature-adaptive velocity reference
-        // Stronger decay (-1.2) for tight turns on 1:10 scale track
+        // Curvature-adaptive velocity reference (matched to reference MPC)
+        // Reference uses exp(-0.4*curvature) with u_ref_max=0.7 normal, 0.2 startup
         double v_ref;
         if (config.startup_elapsed_s < config.startup_ramp_duration_s) {
-            v_ref = 0.15 * std::exp(-3.0 * std::abs(ref.curvature));
+            // Startup: low speed to let controller settle (ref uses 0.2 m/s for 3s)
+            v_ref = 0.20 * std::exp(-0.4 * std::abs(ref.curvature));
         } else {
-            v_ref = config.reference_velocity * std::exp(-1.2 * std::abs(ref.curvature));
+            // Normal: gentler curvature decay matching reference (-0.4 vs our old -1.2)
+            v_ref = config.reference_velocity * std::exp(-0.4 * std::abs(ref.curvature));
         }
-        v_ref = std::clamp(v_ref, 0.08, config.max_velocity);
+        v_ref = std::clamp(v_ref, config.min_velocity, config.max_velocity);
 
         // --- Contouring + lag gradient ---
         // d(e_c)/dx = -sin_theta, d(e_c)/dy = cos_theta
@@ -441,6 +448,18 @@ private:
         cost += config.steering_weight * xk(4) * xk(4);
         grad_x(4) = 2.0 * config.steering_weight * xk(4);
         hess_x(4, 4) = 2.0 * config.steering_weight;
+
+        // --- Heading alignment cost ---
+        // Penalize deviation of vehicle heading from path tangent direction.
+        // This helps the solver actively steer to align heading early,
+        // preventing the initial heading mismatch from compounding.
+        if (config.heading_weight > 0.0) {
+            double path_theta = std::atan2(ref.sin_theta, ref.cos_theta);
+            double heading_err = normalize_angle(xk(2) - path_theta);
+            cost += config.heading_weight * heading_err * heading_err;
+            grad_x(2) += 2.0 * config.heading_weight * heading_err;
+            hess_x(2, 2) += 2.0 * config.heading_weight;
+        }
 
         // --- Obstacle penalty (smooth barrier) ---
         for (const auto& obs : obstacles) {

@@ -3,24 +3,31 @@
 <package format="3">
   <name>acc_mpcc_controller_cpp</name>
   <version>0.0.1</version>
-  <description>C++ MPCC Controller and Sign Detector ROS2 nodes for QCar2</description>
+  <description>C++ MPCC Controller, Mission Manager, Sign Detector, and Odom nodes for QCar2</description>
   <maintainer email="stephen@todo.todo">stephen</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>nav2_msgs</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>visualization_msgs</depend>
   <depend>tf2_ros</depend>
   <depend>tf2</depend>
   <depend>cv_bridge</depend>
+  <depend>rcl_interfaces</depend>
+  <depend>action_msgs</depend>
+  <depend>ament_index_cpp</depend>
+  <depend>qcar2_interfaces</depend>
 
   <build_depend>libopencv-dev</build_depend>
   <build_depend>libeigen3-dev</build_depend>
+  <build_depend>libyaml-cpp-dev</build_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

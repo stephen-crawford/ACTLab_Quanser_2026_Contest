@@ -272,13 +272,14 @@ class TestCoordinateTransform:
         assert abs(map_pts[0, 1]) < 0.01
 
     def test_transform_uses_calibrated_angle(self):
-        """Verify the calibrated angle 0.7177 rad is used with R^T convention."""
-        # With R^T(theta=0.7177), a point at (1, 0) relative to hub maps to
-        # (cos(0.7177), -sin(0.7177)) = (0.7538, -0.6571)
+        """Verify the calibrated angle is used with R(+θ) convention."""
+        # The transform is: translate to origin, then R(+θ) where θ = radians(44.7) = 0.7803
+        # A point at (1, 0) relative to hub maps to (cos(θ), sin(θ))
+        theta = TRANSFORM.get('origin_heading_rad', math.radians(-TRANSFORM.get('origin_heading_deg', -44.7)))
         test_pt = np.array([[HUB[0] + 1.0, HUB[1]]])
         map_pts = qlabs_path_to_map_path(test_pt, **TRANSFORM)
-        expected_x = math.cos(0.7177)
-        expected_y = -math.sin(0.7177)
+        expected_x = math.cos(theta)
+        expected_y = math.sin(theta)
         assert abs(map_pts[0, 0] - expected_x) < 0.01
         assert abs(map_pts[0, 1] - expected_y) < 0.01
 
@@ -290,14 +291,15 @@ class TestCoordinateTransform:
         assert np.linalg.norm(map_route[0]) < 0.1
 
     def test_roundtrip_consistency(self):
-        # Inverse of R^T(θ) is R(θ) — standard CCW rotation with positive θ
-        theta_inv = TRANSFORM['origin_heading_rad']
+        # Forward: translate then R(+θ). Inverse: R(-θ) then translate back.
+        theta = TRANSFORM.get('origin_heading_rad', math.radians(-TRANSFORM.get('origin_heading_deg', -44.7)))
 
         test_pts = np.array([[0.0, 2.0], [-0.5, 1.0], [0.125, 4.395]])
         map_pts = qlabs_path_to_map_path(test_pts, **TRANSFORM)
 
-        cos_inv = math.cos(theta_inv)
-        sin_inv = math.sin(theta_inv)
+        # Inverse rotation: R(-θ) = R^T(θ)
+        cos_inv = math.cos(-theta)
+        sin_inv = math.sin(-theta)
         rotated = np.zeros_like(map_pts)
         rotated[:, 0] = map_pts[:, 0] * cos_inv - map_pts[:, 1] * sin_inv
         rotated[:, 1] = map_pts[:, 0] * sin_inv + map_pts[:, 1] * cos_inv

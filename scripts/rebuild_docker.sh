@@ -22,12 +22,15 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Script directory
+# Script directory — quanser-acc is the canonical repo
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PACKAGE_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
-ROS2_SRC_DIR="$( cd "$PACKAGE_DIR/.." && pwd )"
-ROS2_WS_DIR="$( cd "$ROS2_SRC_DIR/.." && pwd )"
-ACC_DEV_DIR="$( cd "$ROS2_WS_DIR/../.." && pwd )"
+
+# Docker infrastructure lives in ACC_Development
+ACC_DEV_DIR="$HOME/Documents/ACC_Development"
+DEV_WORKSPACE="$ACC_DEV_DIR/Development"
+ROS2_WS_DIR="$DEV_WORKSPACE/ros2"
+DOCKER_PKG_DIR="$ROS2_WS_DIR/src/acc_stage1_mission"
 
 # Docker paths
 ISAAC_ROS_COMMON="$ACC_DEV_DIR/isaac_ros_common"
@@ -183,6 +186,22 @@ if [ "$FULL_REBUILD" = true ]; then
 
     print_info "Docker image rebuild complete!"
 fi
+
+# ============================================================================
+# Sync quanser-acc repo to Docker workspace
+# ============================================================================
+print_info "Syncing quanser-acc → Docker workspace..."
+mkdir -p "$ROS2_WS_DIR/src"
+rsync -a --delete \
+    --exclude='.git' \
+    --exclude='__pycache__' \
+    --exclude='.pytest_cache' \
+    --exclude='*.pyc' \
+    --exclude='run_mission.sh' \
+    --exclude='logs/*.log' \
+    --exclude='logs/*.csv' \
+    "$PACKAGE_DIR/" "$DOCKER_PKG_DIR/"
+print_info "Code synced to $DOCKER_PKG_DIR"
 
 # ============================================================================
 # ROS2 Package Rebuild (inside container)

@@ -14,24 +14,17 @@
 
 set -e
 
-# ACC_DEVELOPMENT root (e.g. /home/$USER/Documents/ACC_Development)
+# Paths — quanser-acc is the canonical repo, Docker infrastructure in ACC_Development
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ -n "${ACC_DEVELOPMENT}" ]; then
-  ACC_ROOT="${ACC_DEVELOPMENT}"
-else
-  # Assume script is in .../Development/ros2/src/acc_stage1_mission/scripts (6 levels below ACC root)
-  ACC_ROOT="$(cd "$SCRIPT_DIR/../../../../../../.." && pwd)"
-  if [ ! -d "$ACC_ROOT/isaac_ros_common" ] || [ ! -d "$ACC_ROOT/Development" ]; then
-    ACC_ROOT="$HOME/Documents/ACC_Development"
-  fi
-fi
+QUANSER_ACC_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ACC_ROOT="${ACC_DEVELOPMENT:-$HOME/Documents/ACC_Development}"
 
 ENV_IMAGE="quanser/virtual-qcar2"
 ENV_NAME="virtual-qcar2"
 DEV_SCRIPT="$ACC_ROOT/isaac_ros_common/scripts/run_dev.sh"
 DEV_MOUNT="$ACC_ROOT/Development"
 ROS2_WS="$ACC_ROOT/Development/ros2"
-MISSION_SCRIPTS="$ROS2_WS/src/acc_stage1_mission/scripts"
+DOCKER_PKG_DIR="$ROS2_WS/src/acc_stage1_mission"
 
 echo "=============================================="
 echo "  Stage I contest – run everything"
@@ -62,6 +55,17 @@ if [ "$1" = "--scenario" ]; then
   echo "   Done. Ensure QLabs Plane World is open."
   echo ""
 fi
+
+# --- 2b) Sync quanser-acc to Docker workspace ---
+echo "== Syncing quanser-acc → Docker workspace..."
+mkdir -p "$ROS2_WS/src"
+rsync -a --delete \
+    --exclude='.git' --exclude='__pycache__' --exclude='.pytest_cache' \
+    --exclude='*.pyc' --exclude='run_mission.sh' \
+    --exclude='logs/*.log' --exclude='logs/*.csv' \
+    "$QUANSER_ACC_DIR/" "$DOCKER_PKG_DIR/"
+echo "   Done."
+echo ""
 
 # --- 3) DEV container ---
 if [ ! -x "$DEV_SCRIPT" ]; then

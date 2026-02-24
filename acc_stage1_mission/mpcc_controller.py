@@ -2,9 +2,18 @@
 """
 MPCC Controller - Model Predictive Contouring Control for QCar2
 
-Uses pympc_core module (extracted from PyMPC framework) for proper MPCC
-with CasADi optimization. Key fix: creates fresh CasADi Opti() per solve
-to prevent constraint accumulation bug.
+Solver backend selection (automatic, configured via config/modules.yaml):
+  1. C++ SQP (Eigen, gradient projection) — fastest, preferred
+  2. CasADi MPCC (pympc_core, fresh Opti per solve) — proven stable
+  3. Pure Pursuit + Stanley — safe fallback when no optimizer available
+
+The auto-selection hierarchy is implemented in SOLVER_BACKEND at module
+level: C++ > CasADi > fallback. This matches the 'auto' setting in
+config/modules.yaml -> controller.backend.
+
+To force a specific backend:
+  config/modules.yaml -> controller.backend: casadi
+  (or modify SOLVER_BACKEND directly for development)
 
 Key Features:
 - CasADi MPCC with fresh Opti per solve (no constraint accumulation)
@@ -46,9 +55,16 @@ from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Twist, PoseStamped, Point
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, String
+from sensor_msgs.msg import JointState
 from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
 from tf2_ros import TransformException
+
+try:
+    from qcar2_interfaces.msg import MotorCommands
+    HAS_MOTOR_COMMANDS = True
+except ImportError:
+    HAS_MOTOR_COMMANDS = False
 
 # Import road boundaries and traffic control state
 from acc_stage1_mission.road_boundaries import RoadBoundarySpline
@@ -98,7 +114,7 @@ class MPCCConfig:
 
     # Vehicle parameters (QCar2)
     wheelbase: float = 0.256       # Wheelbase length (m)
-    max_velocity: float = 0.40     # Max forward velocity (m/s) - reduced for lane safety
+    max_velocity: float = 0.60     # Max forward velocity (m/s) - increased for direct motor mode
     min_velocity: float = -0.15    # Max reverse velocity (m/s)
     max_steering: float = 0.45     # Max steering angle (rad)
     max_acceleration: float = 0.6  # Max acceleration (m/s^2) - smoother transitions
@@ -119,8 +135,8 @@ class MPCCConfig:
     safety_margin: float = 0.10     # Extra safety distance (m)
     robot_radius: float = 0.13      # Vehicle collision radius (m) - QCar2 is small
 
-    # Reference velocity - reduced for safe cornering
-    reference_velocity: float = 0.35  # Target velocity (m/s)
+    # Reference velocity - increased for direct motor mode
+    reference_velocity: float = 0.50  # Target velocity (m/s)
 
     # Solver settings
     max_iterations: int = 75        # More iterations for better solutions
@@ -366,8 +382,8 @@ class MPCCBridge:
         # Convert state to numpy array
         x0 = state.as_array()  # [x, y, theta, v, delta]
 
-        # Convert obstacles to (x, y, radius) tuples
-        obs_list = [(obs.x, obs.y, obs.radius) for obs in obstacles]
+        # Convert obstacles to (x, y, radius, vx, vy) tuples
+        obs_list = [(obs.x, obs.y, obs.radius, obs.vx, obs.vy) for obs in obstacles]
 
         # Compute boundary constraints if available
         boundary_constraints = None
@@ -441,12 +457,14 @@ class MPCCControllerNode(Node):
         self.declare_parameter('contour_weight', self.config.contour_weight)
         self.declare_parameter('lag_weight', self.config.lag_weight)
         self.declare_parameter('horizon', self.config.horizon)
+        self.declare_parameter('use_direct_motor', True)
 
         # Update config from parameters
         self.config.reference_velocity = self.get_parameter('reference_velocity').value
         self.config.contour_weight = self.get_parameter('contour_weight').value
         self.config.lag_weight = self.get_parameter('lag_weight').value
         self.config.horizon = self.get_parameter('horizon').value
+        self.use_direct_motor = self.get_parameter('use_direct_motor').value and HAS_MOTOR_COMMANDS
 
         # Load road boundaries
         self.road_boundaries = None
@@ -477,6 +495,12 @@ class MPCCControllerNode(Node):
         self.current_progress = 0.0
         self.obstacles: List[Obstacle] = []
         self.motion_enabled = True
+        self._motion_disabled_time = 0.0
+        self._motion_disable_timeout = 8.0  # Auto-resume after 8s
+        self._motion_resume_cooldown_until = 0.0  # Ignore re-disabling until this time
+        self._motion_resume_cooldown_s = 5.0
+        self._motion_enable_consecutive = 0  # Hysteresis counter for re-enabling
+        self._MOTION_ENABLE_HYSTERESIS = 5   # Require 5 consecutive true msgs (~500ms)
         self.has_odom = False
         self.has_path = False
 
@@ -488,6 +512,7 @@ class MPCCControllerNode(Node):
         self._traffic_control_state: Optional[TrafficControlState] = None
         self._needs_path_recompute = False
         self._was_stopped_for_traffic = False
+        self._traffic_stop_start_time = 0.0
 
         # Mission hold state - when True, stop sending commands (dwell at pickup/dropoff)
         self._mission_hold = False
@@ -506,8 +531,12 @@ class MPCCControllerNode(Node):
         self._odom_velocity = 0.0  # Velocity from /odom topic (more accurate than TF)
 
         # Publishers
-        # Use /cmd_vel_nav which is what nav2_qcar_command_convert subscribes to
+        # Use /cmd_vel_nav for Twist (debug/legacy mode)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel_nav', 10)
+        # Direct MotorCommands publisher (bypasses nav2_qcar_command_convert)
+        self.motor_pub = None
+        if self.use_direct_motor:
+            self.motor_pub = self.create_publisher(MotorCommands, '/qcar2_motor_speed_cmd', 1)
         self.viz_pub = self.create_publisher(MarkerArray, '/mpcc/predicted_path', 10)
         self.status_pub = self.create_publisher(String, '/mpcc/status', 10)
 
@@ -540,6 +569,17 @@ class MPCCControllerNode(Node):
         self.hold_sub = self.create_subscription(
             Bool, '/mission/hold', self._hold_callback, 10)
 
+        # JointState subscriber for encoder-based velocity (more accurate)
+        self.joint_sub = self.create_subscription(
+            JointState, '/qcar2_joint', self._joint_state_callback, qos)
+        self._joint_velocity = 0.0
+        self._has_joint_velocity = False
+
+        # Stall detection: detect when commands are sent but vehicle doesn't move
+        self._stall_cmd_start_time = None  # When we first started sending non-zero cmds
+        self._stall_warned = False
+        self._stall_timeout = 5.0  # Warn after 5s of non-zero cmds with v=0
+
         # Control timer (20 Hz)
         self.control_timer = self.create_timer(0.05, self._control_loop)
 
@@ -551,15 +591,54 @@ class MPCCControllerNode(Node):
         # Initialize log file
         self._init_log_file()
 
+        motor_mode = "direct MotorCommands" if self.use_direct_motor else "Twist via nav2_qcar_command_convert"
         self.get_logger().info("MPCC Controller initialized")
         self.get_logger().info(f"  Horizon: {self.config.horizon}")
         self.get_logger().info(f"  Reference velocity: {self.config.reference_velocity} m/s")
+        self.get_logger().info(f"  Max velocity: {self.config.max_velocity} m/s")
+        self.get_logger().info(f"  Motor mode: {motor_mode}")
         self.get_logger().info(f"  Solver: pympc_core ({self.solver._backend})")
-        self.get_logger().info(f"  Subscribing to: /odom (or TF map->base_link), /plan, /motion_enable")
-        self.get_logger().info(f"  Publishing to: /cmd_vel_nav")
         self.get_logger().info(f"  Log file: {self._log_path}")
         self._log(f"MPCC initialized: horizon={self.config.horizon} v_ref={self.config.reference_velocity} "
                   f"solver=pympc_core({self.solver._backend})")
+
+        # Delayed pipeline check (3s after init to allow other nodes to start)
+        self._pipeline_check_timer = self.create_timer(3.0, self._check_cmd_pipeline)
+        self._pipeline_check_done = False
+
+    def _check_cmd_pipeline(self):
+        """Check that command pipeline has downstream subscribers."""
+        if self._pipeline_check_done:
+            return
+        self._pipeline_check_done = True
+        self._pipeline_check_timer.cancel()
+
+        if self.use_direct_motor and self.motor_pub is not None:
+            subs = self.motor_pub.get_subscription_count()
+            if subs == 0:
+                msg = (
+                    "WARNING: /qcar2_motor_speed_cmd has 0 subscribers! "
+                    "qcar2_hardware is not running. "
+                    "Vehicle will not move. Ensure Terminal 1 (qcar2_virtual_launch.py) is running."
+                )
+                self.get_logger().error(msg)
+                self._log(msg)
+            else:
+                self.get_logger().info(f"Command pipeline OK: /qcar2_motor_speed_cmd has {subs} subscriber(s) (direct motor mode)")
+                self._log(f"Pipeline check: /qcar2_motor_speed_cmd has {subs} subscriber(s) (direct)")
+        else:
+            subs = self.cmd_pub.get_subscription_count()
+            if subs == 0:
+                msg = (
+                    "WARNING: /cmd_vel_nav has 0 subscribers! "
+                    "nav2_qcar_command_convert is not running. "
+                    "Vehicle will not move. Ensure Terminal 1 (qcar2_virtual_launch.py) is running."
+                )
+                self.get_logger().error(msg)
+                self._log(msg)
+            else:
+                self.get_logger().info(f"Command pipeline OK: /cmd_vel_nav has {subs} subscriber(s)")
+                self._log(f"Pipeline check: /cmd_vel_nav has {subs} subscriber(s)")
 
     def _init_log_file(self):
         """Create timestamped MPCC log file."""
@@ -697,6 +776,14 @@ class MPCCControllerNode(Node):
                 self.current_state.v = msg.twist.twist.linear.x
                 self._last_odom_msg_time = self.get_clock().now().nanoseconds / 1e9
 
+    def _joint_state_callback(self, msg: JointState):
+        """Compute actual velocity from encoder ticks (matches reference MPC_node.py)."""
+        if msg.velocity:
+            encoder_vel = msg.velocity[0]
+            v = (encoder_vel / (720.0 * 4.0)) * ((13.0 * 19.0) / (70.0 * 30.0)) * (2.0 * math.pi) * 0.033
+            self._joint_velocity = v
+            self._has_joint_velocity = True
+
     def _update_state_from_tf(self) -> bool:
         """
         Update vehicle state from TF. Tries multiple frame combinations.
@@ -768,12 +855,29 @@ class MPCCControllerNode(Node):
         return False
 
     def _path_callback(self, msg: Path):
-        """Update reference path"""
+        """Update reference path, skipping reset if path is unchanged."""
         if len(msg.poses) < 2:
             self.get_logger().warn(f"Path too short ({len(msg.poses)} poses), need at least 2")
             return
 
         waypoints = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+
+        # Check if this is the same path we already have (avoid resetting
+        # spline/progress/solver on repeated publishes of the same path)
+        if self.reference_path is not None and self.has_path:
+            same_count = len(waypoints) == len(self.reference_path.waypoints)
+            if same_count:
+                old_start = self.reference_path.waypoints[0]
+                old_end = self.reference_path.waypoints[-1]
+                new_start = waypoints[0]
+                new_end = waypoints[-1]
+                if (abs(new_start[0] - old_start[0]) < 0.01 and
+                    abs(new_start[1] - old_start[1]) < 0.01 and
+                    abs(new_end[0] - old_end[0]) < 0.01 and
+                    abs(new_end[1] - old_end[1]) < 0.01):
+                    # Same path — skip full reset
+                    return
+
         self.reference_path = ReferencePath(waypoints)
         self.has_path = True
 
@@ -793,8 +897,28 @@ class MPCCControllerNode(Node):
         self._log(path_msg)
 
     def _motion_callback(self, msg: Bool):
-        """Handle motion enable/disable"""
-        self.motion_enabled = msg.data
+        """Handle motion enable/disable with auto-resume timeout and hysteresis.
+
+        Intermittent detections can cause motion_enable to flicker between
+        true/false, resetting the auto-resume timer. We require N consecutive
+        true messages before re-enabling to prevent this.
+        """
+        now = self.get_clock().now().nanoseconds / 1e9
+        if msg.data:
+            self._motion_enable_consecutive += 1
+            if self._motion_enable_consecutive >= self._MOTION_ENABLE_HYSTERESIS:
+                self.motion_enabled = True
+                self._motion_disabled_time = 0.0
+                self._motion_enable_consecutive = 0
+            # Don't reset motion_disabled_time on single true messages
+        else:
+            self._motion_enable_consecutive = 0
+            # Ignore re-disabling during post-resume cooldown
+            if self._motion_resume_cooldown_until > now:
+                return
+            if self.motion_enabled:
+                self._motion_disabled_time = now
+            self.motion_enabled = False
 
     # Classes that are PHYSICAL obstacles requiring avoidance
     # Signs and lights are NOT physical obstacles — they're traffic control
@@ -823,10 +947,13 @@ class MPCCControllerNode(Node):
                     if obj_class not in self._obstacle_first_seen_time:
                         self._obstacle_first_seen_time[obj_class] = current_time
                     elif (current_time - self._obstacle_first_seen_time[obj_class]) > self._obstacle_timeout_s:
-                        # Phantom obstacle — detected too long, skip it
-                        self._log(f"OBSTACLE TIMEOUT: {obj_class} detected for "
-                                  f"{current_time - self._obstacle_first_seen_time[obj_class]:.1f}s, ignoring")
-                        continue
+                        # Phantom obstacle timeout — but NEVER ignore pedestrians
+                        if obj_class == 'person':
+                            pass  # Always respect pedestrian detections
+                        else:
+                            self._log(f"OBSTACLE TIMEOUT: {obj_class} detected for "
+                                      f"{current_time - self._obstacle_first_seen_time[obj_class]:.1f}s, ignoring")
+                            continue
 
                     obs_x = self.current_state.x + dist * np.cos(self.current_state.theta)
                     obs_y = self.current_state.y + dist * np.sin(self.current_state.theta)
@@ -874,8 +1001,7 @@ class MPCCControllerNode(Node):
         if msg.data and not was_held:
             self.get_logger().info("Mission HOLD received - stopping")
             self._log("HOLD: mission hold received - stopping")
-            cmd = Twist()
-            self.cmd_pub.publish(cmd)
+            self._publish_stop()
         elif not msg.data and was_held:
             self.get_logger().info("Mission HOLD released - resuming")
             self._log("HOLD: released - resuming")
@@ -891,13 +1017,34 @@ class MPCCControllerNode(Node):
             return False
 
         tc = self._traffic_control_state
+        current_time = self.get_clock().now().nanoseconds / 1e9
+
+        # Skip traffic control during post-resume cooldown
+        if self._motion_resume_cooldown_until > current_time:
+            return False
 
         if tc.should_stop:
+            # Track when traffic stop started
+            if not self._was_stopped_for_traffic:
+                self._traffic_stop_start_time = current_time
+
+            # Timeout: if stopped for traffic for > 10s, force resume
+            if (hasattr(self, '_traffic_stop_start_time') and
+                    self._traffic_stop_start_time > 0 and
+                    (current_time - self._traffic_stop_start_time) > 10.0):
+                # Yield signs get longer cooldown to drive past the sign
+                cooldown = 8.0 if tc.control_type == "yield_sign" else self._motion_resume_cooldown_s
+                self.get_logger().warn(
+                    f"Traffic control stop timeout (10s) for {tc.control_type}, "
+                    f"force resuming (cooldown={cooldown:.0f}s)")
+                self._log(f"TRAFFIC TIMEOUT: force resume after 10s, was={tc.control_type}, cooldown={cooldown:.0f}s")
+                self._was_stopped_for_traffic = False
+                self._traffic_stop_start_time = 0.0
+                self._motion_resume_cooldown_until = current_time + cooldown
+                return False
+
             # Stop the vehicle
-            cmd = Twist()
-            cmd.linear.x = 0.0
-            cmd.angular.z = 0.0
-            self.cmd_pub.publish(cmd)
+            self._publish_stop()
 
             if tc.control_type == "traffic_light":
                 self._publish_status(f"Stopped at RED light (dist={tc.distance:.2f}m)")
@@ -964,8 +1111,13 @@ class MPCCControllerNode(Node):
         if not self.has_odom:
             return
 
-        # Use velocity from /odom topic if available (more accurate than TF-derived velocity)
-        if self._odom_velocity != 0.0 or self._last_odom_msg_time is not None:
+        # Use best available velocity source:
+        # 1. JointState encoder (most accurate, like reference MPC_node.py)
+        # 2. Odom topic velocity
+        # 3. TF-derived velocity (least accurate)
+        if self._has_joint_velocity:
+            self.current_state.v = self._joint_velocity
+        elif self._odom_velocity != 0.0 or self._last_odom_msg_time is not None:
             current_time = self.get_clock().now().nanoseconds / 1e9
             if self._last_odom_msg_time and (current_time - self._last_odom_msg_time) < 0.5:
                 self.current_state.v = self._odom_velocity
@@ -975,15 +1127,23 @@ class MPCCControllerNode(Node):
 
         # Check mission hold (dwell at pickup/dropoff)
         if self._mission_hold:
-            cmd = Twist()
-            self.cmd_pub.publish(cmd)
+            self._publish_stop()
             return
 
         if not self.motion_enabled:
-            # Stop
-            cmd = Twist()
-            self.cmd_pub.publish(cmd)
-            return
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            if (self._motion_disabled_time > 0 and
+                    (current_time - self._motion_disabled_time) > self._motion_disable_timeout):
+                self.get_logger().warn(
+                    f"motion_enable false for {current_time - self._motion_disabled_time:.1f}s, "
+                    f"auto-resuming (timeout={self._motion_disable_timeout:.0f}s)")
+                self._log(f"MOTION AUTO-RESUME: after {current_time - self._motion_disabled_time:.1f}s")
+                self.motion_enabled = True
+                self._motion_disabled_time = 0.0
+                self._motion_resume_cooldown_until = current_time + self._motion_resume_cooldown_s
+            else:
+                self._publish_stop()
+                return
 
         # Check traffic control state (stop signs, traffic lights)
         if self._handle_traffic_control():
@@ -1001,8 +1161,7 @@ class MPCCControllerNode(Node):
         # Check if reached end of path
         remaining_distance = self.reference_path.total_length - self.current_progress
         if remaining_distance < 0.15:
-            cmd = Twist()
-            self.cmd_pub.publish(cmd)
+            self._publish_stop()
             self._publish_status("Goal reached")
             self._log(f"GOAL REACHED: remaining={remaining_distance:.3f}m progress={self.current_progress:.2f}/{self.reference_path.total_length:.2f}")
             return
@@ -1031,38 +1190,64 @@ class MPCCControllerNode(Node):
                     f"xtrack={cross_track:.3f}m"
                 )
 
-        # Convert to Twist message with safety limits
-        cmd = Twist()
-
+        # Apply safety limits
         # Decelerate near the goal for a clean full stop
         if remaining_distance < 0.5:
-            # Linear deceleration: scale velocity by remaining distance
             decel_factor = remaining_distance / 0.5
             v_cmd = v_cmd * decel_factor
-            # Ensure minimum creep speed until very close
             if remaining_distance > 0.2:
                 v_cmd = max(v_cmd, 0.08)
 
         # Clamp velocity to safe range, respecting zone limits
         effective_max_v = min(self.config.max_velocity, zone_velocity_limit)
         v_cmd = np.clip(v_cmd, 0.0, effective_max_v)
-        cmd.linear.x = float(v_cmd)
 
         # Clamp steering angle to prevent extreme values
         delta_cmd = np.clip(delta_cmd, -self.config.max_steering, self.config.max_steering)
 
-        # Convert steering angle to angular velocity: omega = v * tan(delta) / L
+        # Publish MotorCommands directly (bypass nav2_qcar_command_convert)
+        if self.use_direct_motor and self.motor_pub is not None:
+            motor_cmd = MotorCommands()
+            motor_cmd.motor_names = ['steering_angle', 'motor_throttle']
+            motor_cmd.values = [float(delta_cmd), float(v_cmd)]
+            self.motor_pub.publish(motor_cmd)
+
+        # Also publish Twist for debug/visualization (and legacy mode)
+        cmd = Twist()
+        cmd.linear.x = float(v_cmd)
         omega = v_cmd * np.tan(delta_cmd) / self.config.wheelbase
-
-        # Safety clamp on angular velocity (max ~1.5 rad/s)
-        # The MPCC solver already constrains steering rate, so this is just
-        # a safety bound. No rate limiting here - that would fight the solver
-        # and cause trajectory divergence.
-        max_omega = 1.5
-        omega = np.clip(omega, -max_omega, max_omega)
+        omega = np.clip(omega, -1.5, 1.5)
         cmd.angular.z = float(omega)
-
         self.cmd_pub.publish(cmd)
+
+        # Stall detection: warn if sending commands but vehicle isn't moving
+        now = self.get_clock().now().nanoseconds / 1e9
+        if v_cmd > 0.05:
+            if self._stall_cmd_start_time is None:
+                self._stall_cmd_start_time = now
+            elif abs(self.current_state.v) < 0.01 and (now - self._stall_cmd_start_time) > self._stall_timeout:
+                if not self._stall_warned:
+                    self._stall_warned = True
+                    if self.use_direct_motor and self.motor_pub is not None:
+                        subs = self.motor_pub.get_subscription_count()
+                        topic_name = "/qcar2_motor_speed_cmd"
+                    else:
+                        subs = self.cmd_pub.get_subscription_count()
+                        topic_name = "/cmd_vel_nav"
+                    warn_msg = (
+                        f"STALL DETECTED: Publishing v={v_cmd:.2f} to {topic_name} but vehicle v=0.00 "
+                        f"for {now - self._stall_cmd_start_time:.0f}s. "
+                        f"{topic_name} has {subs} subscriber(s). "
+                    )
+                    if subs == 0:
+                        warn_msg += f"No subscribers! Check Terminal 1 (qcar2_virtual_launch.py)."
+                    else:
+                        warn_msg += "Subscribers present - check qcar2_hardware pipeline, or QLabs connection."
+                    self.get_logger().error(warn_msg)
+                    self._log(warn_msg)
+        else:
+            self._stall_cmd_start_time = None
+            self._stall_warned = False
 
         # Log commands at ~1Hz (every 20th cycle)
         if self._cmd_count % 20 == 1:
@@ -1085,7 +1270,18 @@ class MPCCControllerNode(Node):
 
         # Include more diagnostic info in status
         progress_pct = 100 * self.current_progress / self.reference_path.total_length if self.reference_path.total_length > 0 else 0
-        self._publish_status(f"v={v_cmd:.2f}, omega={cmd.angular.z:.2f}, delta={np.degrees(delta_cmd):.1f}deg, progress={progress_pct:.0f}%")
+        motor_str = "direct" if self.use_direct_motor else "twist"
+        self._publish_status(f"v={v_cmd:.2f}, delta={np.degrees(delta_cmd):.1f}deg, progress={progress_pct:.0f}%, motor={motor_str}")
+
+    def _publish_stop(self):
+        """Publish zero velocity on all command channels."""
+        cmd = Twist()
+        self.cmd_pub.publish(cmd)
+        if self.use_direct_motor and self.motor_pub is not None:
+            motor_cmd = MotorCommands()
+            motor_cmd.motor_names = ['steering_angle', 'motor_throttle']
+            motor_cmd.values = [0.0, 0.0]
+            self.motor_pub.publish(motor_cmd)
 
     def _publish_predicted_path(self, predicted: np.ndarray):
         """Publish predicted trajectory for visualization"""

@@ -145,7 +145,10 @@ class CubicSplinePath:
         denom = (dx_ds**2 + dy_ds**2)**1.5
         if abs(denom) < 1e-10:
             return 0.0
-        return float((dx_ds * d2y_ds2 - dy_ds * d2x_ds2) / denom)
+        kappa = float((dx_ds * d2y_ds2 - dy_ds * d2x_ds2) / denom)
+        # Clamp curvature to prevent spikes at sharp corners between straight segments
+        max_kappa = 5.0  # min turn radius ~0.2m
+        return max(-max_kappa, min(max_kappa, kappa))
 
     def _linear_position(self, s: float) -> Tuple[float, float]:
         """Piecewise linear position fallback."""

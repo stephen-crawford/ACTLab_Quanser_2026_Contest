@@ -1,0 +1,167 @@
+{
+  "HSV+Contour": {
+    "tp": 12,
+    "fp": 16,
+    "fn": 16,
+    "precision": 0.42857142857142855,
+    "recall": 0.42857142857142855,
+    "f1": 0.42857142857142855,
+    "mean_time_ms": 1.6300313335856724,
+    "median_time_ms": 1.392851000673545,
+    "std_time_ms": 0.6517624887759592,
+    "distance_error_mean": 0.11434472244304343,
+    "distance_error_std": 0.11410270217777932,
+    "per_class": {
+      "stop_sign": {
+        "tp": 4,
+        "fp": 5,
+        "fn": 2,
+        "precision": 0.4444444444444444,
+        "recall": 0.6666666666666666,
+        "f1": 0.5333333333333333
+      },
+      "traffic_light_red": {
+        "tp": 0,
+        "fp": 4,
+        "fn": 4,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      "traffic_light_green": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 4,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      "cone": {
+        "tp": 8,
+        "fp": 7,
+        "fn": 1,
+        "precision": 0.5333333333333333,
+        "recall": 0.8888888888888888,
+        "f1": 0.6666666666666667
+      },
+      "pedestrian": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 5,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      }
+    }
+  },
+  "Hough+HSV": {
+    "tp": 12,
+    "fp": 14,
+    "fn": 16,
+    "precision": 0.46153846153846156,
+    "recall": 0.42857142857142855,
+    "f1": 0.4444444444444445,
+    "mean_time_ms": 3.1704948333602565,
+    "median_time_ms": 2.9310794998309575,
+    "std_time_ms": 0.8586408104382437,
+    "distance_error_mean": 0.11434472244304343,
+    "distance_error_std": 0.11410270217777932,
+    "per_class": {
+      "stop_sign": {
+        "tp": 4,
+        "fp": 5,
+        "fn": 2,
+        "precision": 0.4444444444444444,
+        "recall": 0.6666666666666666,
+        "f1": 0.5333333333333333
+      },
+      "traffic_light_red": {
+        "tp": 0,
+        "fp": 2,
+        "fn": 4,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      "traffic_light_green": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 4,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      "cone": {
+        "tp": 8,
+        "fp": 7,
+        "fn": 1,
+        "precision": 0.5333333333333333,
+        "recall": 0.8888888888888888,
+        "f1": 0.6666666666666667
+      },
+      "pedestrian": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 5,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      }
+    }
+  },
+  "Hybrid HSV+YOLO": {
+    "tp": 12,
+    "fp": 16,
+    "fn": 16,
+    "precision": 0.42857142857142855,
+    "recall": 0.42857142857142855,
+    "f1": 0.42857142857142855,
+    "mean_time_ms": 1.4253731250543449,
+    "median_time_ms": 1.2015860002065892,
+    "std_time_ms": 0.6615598834115044,
+    "distance_error_mean": 0.11434472244304343,
+    "distance_error_std": 0.11410270217777932,
+    "per_class": {
+      "stop_sign": {
+        "tp": 4,
+        "fp": 5,
+        "fn": 2,
+        "precision": 0.4444444444444444,
+        "recall": 0.6666666666666666,
+        "f1": 0.5333333333333333
+      },
+      "traffic_light_red": {
+        "tp": 0,
+        "fp": 4,
+        "fn": 4,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      "traffic_light_green": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 4,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      "cone": {
+        "tp": 8,
+        "fp": 7,
+        "fn": 1,
+        "precision": 0.5333333333333333,
+        "recall": 0.8888888888888888,
+        "f1": 0.6666666666666667
+      },
+      "pedestrian": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 5,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      }
+    }
+  }
+}

@@ -37,6 +37,8 @@ from action_msgs.msg import GoalStatus
 from rclpy.qos import DurabilityPolicy
 
 from acc_stage1_mission.road_graph import RoadGraph, qlabs_path_to_map_path
+from acc_stage1_mission.planner_interface import create_planner
+from acc_stage1_mission.module_config import load_module_config
 
 
 def yaw_to_quat(yaw: float):
@@ -131,8 +133,9 @@ def qlabs_to_map_frame(qlabs_x: float, qlabs_y: float, qlabs_yaw: float,
     cos_t = math.cos(theta)
     sin_t = math.sin(theta)
 
-    map_x = translated_x * cos_t + translated_y * sin_t
-    map_y = -translated_x * sin_t + translated_y * cos_t
+    # R(+θ): rotate translated coords into map frame
+    map_x = translated_x * cos_t - translated_y * sin_t
+    map_y = translated_x * sin_t + translated_y * cos_t
 
     # Step 3: Transform heading
     map_yaw = qlabs_yaw - (-theta)
@@ -157,7 +160,7 @@ def map_to_qlabs_frame(map_x: float, map_y: float, map_yaw: float,
     Returns:
         (qlabs_x, qlabs_y, qlabs_yaw): Position and heading in QLabs world frame
     """
-    # Step 1: Rotate back by R(θ) — the inverse of R(θ)^T used in qlabs_to_map_frame
+    # Step 1: Rotate back by R(-θ) — the inverse of R(+θ) used in qlabs_to_map_frame
     if origin_heading_rad is not None:
         theta = origin_heading_rad
     else:
@@ -165,8 +168,9 @@ def map_to_qlabs_frame(map_x: float, map_y: float, map_yaw: float,
     cos_t = math.cos(theta)
     sin_t = math.sin(theta)
 
-    rotated_x = map_x * cos_t - map_y * sin_t
-    rotated_y = map_x * sin_t + map_y * cos_t
+    # R(-θ): inverse of the R(+θ) used in qlabs_to_map_frame
+    rotated_x = map_x * cos_t + map_y * sin_t
+    rotated_y = -map_x * sin_t + map_y * cos_t
 
     # Step 2: Translate back to QLabs origin
     qlabs_x = rotated_x + origin_x
@@ -227,12 +231,13 @@ class MissionManager(Node):
         self.declare_parameter("enable_led", True)
         self.declare_parameter("goal_tol_m", 0.35)
         self.declare_parameter("enable_obstacle_detection", True)
-        self.declare_parameter("obstacle_pause_timeout_s", 30.0)
+        self.declare_parameter("obstacle_pause_timeout_s", 10.0)
         self.declare_parameter("backup_distance_m", 0.15)
         self.declare_parameter("backup_speed", 0.1)
         # MPCC mode: use ComputePathToPose instead of NavigateToPose
         # This lets MPCC controller handle path following instead of Nav2's controller
         self.declare_parameter("mpcc_mode", False)
+        self.declare_parameter("path_planning_algorithm", "auto")
 
         # Get parameters
         config_file = self.get_parameter("config_file").get_parameter_value().string_value
@@ -247,6 +252,7 @@ class MissionManager(Node):
         self._backup_distance_m = self.get_parameter("backup_distance_m").get_parameter_value().double_value
         self._backup_speed = self.get_parameter("backup_speed").get_parameter_value().double_value
         self._mpcc_mode = self.get_parameter("mpcc_mode").get_parameter_value().bool_value
+        self._path_planning_algorithm = self.get_parameter("path_planning_algorithm").get_parameter_value().string_value
 
         # Load config
         if not config_file:
@@ -360,10 +366,12 @@ class MissionManager(Node):
         # Nav2 action clients
         if self._mpcc_mode:
             # MPCC mode: use road-graph-based path planner (bypasses Nav2 NavFn)
-            # Initialize road graph for lane-following path generation
-            self._road_graph = RoadGraph(ds=0.01)  # 1cm waypoint spacing
-            self.get_logger().info("Road graph initialized with routes: %s" %
-                                   self._road_graph.get_route_names())
+            # Initialize road graph with selected planning backend
+            planner = self._create_planner()
+            self._road_graph = RoadGraph(ds=0.01, planner=planner)  # 1cm waypoint spacing
+            self.get_logger().info("Road graph initialized with routes: %s, planner: %s" %
+                                   (self._road_graph.get_route_names(),
+                                    self._road_graph._planner.name))
 
             # Still create Nav2 client as fallback
             self.nav_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose",
@@ -483,6 +491,24 @@ class MissionManager(Node):
         self._coord_log_timer = self.create_timer(1.0, self._log_coordinates)
 
         self._publish_status("WAIT_FOR_NAV")
+
+    def _create_planner(self):
+        """Create path planning backend from parameter or modules.yaml."""
+        algo = self._path_planning_algorithm
+        kwargs = {}
+
+        if algo == 'auto':
+            # Resolve from modules.yaml
+            try:
+                mod_config = load_module_config()
+                algo = mod_config['path_planning']['backend']
+                epsilon = mod_config['path_planning'].get('weighted_epsilon', 1.5)
+                kwargs['weighted_epsilon'] = epsilon
+            except Exception:
+                algo = 'experience_astar'
+
+        self.get_logger().info(f"Path planning algorithm: {algo}")
+        return create_planner(algo, **kwargs)
 
     # -------------------------------------------------------------------------
     # Logging - Behavior Events & Coordinate Trace
@@ -1295,9 +1321,14 @@ class MissionManager(Node):
             if self._motion_enabled:
                 self._resume_from_pause()
             elif (time.time() - self._obstacle_pause_start) > self._obstacle_pause_timeout_s:
-                self.get_logger().warn("Obstacle pause timeout - entering recovery")
-                self._obstacle_pause_start = None
-                self.state = MissionState.RECOVERING
+                # Force resume instead of entering recovery - likely a false positive
+                self.get_logger().warn(
+                    f"Obstacle pause timeout ({self._obstacle_pause_timeout_s:.0f}s) - "
+                    "force resuming (likely false positive)")
+                self._log_behavior("OBSTACLE_TIMEOUT_RESUME",
+                    f"forced resume after {self._obstacle_pause_timeout_s:.0f}s")
+                self._motion_enabled = True
+                self._resume_from_pause()
             return
 
         # ---- DWELL ----

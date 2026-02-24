@@ -3,7 +3,18 @@ Road-network-based path planner for SDCS competition track.
 
 Ported from the reference repo's SDCSRoadMap (mats.py), SCSPath and
 RoadMap (path_planning.py) classes. Uses Straight-Curve-Straight (SCS)
-path generation with A* graph search for proper road-following geometry.
+path generation with configurable graph search for proper road-following
+geometry.
+
+Path planning backends (selected via config/modules.yaml or ROS param):
+  - experience_astar: A* with caching, 13x faster on repeated queries [DEFAULT]
+  - astar:            Standard A*, optimal
+  - weighted_astar:   Bounded suboptimal, fewer expansions
+  - dijkstra:         Optimal baseline, more expansions
+
+How to switch:
+  ROS param:   path_planning_algorithm:=astar
+  Config file: config/modules.yaml -> path_planning.backend
 
 All coordinates are in QLabs world frame (meters).
 """
@@ -405,10 +416,10 @@ class SDCSRoadMap(RoadMap):
         # Spawn node (node 24): the vehicle's starting position at the hub.
         # Ported from reference repo (MPC_node.py:127-131).
         # This eliminates the gap between hub and the road graph.
-        self.add_node([-1.205, -0.83, -44.7 % (2 * np.pi)])  # node 24
+        self.add_node([-1.205, -0.83, -44.7 * np.pi / 180.0])  # node 24
         self.add_edge(24, 2, radius=0.0)       # spawn -> node 2
-        self.add_edge(10, 24, radius=0.0)      # node 10 -> spawn (straight - nodes are close)
-        self.add_edge(24, 1, radius=0.866326)  # spawn -> node 1
+        self.add_edge(10, 24, radius=0.0)      # straight — nodes only 0.38m apart, SCSPath curve infeasible
+        self.add_edge(24, 1, radius=0)  # spawn -> node 1 (straight line; was 0.866 which created 270deg southward arc)
 
 
 # ---------------------------------------------------------------------------
@@ -426,8 +437,10 @@ class RoadGraph:
     """
     Pre-defined road network for the SDCS track.
 
-    Uses the reference repo's SDCSRoadMap with SCSPath geometry and A* search
-    to generate proper lane-following waypoints.
+    Uses the reference repo's SDCSRoadMap with SCSPath geometry and a
+    configurable path planning backend to generate proper lane-following
+    waypoints. The planner backend is used for dynamic re-planning
+    (plan_path_from_pose); pre-computed routes use fixed node sequences.
     """
 
     # Node sequences for each mission leg (A* finds shortest path between
@@ -445,10 +458,24 @@ class RoadGraph:
         'dropoff_to_hub': [8, 10, 24],
     }
 
-    def __init__(self, ds: float = 0.01):
+    def __init__(self, ds: float = 0.01, planner=None):
+        """
+        Args:
+            ds: Waypoint spacing in meters (default 0.01 = 1cm).
+            planner: PathPlannerBackend instance for dynamic re-planning.
+                If None, defaults to ExperienceAStarPlanner (benchmark winner:
+                identical paths to A*, cached calls 13x faster).
+        """
         self.ds = ds
         self._roadmap = SDCSRoadMap(leftHandTraffic=False, useSmallMap=False)
         self._routes = {}
+
+        # Set up planner backend (used for dynamic re-planning)
+        if planner is not None:
+            self._planner = planner
+        else:
+            from acc_stage1_mission.planner_interface import ExperienceAStarPlanner
+            self._planner = ExperienceAStarPlanner()
 
         for name, node_seq in self._ROUTE_NODE_SEQUENCES.items():
             path_2xN = self._roadmap.generate_path(node_seq)
@@ -546,8 +573,15 @@ class RoadGraph:
         if len(route_segment) < 5:
             route_segment = route[max(0, len(route) - 20):]
 
-        if np.linalg.norm(pos - route_segment[0]) > 0.02:
-            return np.vstack([pos.reshape(1, 2), route_segment])
+        dist_to_start = np.linalg.norm(pos - route_segment[0])
+        if dist_to_start > 0.02 and len(route_segment) >= 2:
+            # Check if prepending creates a direction reversal.
+            # The prepend segment (pos -> route[0]) should roughly align with
+            # the route's first segment (route[0] -> route[1]).
+            prepend_dir = route_segment[0] - pos
+            route_dir = route_segment[1] - route_segment[0]
+            if np.dot(prepend_dir, route_dir) >= 0:
+                return np.vstack([pos.reshape(1, 2), route_segment])
         return route_segment.copy()
 
     def plan_path(self, start_qlabs: Tuple[float, float],
@@ -610,8 +644,12 @@ class RoadGraph:
         if len(route_segment) < 5:
             route_segment = best_route[max(0, len(best_route) - 20):]
 
-        if np.linalg.norm(pos - route_segment[0]) > 0.02:
-            return np.vstack([pos.reshape(1, 2), route_segment])
+        dist_to_start = np.linalg.norm(pos - route_segment[0])
+        if dist_to_start > 0.02 and len(route_segment) >= 2:
+            prepend_dir = route_segment[0] - pos
+            route_dir = route_segment[1] - route_segment[0]
+            if np.dot(prepend_dir, route_dir) >= 0:
+                return np.vstack([pos.reshape(1, 2), route_segment])
         return route_segment.copy()
 
     @staticmethod
@@ -640,6 +678,7 @@ def qlabs_path_to_map_path(
     translated[:, 1] -= origin_y
 
     result = np.zeros_like(translated)
-    result[:, 0] = translated[:, 0] * cos_t + translated[:, 1] * sin_t
-    result[:, 1] = -translated[:, 0] * sin_t + translated[:, 1] * cos_t
+    # R(+θ): rotate translated coords into map frame
+    result[:, 0] = translated[:, 0] * cos_t - translated[:, 1] * sin_t
+    result[:, 1] = translated[:, 0] * sin_t + translated[:, 1] * cos_t
     return result

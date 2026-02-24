@@ -11,39 +11,39 @@ traffic signs, traffic lights, lane boundaries, and avoiding obstacles.
 ## Architecture
 
 ```
-                 +------------------+
-                 | mission_manager  |  (Python) State machine: hub->pickup->dropoff->hub
-                 +--------+---------+
+                 +-------------------+
+                 | mission_manager   |  C++ (default) or Python fallback
+                 +--------+----------+
                           |
               +-----------+-----------+
               |                       |
      +--------v--------+    +--------v---------+
-     | road_graph       |    | sign_detector    |  C++ HSV+contour (preferred)
+     | road_graph       |    | sign_detector    |  C++ HSV+contour (default)
      | (path planning)  |    | or               |
-     +--------+---------+    | obstacle_detector|  Python YOLO (fallback)
+     +--------+---------+    | obstacle_detector|  Python modular backends (fallback)
               |              +--------+----------+
               |                       |
      +--------v---------+   +--------v----------+
      | mpcc_controller   |   | /traffic_control  |
-     | (C++ or Python)  |   | _state            |
+     | C++ SQP (default)|   | _state            |
      +--------+----------+   +-------------------+
               |
-     +--------v----------+
-     | nav2_qcar_command  |  (C++) Twist -> MotorCommands
-     | _convert           |
-     +--------+-----------+
+              | MotorCommands (direct: steering_angle + motor_throttle)
+              | (bypasses nav2_qcar_command_convert)
               |
      +--------v----------+
-     | qcar2_hardware    |  (C++) HIL driver
+     | qcar2_hardware    |  (C++) HIL driver + built-in PID
      +--------------------+
 ```
+
+Module configuration: `config/modules.yaml` (detection, path planning, controller backends)
 
 ### Packages
 
 | Package | Language | Purpose |
 |---------|----------|---------|
-| `acc_stage1_mission` | Python | Mission logic, MPCC control (Python), detection, path planning |
-| `acc_mpcc_controller_cpp` | C++ | C++ MPCC controller + sign detector nodes |
+| `acc_stage1_mission` | Python | Mission logic, MPCC control (fallback), detection (modular), path planning |
+| `acc_mpcc_controller_cpp` | C++ | MPCC controller, sign detector, mission manager, odom_from_tf (default stack) |
 | `qcar2_nodes` | C++ | Hardware interface (motors, cameras, lidar, LEDs) |
 | `qcar2_interfaces` | C++ | Custom ROS 2 messages (MotorCommands, BooleanLeds) |
 | `qcar2_autonomy` | Python | Quanser reference autonomy (Nav2 client) |
@@ -52,19 +52,21 @@ traffic signs, traffic lights, lane boundaries, and avoiding obstacles.
 
 | Node | Language | File | Purpose |
 |------|----------|------|---------|
-| `mission_manager` | Python | `mission_manager.py` | State machine, Nav2/MPCC goal management |
-| `mpcc_controller` | Python | `mpcc_controller.py` | MPCC path follower (CasADi or C++ solver) |
-| `mpcc_controller_cpp` | C++ | `cpp/mpcc_controller_node.cpp` | C++ MPCC controller with boundary constraints |
-| `sign_detector` | C++ | `cpp/sign_detector_node.cpp` | Fast HSV+contour sign/light/cone detection |
-| `obstacle_detector` | Python | `obstacle_detector.py` | YOLO-based detection (fallback) |
-| `odom_from_tf` | Python | `odom_from_tf.py` | TF -> /odom bridge |
+| `mission_manager` | C++/Python | `cpp/mission_manager_node.cpp` / `mission_manager.py` | State machine, path planning (C++ default) |
+| `mpcc_controller` | C++/Python | `cpp/mpcc_controller_node.cpp` / `mpcc_controller.py` | MPCC path follower (C++ SQP default) |
+| `sign_detector` | C++ | `cpp/sign_detector_node.cpp` | Fast HSV+contour sign/light/cone detection (default) |
+| `obstacle_detector` | Python | `obstacle_detector.py` | Modular detection backends (fallback when C++ sign detector disabled) |
+| `odom_from_tf` | C++/Python | `cpp/odom_from_tf_node.cpp` / `odom_from_tf.py` | TF -> /odom bridge (C++ default) |
+| `path_overlay` | Python | `path_overlay.py` | Bird's-eye path + vehicle visualizer (opt-in: `--overlay`) |
 
 ### Topics
 
 | Topic | Type | Publisher | Subscriber |
 |-------|------|-----------|------------|
 | `/plan` | Path | mission_manager | mpcc_controller |
-| `/cmd_vel_nav` | Twist | mpcc_controller | nav2_qcar_command_convert |
+| `/qcar2_motor_speed_cmd` | MotorCommands | mpcc_controller (direct mode) | qcar2_hardware |
+| `/cmd_vel_nav` | Twist | mpcc_controller (legacy/debug) | nav2_qcar_command_convert |
+| `/qcar2_joint` | JointState | qcar2_hardware | mpcc_controller (encoder velocity) |
 | `/motion_enable` | Bool | sign_detector / obstacle_detector | mpcc_controller, mission_manager |
 | `/traffic_control_state` | String (JSON) | sign_detector / obstacle_detector | mpcc_controller |
 | `/obstacle_positions` | String (JSON) | obstacle_detector | mpcc_controller_cpp |
@@ -118,22 +120,22 @@ bash build.sh
 ## Running
 
 ```bash
+# Recommended: use run_mission.sh (handles all terminals, builds, and Docker)
+./run_mission.sh             # Full C++ stack (auto-detects GPU for YOLO)
+./run_mission.sh --no-gpu    # C++ HSV detection only (skip GPU YOLO)
+./run_mission.sh --2025      # Use PolyCtrl 2025 MPCC weights for comparison
+./run_mission.sh --overlay   # Show bird's-eye path overlay (planned path + vehicle)
+./run_mission.sh --stop      # Stop all nodes
+./run_mission.sh --reset     # Sync code, rebuild, reset car
+
+# Manual launch (inside Isaac ROS container):
 # Terminal 1: Launch hardware + SLAM + Nav2
 ros2 launch qcar2_nodes virtual_sim.launch.py
 
-# Terminal 2: Launch mission (Python MPCC + optional C++ controller/sign detector)
+# Terminal 2: Launch MPCC mission (all C++ nodes)
 ros2 launch acc_stage1_mission mpcc_mission_launch.py
 
-# With C++ controller:
-ros2 launch acc_stage1_mission mpcc_mission_launch.py use_cpp_controller:=true
-
-# With C++ sign detector:
-ros2 launch acc_stage1_mission mpcc_mission_launch.py use_cpp_sign_detector:=true
-
-# Terminal 3: Launch Python YOLO obstacle detector (if not using C++ sign detector)
-ros2 run acc_stage1_mission obstacle_detector
-
-# Terminal 4: QLabs scenario setup
+# Terminal 3: QLabs scenario setup
 python3 Setup_Real_Scenario_Interleaved.py
 ```
 
@@ -141,6 +143,7 @@ python3 Setup_Real_Scenario_Interleaved.py
 
 | File | Purpose |
 |------|---------|
+| `config/modules.yaml` | Module backend selection (detection, path planning, controller) |
 | `config/mission.yaml` | Mission waypoints, transforms, timing |
 | `config/road_boundaries.yaml` | Road segments, traffic controls, obstacle zones |
 
@@ -150,20 +153,26 @@ Critical parameters (same defaults in Python `MPCCConfig` and C++ `mpcc::Config`
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `contour_weight` | 25.0 | Lateral deviation penalty (**PRIMARY** - must be > lag_weight) |
-| `lag_weight` | 5.0 | Progress tracking (secondary to lane keeping) |
-| `reference_velocity` | 0.35 | Target speed (m/s) - reduced for safe cornering |
-| `boundary_weight` | 30.0 | Road boundary soft constraint penalty |
-| `max_velocity` | 0.40 | Hard speed limit (m/s) |
-| `steering_rate_weight` | 4.0 | Smooth steering (prevents oscillation) |
+| `contour_weight` | 8.0 | Lateral deviation penalty (lane keeping) |
+| `lag_weight` | 12.0 | Progress tracking (**PRIMARY** - must be > contour_weight, ref: 7.0) |
+| `velocity_weight` | 15.0 | Velocity reference tracking (ref: R_ref=17.0) |
+| `reference_velocity` | 0.65 | Target speed (m/s) - ref uses 0.70 |
+| `boundary_weight` | 20.0 | Road boundary soft constraint penalty |
+| `max_velocity` | 1.2 | Hard speed limit (m/s) - ref uses 2.0; qcar2_hardware PD controls actual speed |
+| `use_direct_motor` | true | Bypass nav2_qcar_command_convert, publish MotorCommands directly |
+| `steering_rate_weight` | 3.0 | Smooth steering (prevents oscillation) |
 
-Curvature-adaptive speed: `v_ref = reference_velocity * exp(-1.2 * |curvature|)`
+Curvature-adaptive speed: `v_ref = reference_velocity * exp(-0.4 * |curvature|)` (matched to reference)
 
-## Root Cause Analysis (Feb 2025)
+## Root Cause Analysis (Feb 2025-2026)
 
-### Lane Violations
+### Vehicle Not Following Path (Feb 2026)
+- **Cause**: contour_weight (25) >> lag_weight (5) + low velocity_weight (2.0) made solver find "staying still in lane" optimal; curvature decay -1.2 was 3x too aggressive vs reference -0.4
+- **Fix**: Aligned with reference (PolyCtrl 2025): contour=8, lag=12, velocity_weight=15, curvature decay -0.4, max_velocity 1.2, reference_velocity 0.65
+
+### Lane Violations (Feb 2025)
 - **Cause**: contour_weight (8) < lag_weight (15) prioritized progress over lane keeping
-- **Fix**: Inverted ratio to contour=25, lag=5; reduced velocity; increased boundary_weight
+- **Fix**: Balanced ratio with contour=8, lag=12 (progress-first but with lane keeping)
 
 ### Sign Detection Failures
 - **Cause**: Detection persistence threshold too high (5 frames); global 15s stop sign cooldown; traffic light state machine fragile

@@ -10,18 +10,42 @@ set(CMAKE_CXX_STANDARD 17)
 # Find ROS2 packages
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(nav2_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(cv_bridge REQUIRED)
+find_package(rcl_interfaces REQUIRED)
+find_package(action_msgs REQUIRED)
+find_package(ament_index_cpp REQUIRED)
+find_package(qcar2_interfaces REQUIRED)
 
-# Find Eigen3 and OpenCV
+# Find Eigen3, OpenCV, yaml-cpp
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(yaml-cpp REQUIRED)
+
+# =============================================================================
+# acc_core - Static library for non-ROS computational code
+# =============================================================================
+add_library(acc_core STATIC
+  road_graph.cpp
+  road_boundaries.cpp
+)
+
+target_include_directories(acc_core PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${EIGEN3_INCLUDE_DIRS}
+)
+
+target_link_libraries(acc_core
+  yaml-cpp
+)
 
 # =============================================================================
 # MPCC Controller Node
@@ -35,14 +59,21 @@ target_include_directories(mpcc_controller_node PRIVATE
   ${EIGEN3_INCLUDE_DIRS}
 )
 
+target_link_libraries(mpcc_controller_node
+  acc_core
+)
+
 ament_target_dependencies(mpcc_controller_node
   rclcpp
   geometry_msgs
   nav_msgs
   std_msgs
+  sensor_msgs
   visualization_msgs
   tf2_ros
   tf2
+  ament_index_cpp
+  qcar2_interfaces
 )
 
 # =============================================================================
@@ -69,12 +100,141 @@ ament_target_dependencies(sign_detector_node
 )
 
 # =============================================================================
+# Odom From TF Node
+# =============================================================================
+add_executable(odom_from_tf_node
+  odom_from_tf_node.cpp
+)
+
+target_include_directories(odom_from_tf_node PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+ament_target_dependencies(odom_from_tf_node
+  rclcpp
+  nav_msgs
+  geometry_msgs
+  tf2_ros
+  tf2
+)
+
+# =============================================================================
+# Mission Manager Node
+# =============================================================================
+add_executable(mission_manager_node
+  mission_manager_node.cpp
+)
+
+target_include_directories(mission_manager_node PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${EIGEN3_INCLUDE_DIRS}
+)
+
+target_link_libraries(mission_manager_node
+  acc_core
+)
+
+ament_target_dependencies(mission_manager_node
+  rclcpp
+  rclcpp_action
+  geometry_msgs
+  nav_msgs
+  nav2_msgs
+  std_msgs
+  tf2_ros
+  tf2
+  rcl_interfaces
+  action_msgs
+  ament_index_cpp
+)
+
+# =============================================================================
+# State Estimator Node (EKF)
+# =============================================================================
+add_executable(state_estimator_node
+  state_estimator_node.cpp
+)
+
+target_include_directories(state_estimator_node PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${EIGEN3_INCLUDE_DIRS}
+)
+
+ament_target_dependencies(state_estimator_node
+  rclcpp
+  nav_msgs
+  std_msgs
+  sensor_msgs
+  tf2_ros
+  tf2
+)
+
+# =============================================================================
+# Obstacle Tracker Node (Multi-class Kalman + Lidar)
+# =============================================================================
+add_executable(obstacle_tracker_node
+  obstacle_tracker_node.cpp
+)
+
+target_include_directories(obstacle_tracker_node PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${EIGEN3_INCLUDE_DIRS}
+)
+
+ament_target_dependencies(obstacle_tracker_node
+  rclcpp
+  std_msgs
+  sensor_msgs
+  tf2_ros
+  tf2
+)
+
+# =============================================================================
+# Traffic Light Map Node
+# =============================================================================
+add_executable(traffic_light_map_node
+  traffic_light_map_node.cpp
+)
+
+target_include_directories(traffic_light_map_node PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${EIGEN3_INCLUDE_DIRS}
+)
+
+target_link_libraries(traffic_light_map_node
+  acc_core
+)
+
+ament_target_dependencies(traffic_light_map_node
+  rclcpp
+  std_msgs
+  tf2_ros
+  tf2
+  ament_index_cpp
+)
+
+# =============================================================================
 # Install
 # =============================================================================
 install(TARGETS
   mpcc_controller_node
   sign_detector_node
+  odom_from_tf_node
+  mission_manager_node
+  state_estimator_node
+  obstacle_tracker_node
+  traffic_light_map_node
   DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install launch files
+install(DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/launch
+)
+
+# Install config files
+install(DIRECTORY ../config/
+  DESTINATION share/${PROJECT_NAME}/config
 )
 
 ament_package()

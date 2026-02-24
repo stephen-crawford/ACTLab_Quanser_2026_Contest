@@ -1,0 +1,20 @@
+# Preset: Default (C++ Stack)
+#
+# Full C++ stack — the current default when launching with `./run_mission.sh`.
+# All nodes are C++. No Python fallbacks.
+#
+# These parameters match the launch file defaults (mpcc_mission_launch.py).
+# Root cause analysis (Feb 2025): contour_weight MUST be > lag_weight to
+# prevent lane violations on tight curves.
+#
+# Usage:
+#   ./run_mission.sh
+#   ./run_mission.sh --mpcc
+
+# --- MPCC parameters (tuned from root cause analysis) ---
+reference_velocity: 0.50
+contour_weight: 25.0
+lag_weight: 5.0
+horizon: 20
+boundary_weight: 30.0
+use_direct_motor: true
