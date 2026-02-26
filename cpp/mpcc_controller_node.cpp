@@ -2,7 +2,7 @@
  * C++ MPCC Controller ROS2 Node
  *
  * Replaces the Python mpcc_controller.py with a high-performance C++ node.
- * Uses the existing mpcc_solver.h for the core MPCC optimization.
+ * Uses the acados MPCC solver for the core MPCC optimization.
  *
  * Subscriptions:
  *   /odom               - nav_msgs/Odometry (velocity)
@@ -38,7 +38,7 @@
 #include <tf2_ros/transform_listener.h>
 #include <tf2/utils.h>
 
-#include "mpcc_solver.h"
+#include "mpcc_solver_interface.h"
 #include "cubic_spline_path.h"
 #include "road_boundaries.h"
 
@@ -199,10 +199,11 @@ struct ReferencePath {
 class MPCCControllerNode : public rclcpp::Node {
 public:
     MPCCControllerNode() : Node("mpcc_controller_cpp") {
-        // Parameters — tuned via full-mission simulation (Feb 2026)
-        // contour=20 + heading=3.0 gives 0.094m max CTE in combined sim
+        // Parameters — tuned to fix swerving (Feb 2026)
+        // Key changes: startup phase re-enabled (3s), steering_rate_weight 3.0→1.5,
+        // velocity tracking at k=0 only (matching reference R_ref structure)
         this->declare_parameter("reference_velocity", 0.45);
-        this->declare_parameter("contour_weight", 20.0);
+        this->declare_parameter("contour_weight", 15.0);
         this->declare_parameter("lag_weight", 10.0);
         this->declare_parameter("horizon", 10);
         this->declare_parameter("boundary_weight", 0.0);
@@ -214,7 +215,7 @@ public:
         this->declare_parameter("startup_contour_weight", 1.0);
         this->declare_parameter("startup_lag_weight", 10.0);
         this->declare_parameter("startup_velocity_weight", 5.0);
-        this->declare_parameter("startup_heading_weight", 3.0);
+        this->declare_parameter("startup_heading_weight", 1.0);  // Mild heading correction during startup (decays to 0)
         this->declare_parameter("startup_steering_rate_weight", 0.05);
         this->declare_parameter("startup_curvature_decay", -5.0);
 
@@ -234,7 +235,7 @@ public:
         cfg.velocity_weight = 15.0;  // Track v_ref strongly (ref: R_ref[0]=17.0)
         cfg.steering_weight = 0.05;   // Reference R_ref[1]=0.05, penalizes |δ| gently
         cfg.acceleration_weight = 0.01;  // Reference R_u[0]=0.005; near-zero for fast speed changes
-        cfg.steering_rate_weight = 1.0; // Smooth steering, prevents bang-bang oscillation; ref R_u[1]=1.1
+        cfg.steering_rate_weight = 1.5; // Moderate damping (ref R_u[1]=1.1; was 3.0 which caused swerving)
         cfg.jerk_weight = 0.0;       // Reference has no jerk penalty
         cfg.robot_radius = 0.13;
         cfg.safety_margin = 0.10;
@@ -242,7 +243,7 @@ public:
         cfg.boundary_weight = this->get_parameter("boundary_weight").as_double();
         cfg.boundary_default_width = this->get_parameter("boundary_default_width").as_double();
         cfg.max_sqp_iterations = 5;   // PyMPC uses 5; was 3 (insufficient for curve convergence)
-        cfg.max_qp_iterations = 20;   // ×10 internally = 200 ADMM iterations
+        cfg.max_qp_iterations = 20;   // qpOASES iteration limit (acados multiplies by 10 internally)
         cfg.qp_tolerance = 1e-5;
         cfg.startup_contour_weight = this->get_parameter("startup_contour_weight").as_double();
         cfg.startup_lag_weight = this->get_parameter("startup_lag_weight").as_double();
@@ -500,29 +501,11 @@ private:
 
             bool spline_ok = spline_path_ && spline_path_->is_built();
 
-            // Set up adaptive path re-projection for the solver.
-            // This lets the solver re-project predicted positions onto the path
-            // each SQP iteration, matching the reference MPCC where arc-length
-            // progress θ is a decision variable. Without this, pre-computed
-            // references race ahead on curves, causing overshoot.
+            // Set spline_path for acados solver's theta_A-based reference lookup
             if (spline_ok) {
-                double tl = spline_path_->total_length();
-                solver_.path_lookup.lookup = [this, tl](
-                    double px, double py, double s_min, double* s_out) -> mpcc::PathRef
-                {
-                    double s = spline_path_->find_closest_progress_from(px, py, s_min);
-                    s = std::clamp(s, 0.0, tl - 0.001);
-                    if (s_out) *s_out = s;
-                    mpcc::PathRef ref;
-                    double ct, st;
-                    spline_path_->get_path_reference(s, ref.x, ref.y, ct, st);
-                    ref.cos_theta = ct;
-                    ref.sin_theta = st;
-                    ref.curvature = spline_path_->get_curvature(s);
-                    return ref;
-                };
+                solver_.spline_path = spline_path_.get();
             } else {
-                solver_.path_lookup.lookup = nullptr;
+                solver_.spline_path = nullptr;
             }
 
             RCLCPP_INFO(this->get_logger(), "Path received: %zu waypoints, length=%.2fm, spline=%s",
@@ -1324,7 +1307,7 @@ private:
     }
 
     // Solver
-    mpcc::Solver solver_;
+    mpcc::ActiveSolver solver_;
     mpcc::Config config_;
 
     // Road boundary spline (YAML-driven)

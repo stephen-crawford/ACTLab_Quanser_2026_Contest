@@ -1,0 +1,89 @@
+=== Deployment-Realistic MPCC Tests ===
+
+[Individual Mission Legs]
+  TEST: deployment: hub→pickup with PD speed lag → CTE < 0.30m (max_cte=0.014 avg_cte=0.003 speed=0.39 steps=270 prog=99.1%) [PASS]
+  TEST: deployment: pickup→dropoff with PD speed lag → CTE < 0.30m (max_cte=0.034 avg_cte=0.006 speed=0.34 steps=180 prog=98.7%) [PASS]
+  TEST: deployment: dropoff→hub with PD speed lag → CTE < 0.30m (max_cte=0.021 avg_cte=0.006 speed=0.34 steps=416 prog=99.4%) [PASS]
+
+[PD Speed Lag Comparison]
+  TEST: deployment: hub→pickup WITHOUT PD lag → better CTE (pd_cte=0.014 no_lag_cte=0.013) [PASS]
+
+[Full Mission]
+  TEST: deployment: full mission (all 3 legs) → total max CTE < 0.30m 
+    hub_to_pickup: max=0.014 avg=0.003 prog=99% 
+    pickup_to_dropoff: max=0.034 avg=0.006 prog=99% 
+    dropoff_to_hub: max=0.021 avg=0.006 prog=99% 
+    TOTAL: max_cte=0.034 avg_cte=0.005 [PASS]
+
+[Path Planning Verification]
+  TEST: planning: path generation is deterministic and legs tile correctly (deterministic, gaps: hp→pd=0.102m pd→dh=0.030m) [PASS]
+  TEST: planning: path endpoints match hub/pickup/dropoff within 50mm (hp_end=0.102 pd_start=0.000 pd_end=0.030 dh_start=0.000) [PASS]
+  TEST: planning: curvature within vehicle limits after Gaussian smoothing (max_curv=2.250, vehicle_limit=2.256) [PASS]
+  TEST: planning: spline path has no gaps > 2mm at 1mm evaluation spacing (max_gap=0.0010m) [PASS]
+
+[Synthetic Path — Solver Agnosticism]
+  TEST: arbitrary: 5m straight path → CTE < 0.05m (max_cte=0.000 avg_cte=0.000 speed=0.61 prog=99%) [PASS]
+  TEST: arbitrary: gentle left curve (r=2.0m, 90°) → CTE < 0.15m (max_cte=0.005 avg_cte=0.004 prog=98%) [PASS]
+  TEST: arbitrary: gentle right curve (r=2.0m, -90°) → CTE < 0.15m (max_cte=0.005 avg_cte=0.004 prog=98%) [PASS]
+  TEST: arbitrary: tight left curve (r=0.6m, 90°) → CTE < 0.30m (max_cte=0.013 avg_cte=0.004 prog=92%) [PASS]
+  TEST: arbitrary: tight right curve (r=0.6m, -90°) → CTE < 0.30m (max_cte=0.013 avg_cte=0.004 prog=92%) [PASS]
+  TEST: arbitrary: S-curve (r=1.0m, ±45°) → CTE < 0.20m (max_cte=0.037 avg_cte=0.012 prog=95%) [PASS]
+  TEST: arbitrary: tight S-curve (r=0.6m, ±60°) → CTE < 0.30m (max_cte=0.071 avg_cte=0.025 prog=94%) [PASS]
+  TEST: arbitrary: U-turn (r=0.7m, 180°) → CTE < 0.30m (max_cte=0.019 avg_cte=0.011 prog=97%) [PASS]
+  TEST: arbitrary: full circle (r=1.0m, 360°) → CTE < 0.20m (max_cte=0.012 avg_cte=0.010 prog=99%) [PASS]
+
+[Node Network Routes — A* Paths]
+  TEST: route: node 1 → 5 (inner-north 1→5) → CTE < 0.30m (max_cte=0.042 avg_cte=0.011 speed=0.38 prog=97% path=2680pts) [PASS]
+  TEST: route: node 9 → 7 (inner-east 9→7 (straight)) → CTE < 0.30m (max_cte=0.000 avg_cte=0.000 speed=0.55 prog=96% path=1985pts) [PASS]
+  TEST: route: node 3 → 1 (inner-west 3→1) → CTE < 0.30m (max_cte=0.019 avg_cte=0.007 speed=0.37 prog=94% path=1488pts) [PASS]
+  TEST: route: node 5 → 3 (inner-south 5→3) → CTE < 0.30m (max_cte=0.017 avg_cte=0.007 speed=0.37 prog=95% path=1486pts) [PASS]
+  TEST: route: node 0 → 2 (outer-NW→E 0→2) → CTE < 0.30m (max_cte=0.013 avg_cte=0.006 speed=0.42 prog=97% path=1960pts) [PASS]
+  TEST: route: node 2 → 4 (outer-E→NE 2→4) → CTE < 0.30m (max_cte=0.014 avg_cte=0.006 speed=0.42 prog=97% path=1911pts) [PASS]
+  TEST: route: node 4 → 6 (outer-NE→SE 4→6) → CTE < 0.30m (max_cte=0.016 avg_cte=0.007 speed=0.41 prog=97% path=1879pts) [PASS]
+  TEST: route: node 0 → 4 (cross 0→4 (2 turns)) → CTE < 0.30m (max_cte=0.029 avg_cte=0.009 speed=0.45 prog=97% path=3871pts) [PASS]
+  TEST: route: node 9 → 2 (cross 9→2 (inner+outer)) → CTE < 0.30m (max_cte=0.027 avg_cte=0.010 speed=0.41 prog=98% path=3142pts) [PASS]
+  TEST: route: node 4 → 14 (south-entry 4→14 (straight)) → CTE < 0.30m (max_cte=0.000 avg_cte=0.000 speed=0.58 prog=98% path=2886pts) [PASS]
+  TEST: route: node 14 → 20 (circle→south 14→20) → CTE < 0.30m (max_cte=0.029 avg_cte=0.008 speed=0.50 prog=99% path=3495pts) [PASS]
+  TEST: route: node 0 → 6 (full-outer 0→6 (3 turns)) → CTE < 0.30m (max_cte=0.029 avg_cte=0.010 speed=0.45 prog=99% path=5749pts) [PASS]
+
+[Orientation & Velocity Invariance]
+  TEST: invariance: same curve at 4 orientations → similar CTE (±50%) (base_cte=0.011 max_diff=0.000) [PASS]
+  TEST: robustness: solver tracks path at v_ref = 0.30, 0.50, 0.65, 0.90 
+    v_ref=0.30 max_cte=0.009 
+    v_ref=0.50 max_cte=0.009 
+    v_ref=0.65 max_cte=0.010 
+    v_ref=0.90 max_cte=0.014 [PASS]
+
+[Heading Misalignment — Deployment Gap]
+  TEST: heading: 5° offset on gentle curve → CTE < 0.10m (max_cte=0.009 avg_cte=0.005 prog=98%) [PASS]
+  TEST: heading: 10° offset on gentle curve → CTE < 0.15m (max_cte=0.019 avg_cte=0.007 prog=98%) [PASS]
+  TEST: heading: 20° offset on gentle curve → CTE < 0.25m (max_cte=0.040 avg_cte=0.011 prog=98%) [PASS]
+  TEST: heading: 30° offset on straight → CTE < 0.30m (max_cte=0.061 avg_cte=0.009 prog=99%) [PASS]
+  TEST: heading: -20° offset on straight → CTE < 0.25m (max_cte=0.040 avg_cte=0.006 prog=99%) [PASS]
+  TEST: heading: 15° offset on hub→pickup mission leg → CTE < 0.30m (max_cte=0.030 avg_cte=0.008 prog=100%) [PASS]
+
+[Stop-and-Resume — Deployment Gap]
+  TEST: stop-resume: periodic stops on gentle curve → CTE < 0.20m (max_cte=0.006 stops=3 prog=99%) [PASS]
+  TEST: stop-resume: 3 stops on hub→pickup → CTE < 0.30m (max_cte=0.028 prog=99%) [PASS]
+
+[Mission Leg Transition — Deployment Gap]
+  TEST: transition: hub→pickup then pickup→dropoff → CTE < 0.30m on both 
+    leg1: max_cte=0.028 prog=99%
+    leg2: max_cte=0.063 prog=99% heading_offset=46.1deg [PASS]
+
+[Measurement Noise — Deployment Gap]
+  TEST: noise: σ_pos=5mm σ_heading=0.5° on gentle curve → CTE < 0.20m (max_cte=0.007 prog=98%) [PASS]
+  TEST: noise: σ_pos=5mm σ_heading=0.5° on hub→pickup → CTE < 0.30m (max_cte=0.029 prog=99%) [PASS]
+
+[No-Startup-Ramp — Fix Verification]
+  TEST: startup: no ramp (duration=0) on hub→pickup → CTE < 0.30m (max_cte=0.028 prog=99%) [PASS]
+
+[Full Mission Combined — State Carry-Over + Hermite Blending]
+  TEST: combined: 3-leg mission with state carry-over + Hermite blending 
+    hub_to_pickup: max_cte=0.014 avg_cte=0.003 heading_err=11.3deg steer_sat=0 prog=99% OK
+    pickup_to_dropoff: max_cte=0.012 avg_cte=0.004 heading_err=10.7deg steer_sat=0 prog=98% OK
+    dropoff_to_hub: max_cte=0.020 avg_cte=0.005 heading_err=13.0deg steer_sat=0 prog=99% OK
+    COMBINED: max_cte=0.020 avg_cte=0.004 steer_sat=0% duration=90.8s avg_speed=0.34m/s 
+    CSV written: combined_mission.csv [PASS]
+
+=== Results: 45 passed, 0 failed ===

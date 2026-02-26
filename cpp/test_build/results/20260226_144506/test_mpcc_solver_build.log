@@ -1,0 +1,13 @@
+In file included from ../mpcc_solver_interface.h:29,
+                 from test_mpcc_solver.cpp:26:
+../acados_mpcc_solver.h: In member function ‘mpcc::Result mpcc::AcadosSolver::solve(const mpcc::Vec3&, const std::vector<mpcc::PathRef>&, double, double, const std::vector<mpcc::Obstacle>&, const std::vector<mpcc::BoundaryConstraint>&, double, double)’:
+../acados_mpcc_solver.h:380:21: error: cannot convert ‘ocp_nlp_config*’ to ‘ocp_nlp_solver*’
+  380 |         ocp_nlp_get(nlp_config_, capsule_->nlp_solver, "time_tot", (void*)&t_solve);
+      |                     ^~~~~~~~~~~
+      |                     |
+      |                     ocp_nlp_config*
+In file included from ../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.h:36,
+                 from ../acados_mpcc_solver.h:26:
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:455:55: note:   initializing argument 1 of ‘void ocp_nlp_get(ocp_nlp_solver*, const char*, void*)’
+  455 | ACADOS_SYMBOL_EXPORT void ocp_nlp_get(ocp_nlp_solver *solver, const char *field, void *return_value_);
+      |                                       ~~~~~~~~~~~~~~~~^~~~~~

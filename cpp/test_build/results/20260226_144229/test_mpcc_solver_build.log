@@ -1,0 +1,279 @@
+In file included from ../mpcc_solver_interface.h:24,
+                 from test_mpcc_solver.cpp:26:
+../acados_mpcc_solver.h: In member function ‘mpcc::Result mpcc::AcadosSolver::solve(const mpcc::Vec3&, const std::vector<mpcc::PathRef>&, double, double, const std::vector<mpcc::Obstacle>&, const std::vector<mpcc::BoundaryConstraint>&, double, double)’:
+../acados_mpcc_solver.h:186:75: error: invalid conversion from ‘const char*’ to ‘int’ [-fpermissive]
+  186 |         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, 0, "lbx", x0_4d);
+      |                                                                           ^~~~~
+      |                                                                           |
+      |                                                                           const char*
+../acados_mpcc_solver.h:186:82: error: cannot convert ‘double*’ to ‘const char*’
+  186 |         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, 0, "lbx", x0_4d);
+      |                                                                                  ^~~~~
+      |                                                                                  |
+      |                                                                                  double*
+In file included from ../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.h:36,
+                 from ../acados_mpcc_solver.h:26:
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:269:66: note:   initializing argument 6 of ‘int ocp_nlp_constraints_model_set(ocp_nlp_config*, ocp_nlp_dims*, ocp_nlp_in*, ocp_nlp_out*, int, const char*, void*)’
+  269 |         ocp_nlp_in *in, ocp_nlp_out *out, int stage, const char *field, void *value);
+      |                                                      ~~~~~~~~~~~~^~~~~
+../acados_mpcc_solver.h:187:75: error: invalid conversion from ‘const char*’ to ‘int’ [-fpermissive]
+  187 |         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, 0, "ubx", x0_4d);
+      |                                                                           ^~~~~
+      |                                                                           |
+      |                                                                           const char*
+../acados_mpcc_solver.h:187:82: error: cannot convert ‘double*’ to ‘const char*’
+  187 |         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, 0, "ubx", x0_4d);
+      |                                                                                  ^~~~~
+      |                                                                                  |
+      |                                                                                  double*
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:269:66: note:   initializing argument 6 of ‘int ocp_nlp_constraints_model_set(ocp_nlp_config*, ocp_nlp_dims*, ocp_nlp_in*, ocp_nlp_out*, int, const char*, void*)’
+  269 |         ocp_nlp_in *in, ocp_nlp_out *out, int stage, const char *field, void *value);
+      |                                                      ~~~~~~~~~~~~^~~~~
+../acados_mpcc_solver.h:204:67: error: invalid conversion from ‘int’ to ‘ocp_nlp_in*’ [-fpermissive]
+  204 |                 ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "x", xk);
+      |                                                                   ^
+      |                                                                   |
+      |                                                                   int
+../acados_mpcc_solver.h:204:70: error: invalid conversion from ‘const char*’ to ‘int’ [-fpermissive]
+  204 |                 ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "x", xk);
+      |                                                                      ^~~
+      |                                                                      |
+      |                                                                      const char*
+../acados_mpcc_solver.h:204:75: error: cannot convert ‘double*’ to ‘const char*’
+  204 |                 ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "x", xk);
+      |                                                                           ^~
+      |                                                                           |
+      |                                                                           double*
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:298:32: note:   initializing argument 6 of ‘void ocp_nlp_out_set(ocp_nlp_config*, ocp_nlp_dims*, ocp_nlp_out*, ocp_nlp_in*, int, const char*, void*)’
+  298 |         int stage, const char *field, void *value);
+      |                    ~~~~~~~~~~~~^~~~~
+../acados_mpcc_solver.h:208:71: error: invalid conversion from ‘int’ to ‘ocp_nlp_in*’ [-fpermissive]
+  208 |                     ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "u", uk);
+      |                                                                       ^
+      |                                                                       |
+      |                                                                       int
+../acados_mpcc_solver.h:208:74: error: invalid conversion from ‘const char*’ to ‘int’ [-fpermissive]
+  208 |                     ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "u", uk);
+      |                                                                          ^~~
+      |                                                                          |
+      |                                                                          const char*
+../acados_mpcc_solver.h:208:79: error: cannot convert ‘double*’ to ‘const char*’
+  208 |                     ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "u", uk);
+      |                                                                               ^~
+      |                                                                               |
+      |                                                                               double*
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:298:32: note:   initializing argument 6 of ‘void ocp_nlp_out_set(ocp_nlp_config*, ocp_nlp_dims*, ocp_nlp_out*, ocp_nlp_in*, int, const char*, void*)’
+  298 |         int stage, const char *field, void *value);
+      |                    ~~~~~~~~~~~~^~~~~
+../acados_mpcc_solver.h:217:67: error: invalid conversion from ‘int’ to ‘ocp_nlp_in*’ [-fpermissive]
+  217 |                 ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "x", xk);
+      |                                                                   ^
+      |                                                                   |
+      |                                                                   int
+../acados_mpcc_solver.h:217:70: error: invalid conversion from ‘const char*’ to ‘int’ [-fpermissive]
+  217 |                 ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "x", xk);
+      |                                                                      ^~~
+      |                                                                      |
+      |                                                                      const char*
+../acados_mpcc_solver.h:217:75: error: cannot convert ‘double*’ to ‘const char*’
+  217 |                 ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "x", xk);
+      |                                                                           ^~
+      |                                                                           |
+      |                                                                           double*
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:298:32: note:   initializing argument 6 of ‘void ocp_nlp_out_set(ocp_nlp_config*, ocp_nlp_dims*, ocp_nlp_out*, ocp_nlp_in*, int, const char*, void*)’
+  298 |         int stage, const char *field, void *value);
+      |                    ~~~~~~~~~~~~^~~~~
+../acados_mpcc_solver.h:223:71: error: invalid conversion from ‘int’ to ‘ocp_nlp_in*’ [-fpermissive]
+  223 |                     ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "u", uk);
+      |                                                                       ^
+      |                                                                       |
+      |                                                                       int
+../acados_mpcc_solver.h:223:74: error: invalid conversion from ‘const char*’ to ‘int’ [-fpermissive]
+  223 |                     ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "u", uk);
+      |                                                                          ^~~
+      |                                                                          |
+      |                                                                          const char*
+../acados_mpcc_solver.h:223:79: error: cannot convert ‘double*’ to ‘const char*’
+  223 |                     ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, k, "u", uk);
+      |                                                                               ^~
+      |                                                                               |
+      |                                                                               double*
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:298:32: note:   initializing argument 6 of ‘void ocp_nlp_out_set(ocp_nlp_config*, ocp_nlp_dims*, ocp_nlp_out*, ocp_nlp_in*, int, const char*, void*)’
+  298 |         int stage, const char *field, void *value);
+      |                    ~~~~~~~~~~~~^~~~~
+../acados_mpcc_solver.h:228:66: error: invalid conversion from ‘const char*’ to ‘int’ [-fpermissive]
+  228 |             ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, 0, "x", xk0);
+      |                                                                  ^~~
+      |                                                                  |
+      |                                                                  const char*
+../acados_mpcc_solver.h:228:71: error: cannot convert ‘double*’ to ‘const char*’
+  228 |             ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, 0, "x", xk0);
+      |                                                                       ^~~
+      |                                                                       |
+      |                                                                       double*
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:298:32: note:   initializing argument 6 of ‘void ocp_nlp_out_set(ocp_nlp_config*, ocp_nlp_dims*, ocp_nlp_out*, ocp_nlp_in*, int, const char*, void*)’
+  298 |         int stage, const char *field, void *value);
+      |                    ~~~~~~~~~~~~^~~~~
+../acados_mpcc_solver.h:235:43: error: invalid conversion from ‘int’ to ‘ocp_nlp_out*’ [-fpermissive]
+  235 |                                           k, "ubx", ubx);
+      |                                           ^
+      |                                           |
+      |                                           int
+../acados_mpcc_solver.h:235:46: error: invalid conversion from ‘const char*’ to ‘int’ [-fpermissive]
+  235 |                                           k, "ubx", ubx);
+      |                                              ^~~~~
+      |                                              |
+      |                                              const char*
+../acados_mpcc_solver.h:235:53: error: cannot convert ‘double*’ to ‘const char*’
+  235 |                                           k, "ubx", ubx);
+      |                                                     ^~~
+      |                                                     |
+      |                                                     double*
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:269:66: note:   initializing argument 6 of ‘int ocp_nlp_constraints_model_set(ocp_nlp_config*, ocp_nlp_dims*, ocp_nlp_in*, ocp_nlp_out*, int, const char*, void*)’
+  269 |         ocp_nlp_in *in, ocp_nlp_out *out, int stage, const char *field, void *value);
+      |                                                      ~~~~~~~~~~~~^~~~~
+../acados_mpcc_solver.h:239:47: error: invalid conversion from ‘int’ to ‘ocp_nlp_out*’ [-fpermissive]
+  239 |                                               k, "lbx", lbx);
+      |                                               ^
+      |                                               |
+      |                                               int
+../acados_mpcc_solver.h:239:50: error: invalid conversion from ‘const char*’ to ‘int’ [-fpermissive]
+  239 |                                               k, "lbx", lbx);
+      |                                                  ^~~~~
+      |                                                  |
+      |                                                  const char*
+../acados_mpcc_solver.h:239:57: error: cannot convert ‘double*’ to ‘const char*’
+  239 |                                               k, "lbx", lbx);
+      |                                                         ^~~
+      |                                                         |
+      |                                                         double*
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:269:66: note:   initializing argument 6 of ‘int ocp_nlp_constraints_model_set(ocp_nlp_config*, ocp_nlp_dims*, ocp_nlp_in*, ocp_nlp_out*, int, const char*, void*)’
+  269 |         ocp_nlp_in *in, ocp_nlp_out *out, int stage, const char *field, void *value);
+      |                                                      ~~~~~~~~~~~~^~~~~
+../acados_mpcc_solver.h:378:21: error: cannot convert ‘ocp_nlp_config*’ to ‘ocp_nlp_solver*’
+  378 |         ocp_nlp_get(nlp_config_, capsule_->nlp_solver, "time_tot", &t_solve);
+      |                     ^~~~~~~~~~~
+      |                     |
+      |                     ocp_nlp_config*
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:455:55: note:   initializing argument 1 of ‘void ocp_nlp_get(ocp_nlp_solver*, const char*, void*)’
+  455 | ACADOS_SYMBOL_EXPORT void ocp_nlp_get(ocp_nlp_solver *solver, const char *field, void *return_value_);
+      |                                       ~~~~~~~~~~~~~~~~^~~~~~
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c: In function ‘void mpcc_qcar2_acados_create_set_default_parameters(mpcc_qcar2_solver_capsule*)’:
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:442:23: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  442 |     double* p = calloc(NP, sizeof(double));
+      |                 ~~~~~~^~~~~~~~~~~~~~~~~~~~
+      |                       |
+      |                       void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c: In function ‘void mpcc_qcar2_acados_setup_nlp_in(mpcc_qcar2_solver_capsule*, int, double*)’:
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:494:38: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  494 |         double* cost_scaling = malloc((N+1)*sizeof(double));
+      |                                ~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+      |                                      |
+      |                                      void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:549:28: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  549 |     double* zlumem = calloc(4*NS, sizeof(double));
+      |                      ~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+      |                            |
+      |                            void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:569:29: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  569 |     double* zluemem = calloc(4*NSN, sizeof(double));
+      |                       ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~
+      |                             |
+      |                             void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:589:25: error: invalid conversion from ‘void*’ to ‘int*’ [-fpermissive]
+  589 |     int* idxbx0 = malloc(NBX0 * sizeof(int));
+      |                   ~~~~~~^~~~~~~~~~~~~~~~~~~~
+      |                         |
+      |                         void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:595:27: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  595 |     double* lubx0 = calloc(2*NBX0, sizeof(double));
+      |                     ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+      |                           |
+      |                           void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:606:27: error: invalid conversion from ‘void*’ to ‘int*’ [-fpermissive]
+  606 |     int* idxbxe_0 = malloc(4 * sizeof(int));
+      |                     ~~~~~~^~~~~~~~~~~~~~~~~
+      |                           |
+      |                           void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:627:24: error: invalid conversion from ‘void*’ to ‘int*’ [-fpermissive]
+  627 |     int* idxbu = malloc(NBU * sizeof(int));
+      |                  ~~~~~~^~~~~~~~~~~~~~~~~~~
+      |                        |
+      |                        void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:631:26: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  631 |     double* lubu = calloc(2*NBU, sizeof(double));
+      |                    ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~
+      |                          |
+      |                          void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:656:24: error: invalid conversion from ‘void*’ to ‘int*’ [-fpermissive]
+  656 |     int* idxbx = malloc(NBX * sizeof(int));
+      |                  ~~~~~~^~~~~~~~~~~~~~~~~~~
+      |                        |
+      |                        void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:661:26: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  661 |     double* lubx = calloc(2*NBX, sizeof(double));
+      |                    ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~
+      |                          |
+      |                          void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:683:25: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  683 |     double* luh = calloc(2*NH, sizeof(double));
+      |                   ~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+      |                         |
+      |                         void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:713:24: error: invalid conversion from ‘void*’ to ‘int*’ [-fpermissive]
+  713 |     int* idxsh = malloc(NSH * sizeof(int));
+      |                  ~~~~~~^~~~~~~~~~~~~~~~~~~
+      |                        |
+      |                        void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:715:26: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  715 |     double* lush = calloc(2*NSH, sizeof(double));
+      |                    ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~
+      |                          |
+      |                          void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:734:26: error: invalid conversion from ‘void*’ to ‘int*’ [-fpermissive]
+  734 |     int* idxbx_e = malloc(NBXN * sizeof(int));
+      |                    ~~~~~~^~~~~~~~~~~~~~~~~~~~
+      |                          |
+      |                          void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:739:28: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  739 |     double* lubx_e = calloc(2*NBXN, sizeof(double));
+      |                      ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+      |                            |
+      |                            void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:759:27: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  759 |     double* luh_e = calloc(2*NHN, sizeof(double));
+      |                     ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~
+      |                           |
+      |                           void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:788:26: error: invalid conversion from ‘void*’ to ‘int*’ [-fpermissive]
+  788 |     int* idxsh_e = malloc(NSHN * sizeof(int));
+      |                    ~~~~~~^~~~~~~~~~~~~~~~~~~~
+      |                          |
+      |                          void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:790:28: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+  790 |     double* lush_e = calloc(2*NSHN, sizeof(double));
+      |                      ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~
+      |                            |
+      |                            void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c: In function ‘void mpcc_qcar2_acados_create_set_opts(mpcc_qcar2_solver_capsule*)’:
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:903:68: error: invalid conversion from ‘const void*’ to ‘void*’ [-fpermissive]
+  903 |     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_hpipm_mode", "SPEED");
+      |                                                                    ^~~~~~~
+      |                                                                    |
+      |                                                                    const void*
+In file included from ../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:37:
+/home/stephen/acados/include/acados_c/ocp_nlp_interface.h:361:113: note:   initializing argument 4 of ‘void ocp_nlp_solver_opts_set(ocp_nlp_config*, void*, const char*, void*)’
+  361 | ACADOS_SYMBOL_EXPORT void ocp_nlp_solver_opts_set(ocp_nlp_config *config, void *opts_, const char *field, void* value);
+      |                                                                                                           ~~~~~~^~~~~
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c: In function ‘void mpcc_qcar2_acados_set_nlp_out(mpcc_qcar2_solver_capsule*)’:
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:1024:25: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+ 1024 |     double* xu0 = calloc(NX+NU, sizeof(double));
+      |                   ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~
+      |                         |
+      |                         void*
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c: In function ‘int mpcc_qcar2_acados_reset(mpcc_qcar2_solver_capsule*, int)’:
+../acados_ocp/c_generated_code/acados_solver_mpcc_qcar2.c:1146:28: error: invalid conversion from ‘void*’ to ‘double*’ [-fpermissive]
+ 1146 |     double* buffer = calloc(NX+NU+NZ+2*NS+2*NSN+2*NS0+NBX+NBU+NG+NH+NPHI+NBX0+NBXN+NHN+NH0+NPHIN+NGN, sizeof(double));
+      |                      ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      |                            |
+      |                            void*

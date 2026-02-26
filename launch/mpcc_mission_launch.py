@@ -36,7 +36,7 @@ def generate_launch_description():
 
     contour_weight_arg = DeclareLaunchArgument(
         'contour_weight',
-        default_value='20.0',
+        default_value='15.0',
         description='Weight for path contouring (lateral) error - tighter lane keeping'
     )
 

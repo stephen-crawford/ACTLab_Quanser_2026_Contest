@@ -23,7 +23,7 @@
 #include "coordinate_transform.h"
 #include "cubic_spline_path.h"
 #include "road_graph.h"
-#include "mpcc_solver.h"
+#include "mpcc_solver_interface.h"
 
 int main() {
     printf("=== Diagnose Startup Max Steering ===\n\n");
@@ -89,7 +89,7 @@ int main() {
     // ====== Test 1: Solver with NO path lookup (pre-computed refs) ======
     printf("=== Test 1: Pre-computed path refs (no adaptive re-projection) ===\n");
     {
-        mpcc::Solver solver;
+        mpcc::ActiveSolver solver;
         solver.init(cfg);
         // NO path_lookup — just like diagnose_steering.cpp which showed δ≈0
 
@@ -132,7 +132,7 @@ int main() {
     // ====== Test 2: Solver WITH path lookup (adaptive re-projection) ======
     printf("=== Test 2: With adaptive path re-projection (as deployed) ===\n");
     {
-        mpcc::Solver solver;
+        mpcc::ActiveSolver solver;
         solver.init(cfg);
 
         // Set up path lookup exactly as controller does
@@ -183,7 +183,7 @@ int main() {
     printf("step | v_cmd  delta_cmd | state_v  state_delta | x       y       theta   | CTE     h_err\n");
     printf("-----|------------------|----------------------|-------------------------|-------------\n");
     {
-        mpcc::Solver solver;
+        mpcc::ActiveSolver solver;
         solver.init(cfg);
 
         // Set up path lookup
@@ -256,7 +256,7 @@ int main() {
     printf("step | v_cmd  delta_cmd | state_v  state_delta | x       y       theta   | CTE     h_err\n");
     printf("-----|------------------|----------------------|-------------------------|-------------\n");
     {
-        mpcc::Solver solver;
+        mpcc::ActiveSolver solver;
         solver.init(cfg);
 
         solver.path_lookup.lookup = [&spline, total_len](
@@ -317,7 +317,7 @@ int main() {
         mpcc::Config cfg45 = cfg;
         cfg45.max_steering = 0.45;  // True hardware limit
 
-        mpcc::Solver solver;
+        mpcc::ActiveSolver solver;
         solver.init(cfg45);
 
         solver.path_lookup.lookup = [&spline, total_len](

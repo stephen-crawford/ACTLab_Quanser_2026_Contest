@@ -16,7 +16,7 @@
 
 # --- MPCC parameters (tuned via full-mission simulation Feb 2026) ---
 reference_velocity: 0.45
-contour_weight: 20.0
+contour_weight: 15.0
 lag_weight: 10.0
 horizon: 10
 boundary_weight: 0.0

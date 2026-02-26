@@ -35,7 +35,7 @@
 #include <algorithm>
 #include <iomanip>
 
-#include "mpcc_solver.h"
+#include "mpcc_solver_interface.h"
 #include "cubic_spline_path.h"
 #include "road_graph.h"
 #include "coordinate_transform.h"
@@ -262,7 +262,7 @@ LegResult run_leg(
     }
 
     // Initialize solver
-    mpcc::Solver solver;
+    mpcc::ActiveSolver solver;
     auto cfg = make_deployment_config();
     solver.init(cfg);
 
@@ -454,7 +454,7 @@ LegResult run_leg_with_events(
                              result.blended_path.y_ql[i]);
     }
 
-    mpcc::Solver solver;
+    mpcc::ActiveSolver solver;
     auto cfg = make_deployment_config();
     solver.init(cfg);
 
@@ -972,7 +972,7 @@ int main() {
             gspline.build(gmx, gmy, true);
             double glen = gspline.total_length();
 
-            mpcc::Solver gsolver;
+            mpcc::ActiveSolver gsolver;
             auto gcfg = make_deployment_config();
             gcfg.boundary_weight = 8.0;  // <-- DEPLOY HAD THIS
             gsolver.init(gcfg);
@@ -1104,7 +1104,7 @@ int main() {
             gspline.build(gmx, gmy, true);
             double glen = gspline.total_length();
 
-            mpcc::Solver gsolver;
+            mpcc::ActiveSolver gsolver;
             auto gcfg = make_deployment_config();
             gsolver.init(gcfg);
 
@@ -1219,7 +1219,7 @@ int main() {
             gspline.build(gmx, gmy, true);
             double glen = gspline.total_length();
 
-            mpcc::Solver gsolver;
+            mpcc::ActiveSolver gsolver;
             auto gcfg = make_deployment_config();
             gcfg.boundary_weight = 8.0;  // <-- DEPLOY HAD THIS
             gsolver.init(gcfg);
@@ -1366,7 +1366,7 @@ int main() {
             gspline.build(gmx, gmy, true);
             double glen = gspline.total_length();
 
-            mpcc::Solver gsolver;
+            mpcc::ActiveSolver gsolver;
             auto gcfg = make_deployment_config();
             gsolver.init(gcfg);
 
@@ -1495,7 +1495,7 @@ int main() {
             gspline.build(gmx, gmy, true);
             double glen = gspline.total_length();
 
-            mpcc::Solver gsolver;
+            mpcc::ActiveSolver gsolver;
             auto gcfg = make_deployment_config();
             gcfg.boundary_weight = 8.0;
             gsolver.init(gcfg);

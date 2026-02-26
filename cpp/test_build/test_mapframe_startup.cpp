@@ -28,7 +28,7 @@
 #include "coordinate_transform.h"
 #include "cubic_spline_path.h"
 #include "road_graph.h"
-#include "mpcc_solver.h"
+#include "mpcc_solver_interface.h"
 
 // Hermite path blending — MUST match mission_manager_node.cpp
 static void align_path_to_vehicle_heading(
@@ -194,7 +194,7 @@ int main() {
     printf("step | v_cmd  delta_cmd | plant_v plant_delta | x       y       theta   | CTE     h_err   | progress\n");
     printf("-----|------------------|---------------------|-------------------------|-----------------|--------\n");
 
-    mpcc::Solver solver;
+    mpcc::ActiveSolver solver;
     solver.init(cfg);
 
     // Adaptive path re-projection (as deployed)

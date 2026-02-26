@@ -1,0 +1,34 @@
+=== Swerving Diagnosis: Realistic Deployment Model ===
+Models: servo delay, TF latency, measurement noise
+
+--- heading_weight sweep (servo=50ms, TF=100ms, noise=5mm/2.0°) ---
+heading_w  | max_cte avg_cte max_osc   avg_osc   speed  sat    status
+-----------|---------|---------|---------|---------|------|------|-------
+0.0        | 0.014   0.003   0.000     0.018     0.372  0      OK
+0.5        | 0.021   0.005   0.000     0.022     0.372  0      OK
+1.0        | 0.025   0.007   0.000     0.025     0.372  0      OK
+1.5        | 0.027   0.007   0.000     0.027     0.373  0      OK
+2.0        | 0.028   0.008   0.000     0.028     0.373  0      OK
+3.0        | 0.030   0.008   0.000     0.031     0.373  0      OK
+5.0        | 0.045   0.009   0.000     0.037     0.373  0      OK
+
+--- heading_weight=2.0: delay comparison ---
+condition            | max_cte avg_cte avg_osc  
+--------------------|---------|---------|--------
+no delay, no noise   | 0.022   0.006   0.005    
+servo only (50ms)    | 0.022   0.006   0.005    
+TF only (100ms)      | 0.026   0.007   0.005    
+noise only           | 0.021   0.007   0.026    
+servo+TF             | 0.026   0.007   0.005    
+servo+TF+noise       | 0.028   0.008   0.026    
+
+--- Full 3-leg mission with heading_weight=0 (reference-matched) ---
+  Hub→Pickup: max_cte=0.012m avg_cte=0.004m avg_osc=0.021 speed=0.384 OK
+  Pickup→Dropoff: max_cte=0.005m avg_cte=0.002m avg_osc=0.019 speed=0.361 OK
+  Dropoff→Hub: max_cte=0.000m avg_cte=0.000m avg_osc=0.000 speed=0.000 OK
+
+--- Writing CSV traces for heading_weight comparison ---
+  Written: results/swerving_hw0.csv
+  Written: results/swerving_hw2.csv
+
+=== DONE ===

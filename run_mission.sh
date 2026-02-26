@@ -672,34 +672,6 @@ detect_gpu() {
     return 0
 }
 
-build_mpcc_solver() {
-    local container_id="$1"
-
-    print_info "Building C++ MPCC solver..."
-
-    local cpp_dir="/workspaces/isaac_ros-dev/ros2/src/acc_stage1_mission/cpp"
-
-    docker exec "$container_id" bash -c "
-        cd $cpp_dir
-        EIGEN_INCLUDE=\$(pkg-config --cflags eigen3 2>/dev/null || echo '-I/usr/include/eigen3')
-        g++ -shared -fPIC -O2 \$EIGEN_INCLUDE -std=c++17 \
-            -o libmpcc_solver.so mpcc_solver.cpp 2>&1
-    "
-
-    if [ $? -eq 0 ]; then
-        # Verify symbols
-        if docker exec "$container_id" nm -D "$cpp_dir/libmpcc_solver.so" 2>/dev/null | grep -q mpcc_create; then
-            print_status "C++ MPCC solver built successfully"
-        else
-            print_error "C++ MPCC solver built but symbols missing"
-            return 1
-        fi
-    else
-        print_error "C++ MPCC solver build failed"
-        return 1
-    fi
-}
-
 launch_mission() {
     print_header
 

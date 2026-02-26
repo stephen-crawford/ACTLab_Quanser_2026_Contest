@@ -16,7 +16,7 @@
 #include "coordinate_transform.h"
 #include "cubic_spline_path.h"
 #include "road_graph.h"
-#include "mpcc_solver.h"
+#include "mpcc_solver_interface.h"
 
 struct PDSpeedController {
     double actual_speed = 0.0;
@@ -61,19 +61,19 @@ int main() {
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.45;
-    cfg.contour_weight = 20.0;
+    cfg.contour_weight = 15.0;      // Matches deployed
     cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;
     cfg.steering_weight = 0.05;
     cfg.acceleration_weight = 0.01;
-    cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 3.0;
+    cfg.steering_rate_weight = 1.5;  // Matches deployed
+    cfg.heading_weight = 0.0;        // Reference-matched (was 2.0, caused swerving)
     cfg.progress_weight = 1.0;
     cfg.jerk_weight = 0.0;
     cfg.boundary_weight = 0.0;
     cfg.max_sqp_iterations = 5;
     cfg.max_qp_iterations = 20;
-    cfg.startup_ramp_duration_s = 0.0;
+    cfg.startup_ramp_duration_s = 3.0;  // Matches deployed
     cfg.startup_elapsed_s = 0.0;
     cfg.startup_progress_weight = 5.0;
 
@@ -101,7 +101,7 @@ int main() {
     printf("step | v_cmd  delta_cmd | plant_v plant_delta | x       y       theta   | CTE     heading_err\n");
     printf("-----|------------------|---------------------|-------------------------|--------------------\n");
 
-    mpcc::Solver solverA;
+    mpcc::ActiveSolver solverA;
     solverA.init(cfg);
     solverA.path_lookup.lookup = make_lookup;
 
@@ -162,7 +162,7 @@ int main() {
     printf("step | v_cmd  delta_cmd | plant_v plant_delta | x       y       theta   | CTE     heading_err\n");
     printf("-----|------------------|---------------------|-------------------------|--------------------\n");
 
-    mpcc::Solver solverB;
+    mpcc::ActiveSolver solverB;
     solverB.init(cfg);
     solverB.path_lookup.lookup = make_lookup;
 

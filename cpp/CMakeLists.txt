@@ -32,6 +32,40 @@ find_package(OpenCV REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 # =============================================================================
+# acados MPCC solver
+# =============================================================================
+set(ACADOS_DIR "$ENV{ACADOS_INSTALL_DIR}" CACHE PATH "acados install directory")
+if(NOT ACADOS_DIR)
+  set(ACADOS_DIR "/home/stephen/acados")
+endif()
+
+# acados generated solver code
+set(ACADOS_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/acados_ocp/c_generated_code")
+
+# Collect all generated C source files
+file(GLOB ACADOS_MODEL_SRCS "${ACADOS_GENERATED_DIR}/mpcc_qcar2_model/*.c")
+file(GLOB ACADOS_COST_SRCS "${ACADOS_GENERATED_DIR}/mpcc_qcar2_cost/*.c")
+file(GLOB ACADOS_CONSTR_SRCS "${ACADOS_GENERATED_DIR}/mpcc_qcar2_constraints/*.c")
+
+add_library(acados_mpcc_generated STATIC
+  ${ACADOS_GENERATED_DIR}/acados_solver_mpcc_qcar2.c
+  ${ACADOS_MODEL_SRCS}
+  ${ACADOS_COST_SRCS}
+  ${ACADOS_CONSTR_SRCS}
+)
+
+target_include_directories(acados_mpcc_generated PUBLIC
+  ${ACADOS_GENERATED_DIR}
+  ${ACADOS_DIR}/include
+  ${ACADOS_DIR}/include/acados
+  ${ACADOS_DIR}/include/blasfeo/include
+  ${ACADOS_DIR}/include/hpipm/include
+)
+
+target_link_directories(acados_mpcc_generated PUBLIC ${ACADOS_DIR}/lib)
+target_link_libraries(acados_mpcc_generated acados hpipm blasfeo m)
+
+# =============================================================================
 # acc_core - Static library for non-ROS computational code
 # =============================================================================
 add_library(acc_core STATIC
@@ -62,6 +96,7 @@ target_include_directories(mpcc_controller_node PRIVATE
 
 target_link_libraries(mpcc_controller_node
   acc_core
+  acados_mpcc_generated
 )
 
 ament_target_dependencies(mpcc_controller_node

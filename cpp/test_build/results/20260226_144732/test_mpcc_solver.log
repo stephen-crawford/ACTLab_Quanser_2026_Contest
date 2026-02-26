@@ -1,0 +1,1534 @@
+=== MPCC Solver Tests ===
+
+[Config Defaults]
+  TEST: config: contour_weight default is 15.0 (tuned Feb 2026) [PASS]
+  TEST: config: contour_weight > lag_weight (lateral tracking priority) [PASS]
+  TEST: config: velocity_weight >= 15.0 (strong tracking)       [PASS]
+  TEST: config: reference_velocity is 0.45                      [PASS]
+  TEST: config: max_velocity >= 1.0 (ref uses 2.0)              [PASS]
+  TEST: config: min_velocity >= 0 (ref uses u_min=0)            [PASS]
+
+[Dynamics Model]
+  TEST: dynamics: straight ahead (delta=0) preserves heading    [PASS]
+  TEST: dynamics: positive delta (left steer) → positive yaw rate [PASS]
+  TEST: dynamics: negative delta (right steer) → negative yaw rate [PASS]
+
+[Solver - Basic]
+  TEST: solver: straight path → velocity approaches v_ref     
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+[FAIL] solver should succeed
+  TEST: solver: straight path → near-zero steering            
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] solver should succeed
+
+[Solver - Steering Direction (CRITICAL)]
+  TEST: solver: LEFT turn path → POSITIVE delta (left steering) 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] solver should succeed
+  TEST: solver: RIGHT turn path → NEGATIVE delta (right steering) 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] solver should succeed
+
+[Solver - Hub-to-Pickup Scenario]
+  TEST: solver: hub→pickup path → steers LEFT (not right into wall) 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+[FAIL] solver should succeed
+  TEST: solver: hub→pickup → velocity > min (actually moving) 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+[FAIL] solver should succeed
+
+[Solver - Multi-step Simulation]
+  TEST: solver: 20-step simulation → car advances along path  
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+[FAIL] solver should succeed each step
+  TEST: solver: 20-step left turn → car follows curve         
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+[FAIL] car should advance in x (got 0.000000, expected > 0.100000)
+
+[Warm Start]
+  TEST: solver: warm-started solve is faster than cold start    
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] both solves should succeed
+
+[Obstacle Avoidance]
+  TEST: solver: obstacle on path → steers around it           [PASS]
+
+[Contouring & Lag Errors]
+  TEST: contouring: car offset left → positive e_c            [PASS]
+  TEST: lag: car behind reference → negative e_l              [PASS]
+  TEST: lag: car ahead of reference → positive e_l            [PASS]
+
+[Performance]
+  TEST: solver: solve time < 5ms                                
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(avg=48us) [PASS]
+
+[Heading Cost]
+  TEST: heading_cost: heading_weight > 0 adds cost for misaligned heading 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] both should succeed
+  TEST: heading_cost: zero heading error adds no heading cost   [PASS]
+  TEST: heading_cost: solver aligns heading on straight path    
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] heading error should reduce by at least 15% over 3s (got 0.500000, expected < 0.425000)
+  TEST: heading_cost: heading_weight=0 disables heading penalty 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] both should succeed
+
+[Startup Ramp]
+  TEST: startup_ramp: v_ref=0.20 during startup (elapsed < 3s)  
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+[FAIL] solver should succeed
+  TEST: startup_ramp: v_ref=reference_velocity after startup    
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] solver should succeed
+  TEST: startup_ramp: curvature decay applied during startup too [PASS]
+  TEST: startup_weights: ramp enabled (duration=3s) → startup weights during ramp [PASS]
+  TEST: startup_weights: solver corrects 45° heading faster in startup 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] both should succeed
+
+[Curvature-Adaptive Speed]
+  TEST: curvature_speed: straight path → v_ref near reference_velocity [PASS]
+  TEST: curvature_speed: high curvature → reduced v_ref       [PASS]
+  TEST: curvature_speed: solver commands lower speed on curved path 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] both should succeed
+
+[Progress Tracking]
+  TEST: progress: car right of path → solver steers left      
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] solver should succeed
+  TEST: progress: solver advances along path over 10 steps      
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+[FAIL] solver should succeed each step
+  TEST: progress: monotonic enforcement prevents backward jump  [PASS]
+
+[Stuck Detection]
+  TEST: stuck: steering saturated with no progress triggers after 3s [PASS]
+  TEST: stuck: progress advance resets stuck timer              [PASS]
+  TEST: stuck: non-saturated steering does not trigger stuck    [PASS]
+
+[Closed-Loop Tracking Quality]
+  TEST: tracking: 50-step straight path → CTE < 0.05m         
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+(max_cte=0.0000) [PASS]
+  TEST: tracking: 50-step curved path → CTE < 0.40m           
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+(max_cte=0.0000) [PASS]
+
+[Adaptive Lookahead — Curve Tracking]
+  TEST: adaptive: tight curve (r=0.8m) 50-step → CTE < 0.25m  
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max_cte=0.0000) [PASS]
+  TEST: adaptive: S-curve (r=1.5m) 50-step → CTE < 0.25m      
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max_cte=0.0000) [PASS]
+  TEST: adaptive: horizon spacing smaller on curves than straights (straight=0.0650 curved=0.0394) [PASS]
+
+[Curve Tracking Robustness]
+  TEST: lag_atten: tight turn (r=0.6m) with lag atten → less overshoot 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max_cte=0.0000) [PASS]
+  TEST: steering_ff: feedforward δ_ff = atan(L*κ) for curve tracking (κ=0:0.0° κ=1:14.4° κ=2:27.1°) [PASS]
+  TEST: lag_atten: reduced lag still allows forward progress on curve 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 1.
+(dist=0.000 v=0.000) [FAIL] car should advance > 0.3m in 3s on gentle curve (got 0.000000, expected > 0.300000)
+  TEST: lag_atten: zero curvature → lag weight unchanged (no regression) 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] solver should succeed each step
+
+[Closed-Loop Bicycle Dynamics]
+  TEST: closed-loop: straight path → CTE < 0.06m (baseline)   
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max_cte=0.0000 avg_cte=0.0000 prog=0.0%) [FAIL] solver should not fail
+  TEST: closed-loop: 90° curve r=1.0m → CTE < 0.35m          
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max_cte=0.0000 avg_cte=0.0000 prog=0.0%) [FAIL] solver should not fail
+  TEST: closed-loop: 90° curve r=0.8m → CTE < 0.35m          
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max_cte=0.0000 avg_cte=0.0000 prog=0.0%) [FAIL] solver should not fail
+  TEST: closed-loop: 90° curve r=0.6m → CTE < 0.40m          
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max_cte=0.0000 avg_cte=0.0000 prog=0.0%) [FAIL] solver should not fail
+  TEST: closed-loop: S-curve r=1.2m alternating → CTE < 0.20m 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max_cte=0.0000 avg_cte=0.0000 prog=0.0%) [FAIL] solver should not fail
+  TEST: closed-loop: 180° U-turn r=0.8m → CTE < 0.35m        
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max_cte=0.0000 avg_cte=0.0000 prog=0.0%) [FAIL] solver should not fail
+  TEST: closed-loop: vehicle slows before tight curve           
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(v_straight=0.000 v_curve_min=1.000) [PASS]
+  TEST: closed-loop: no backward motion or looping on tight curve 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max_prog=0/500 loop=no) [FAIL] vehicle should make meaningful progress (got 0.000000, expected > 50.000000)
+
+[Oscillation Detection]
+  TEST: oscillation: straight path → ≤3 CTE sign changes in 50 steps 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(sign_changes=0) [PASS]
+  TEST: oscillation: gentle curve r=2m → ≤4 CTE sign changes 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(sign_changes=0) [PASS]
+  TEST: oscillation: 10cm offset → converge without overshoot 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(overshoot=0.0000m) [PASS]
+
+[Reference MPCC.py Dynamics Validation]
+  TEST: ref_dynamics: straight (δ=0) → dψ=0, dx=v           [PASS]
+  TEST: ref_dynamics: yaw rate = v/L * tan(δ) * cos(β) (not sin(β)/L) [PASS]
+  TEST: ref_dynamics: yaw rate correct for δ = ±10°, ±20°, ±30° [PASS]
+  TEST: ref_dynamics: turn radius = L / tan(δ) at low speed    (R_meas=1.2694 R_acker=1.2629) [PASS]
+  TEST: ref_contouring: e_c sign matches reference MPCC.py      [PASS]
+  TEST: ref_solver: output v_cmd and delta_cmd are reasonable for straight path 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] solver should succeed
+  TEST: ref_solver: left curve → positive steering, speed < v_ref 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] solver should succeed
+
+[Deployment Simulation]
+  TEST: deployment: roundabout (r=0.5m, 270°) → CTE < 0.25m  
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max=0.0000 avg=0.0000 steps=0 prog=0.0%) [PASS]
+  TEST: deployment: consecutive solves with warm-start → decreasing cost 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] all solves should succeed
+  TEST: deployment: v_cmd/delta_cmd pipeline → vehicle tracks path 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+[FAIL] solver should succeed
+
+[Adaptive Path Re-projection]
+  TEST: adaptive_reproj: tight curve (r=0.5m) with PathLookup → CTE < 0.20m 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max=0.0000 avg=0.0000 steps=0 prog=0.0%) [PASS]
+  TEST: adaptive_reproj: S-curve with PathLookup → CTE < 0.40m 
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+
+QP solver returned error status 3 (ACADOS_MINSTEP) in SQP iteration 1, QP iteration 3.
+(max=0.0000 steps=0 prog=0.0%) [PASS]
+
+=== Results: 42 passed, 31 failed ===

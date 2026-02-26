@@ -1,0 +1,41 @@
+test_full_mission_sim.cpp: In function ‘int main()’:
+test_full_mission_sim.cpp:994:13: error: ‘solver’ was not declared in this scope; did you mean ‘gsolver’?
+  994 |             solver.spline_path = &spline;
+      |             ^~~~~~
+      |             gsolver
+test_full_mission_sim.cpp:994:35: error: ‘spline’ was not declared in this scope; did you mean ‘gspline’?
+  994 |             solver.spline_path = &spline;
+      |                                   ^~~~~~
+      |                                   gspline
+test_full_mission_sim.cpp:1126:13: error: ‘solver’ was not declared in this scope; did you mean ‘gsolver’?
+ 1126 |             solver.spline_path = &spline;
+      |             ^~~~~~
+      |             gsolver
+test_full_mission_sim.cpp:1126:35: error: ‘spline’ was not declared in this scope; did you mean ‘gspline’?
+ 1126 |             solver.spline_path = &spline;
+      |                                   ^~~~~~
+      |                                   gspline
+test_full_mission_sim.cpp:1243:13: error: ‘solver’ was not declared in this scope; did you mean ‘gsolver’?
+ 1243 |             solver.spline_path = &spline;
+      |             ^~~~~~
+      |             gsolver
+test_full_mission_sim.cpp:1243:35: error: ‘spline’ was not declared in this scope; did you mean ‘gspline’?
+ 1243 |             solver.spline_path = &spline;
+      |                                   ^~~~~~
+      |                                   gspline
+test_full_mission_sim.cpp:1390:13: error: ‘solver’ was not declared in this scope; did you mean ‘gsolver’?
+ 1390 |             solver.spline_path = &spline;
+      |             ^~~~~~
+      |             gsolver
+test_full_mission_sim.cpp:1390:35: error: ‘spline’ was not declared in this scope; did you mean ‘gspline’?
+ 1390 |             solver.spline_path = &spline;
+      |                                   ^~~~~~
+      |                                   gspline
+test_full_mission_sim.cpp:1521:13: error: ‘solver’ was not declared in this scope; did you mean ‘gsolver’?
+ 1521 |             solver.spline_path = &spline;
+      |             ^~~~~~
+      |             gsolver
+test_full_mission_sim.cpp:1521:35: error: ‘spline’ was not declared in this scope; did you mean ‘gspline’?
+ 1521 |             solver.spline_path = &spline;
+      |                                   ^~~~~~
+      |                                   gspline
