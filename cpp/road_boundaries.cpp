@@ -246,7 +246,7 @@ BoundaryResult RoadBoundarySpline::get_boundary_constraints(
         double dy_n = std::sin(theta);
         br.nx = dy_n;
         br.ny = -dx_n;
-        double eff_w = road_width_ * 2.0 - vehicle_half_width_;
+        double eff_w = std::max(road_width_ - vehicle_half_width_ - safety_margin_, 0.10);
         double proj = br.nx * x + br.ny * y;
         br.b_left = proj + eff_w;
         br.b_right = -proj + eff_w;

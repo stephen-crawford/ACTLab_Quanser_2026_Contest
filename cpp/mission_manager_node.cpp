@@ -167,18 +167,34 @@ public:
         cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel_nav", 10);
 
         if (mpcc_mode_) {
-            auto path_qos = rclcpp::QoS(10)
-                .transient_local()
-                .reliable();
+            // Use reliable() but NOT transient_local() for /plan publisher.
+            // transient_local causes QoS DURABILITY incompatibility with Nav2's
+            // planner (which also publishes on /plan with volatile durability),
+            // leading to the MPCC controller rejecting all /plan messages.
+            // The mission manager republishes every 2s, so latching isn't needed.
+            auto path_qos = rclcpp::QoS(10).reliable();
             path_pub_ = this->create_publisher<nav_msgs::msg::Path>("/plan", path_qos);
             hold_pub_ = this->create_publisher<std_msgs::msg::Bool>("/mission/hold", 10);
 
-            // Road graph
-            road_graph_ = std::make_unique<acc::RoadGraph>(0.01);
+            // Road graph (reference 2025 style: single loop [24,20,9,10])
+            road_graph_ = std::make_unique<acc::RoadGraph>(0.001);
             auto routes = road_graph_->get_route_names();
             std::string route_list;
             for (auto& r : routes) route_list += r + " ";
             RCLCPP_INFO(this->get_logger(), "Road graph initialized: %s", route_list.c_str());
+            RCLCPP_INFO(this->get_logger(), "  Loop path: %zu pts, pickup_idx=%d, dropoff_idx=%d, hub_idx=%d",
+                         road_graph_->loop_x().size(),
+                         road_graph_->pickup_index(),
+                         road_graph_->dropoff_index(),
+                         road_graph_->hub_index());
+            if (!road_graph_->loop_x().empty()) {
+                double lx_min = *std::min_element(road_graph_->loop_x().begin(), road_graph_->loop_x().end());
+                double lx_max = *std::max_element(road_graph_->loop_x().begin(), road_graph_->loop_x().end());
+                double ly_min = *std::min_element(road_graph_->loop_y().begin(), road_graph_->loop_y().end());
+                double ly_max = *std::max_element(road_graph_->loop_y().begin(), road_graph_->loop_y().end());
+                RCLCPP_INFO(this->get_logger(), "  Loop QLabs bbox: x=[%.3f..%.3f] y=[%.3f..%.3f]",
+                             lx_min, lx_max, ly_min, ly_max);
+            }
         }
 
         // Nav2 action client
@@ -224,6 +240,13 @@ public:
                 [this](std_msgs::msg::String::SharedPtr msg) {
                     on_mpcc_status(msg->data);
                 }, sub_opts);
+
+            // Replan request subscriber (from MPCC controller)
+            replan_sub_ = this->create_subscription<std_msgs::msg::String>(
+                "/mpcc/replan_request", 10,
+                [this](std_msgs::msg::String::SharedPtr msg) {
+                    on_replan_request(msg->data);
+                }, sub_opts);
         }
 
         // Traffic control state subscriber
@@ -259,12 +282,30 @@ public:
         RCLCPP_INFO(this->get_logger(), "  Mode: %s", mpcc_mode_ ? "MPCC (path only)" : "Nav2");
         RCLCPP_INFO(this->get_logger(), "  Legs: %zu", legs_.size());
         RCLCPP_INFO(this->get_logger(), "  Goal tolerance: %.2fm", goal_tol_m_);
+        RCLCPP_INFO(this->get_logger(), "  Transform: origin=(%.3f, %.3f), theta=%.4f rad (%.1f deg)",
+                     tp_.origin_x, tp_.origin_y, tp_.origin_heading_rad,
+                     tp_.origin_heading_rad * 180.0 / M_PI);
         for (size_t i = 0; i < legs_.size(); ++i) {
             auto& leg = legs_[i];
             RCLCPP_INFO(this->get_logger(), "  %zu: %-20s -> (%.2f, %.2f) dwell=%.1fs %s",
                 i, leg.label.c_str(), leg.target_x, leg.target_y,
                 leg.dwell_s, leg.is_skippable ? "(skip)" : "(req)");
         }
+
+        // Validate coordinate transform: pickup in map frame should be around (-2.43, 4.81)
+        // If it's at (4.44, 3.07), the transform is using R(-theta) instead of R(+theta)
+        {
+            double mx, my, myaw;
+            acc::qlabs_to_map(0.125, 4.395, 0, tp_, mx, my, myaw);
+            RCLCPP_INFO(this->get_logger(), "  Transform check: Pickup QLabs(0.125, 4.395) -> Map(%.2f, %.2f)", mx, my);
+            if (mx > 2.0 || my < 0.0) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "COORDINATE TRANSFORM BUG: Pickup mapped to (%.2f, %.2f) — "
+                    "expected ~(-2.43, 4.81). The qlabs_to_map in coordinate_transform.h "
+                    "may be using R(-theta) instead of R(+theta). REBUILD REQUIRED!", mx, my);
+            }
+        }
+
         RCLCPP_INFO(this->get_logger(), "============================================================");
 
         publish_status("WAIT_FOR_NAV");
@@ -378,10 +419,15 @@ private:
         std::ostringstream ts;
         ts << std::put_time(&tm, "%Y%m%d_%H%M%S");
 
-        std::string log_dir = "/tmp/mission_logs";
+        // Write to the Docker-mounted workspace so logs appear on the host
+        std::string log_dir = "/workspaces/isaac_ros-dev/ros2/src/acc_stage1_mission/logs";
         try {
             std::filesystem::create_directories(log_dir);
-        } catch (...) {}
+        } catch (...) {
+            // Fallback to /tmp if workspace mount not available
+            log_dir = "/tmp/mission_logs";
+            try { std::filesystem::create_directories(log_dir); } catch (...) {}
+        }
 
         behavior_log_path_ = log_dir + "/behavior_" + ts.str() + ".log";
         coord_log_path_ = log_dir + "/coordinates_" + ts.str() + ".csv";
@@ -515,6 +561,143 @@ private:
     }
 
     // -----------------------------------------------------------------
+    // Dynamic Replanning
+    // -----------------------------------------------------------------
+    void on_replan_request(const std::string& json) {
+        // Guards: only replan during GO_LEG with road graph available
+        if (state_ != MissionState::GO_LEG || !mpcc_mode_ || !road_graph_) {
+            RCLCPP_DEBUG(this->get_logger(), "Replan request ignored: state=%s, mpcc=%d",
+                         state_name(state_).c_str(), mpcc_mode_);
+            return;
+        }
+
+        // Cooldown between replans
+        double now = now_sec();
+        if ((now - last_replan_time_) < REPLAN_COOLDOWN_S) {
+            RCLCPP_DEBUG(this->get_logger(), "Replan request ignored: cooldown (%.1fs remaining)",
+                         REPLAN_COOLDOWN_S - (now - last_replan_time_));
+            return;
+        }
+
+        // Per-leg cap to prevent infinite replan cycles
+        if (replan_count_ >= MAX_REPLANS_PER_LEG) {
+            RCLCPP_WARN(this->get_logger(),
+                "Replan request ignored: max %d replans reached for leg %d",
+                MAX_REPLANS_PER_LEG, leg_index_);
+            return;
+        }
+
+        replan_count_++;
+        last_replan_time_ = now;
+
+        RCLCPP_INFO(this->get_logger(),
+            "Replanning path for leg %d (%s) — replan #%d, request: %s",
+            leg_index_,
+            (leg_index_ < static_cast<int>(legs_.size()) ? legs_[leg_index_].label.c_str() : "?"),
+            replan_count_, json.c_str());
+        log_behavior("REPLAN_TRIGGERED", "leg=" + std::to_string(leg_index_) +
+                     " count=" + std::to_string(replan_count_) + " " + json);
+
+        send_road_graph_path(leg_index_);
+        // Reset periodic republish timer so the old cached path isn't re-published
+        last_path_pub_time_ = now;
+    }
+
+    /**
+     * Detect which mission leg the vehicle is currently on based on its
+     * position. Used at startup to allow missions from arbitrary start positions.
+     *
+     * Returns the leg index (0=hub_to_pickup, 1=pickup_to_dropoff, 2=dropoff_to_hub).
+     */
+    int detect_current_leg() {
+        auto pose = get_current_pose();
+        if (!pose) {
+            RCLCPP_WARN(this->get_logger(), "detect_current_leg: no TF available, defaulting to leg 0");
+            return 0;
+        }
+
+        // Transform current position to QLabs frame
+        double cur_qx, cur_qy;
+        acc::map_to_qlabs_2d((*pose)[0], (*pose)[1], tp_, cur_qx, cur_qy);
+
+        // Check if at hub (normal start)
+        double hub_dist = std::hypot(cur_qx - tp_.origin_x, cur_qy - tp_.origin_y);
+        if (hub_dist < goal_tol_m_ * 2.0) {
+            RCLCPP_INFO(this->get_logger(),
+                "detect_current_leg: at hub (dist=%.3f), starting from leg 0", hub_dist);
+            return 0;
+        }
+
+        // Check each route to find the closest one with enough remaining path
+        struct RouteCandidate {
+            int leg_idx;
+            double distance;       // distance from vehicle to closest point on route
+            double remaining_frac; // fraction of route remaining
+        };
+        std::vector<RouteCandidate> candidates;
+
+        for (int i = 0; i < static_cast<int>(legs_.size()); i++) {
+            auto route = road_graph_->get_route(legs_[i].route_name);
+            if (!route || route->first.size() < 2) continue;
+
+            auto& [rx, ry] = *route;
+            // Find closest point on this route
+            int closest_idx = 0;
+            double min_dist_sq = 1e18;
+            for (int j = 0; j < static_cast<int>(rx.size()); j++) {
+                double dsq = (rx[j] - cur_qx) * (rx[j] - cur_qx) +
+                             (ry[j] - cur_qy) * (ry[j] - cur_qy);
+                if (dsq < min_dist_sq) { min_dist_sq = dsq; closest_idx = j; }
+            }
+            double dist = std::sqrt(min_dist_sq);
+            double remaining_frac = 1.0 - static_cast<double>(closest_idx) / rx.size();
+
+            candidates.push_back({i, dist, remaining_frac});
+
+            RCLCPP_INFO(this->get_logger(),
+                "detect_current_leg: route '%s' (leg %d): closest_dist=%.3f, remaining=%.0f%%",
+                legs_[i].route_name.c_str(), i, dist, remaining_frac * 100.0);
+        }
+
+        // Filter to routes with >20% remaining (viable)
+        std::vector<RouteCandidate> viable;
+        for (auto& c : candidates) {
+            if (c.remaining_frac > 0.20) {
+                viable.push_back(c);
+            }
+        }
+
+        if (!viable.empty()) {
+            // Among viable routes, select the one with minimum distance to vehicle
+            auto best = std::min_element(viable.begin(), viable.end(),
+                [](const RouteCandidate& a, const RouteCandidate& b) {
+                    return a.distance < b.distance;
+                });
+            RCLCPP_INFO(this->get_logger(),
+                "detect_current_leg: selected leg %d ('%s'), dist=%.3f, remaining=%.0f%%",
+                best->leg_idx, legs_[best->leg_idx].label.c_str(),
+                best->distance, best->remaining_frac * 100.0);
+            return best->leg_idx;
+        }
+
+        // No viable routes (all near completion) — advance to the next leg after
+        // the one with least remaining fraction
+        if (!candidates.empty()) {
+            auto least = std::min_element(candidates.begin(), candidates.end(),
+                [](const RouteCandidate& a, const RouteCandidate& b) {
+                    return a.remaining_frac < b.remaining_frac;
+                });
+            int next_leg = (least->leg_idx + 1) % static_cast<int>(legs_.size());
+            RCLCPP_INFO(this->get_logger(),
+                "detect_current_leg: all routes near completion, advancing to leg %d", next_leg);
+            return next_leg;
+        }
+
+        RCLCPP_WARN(this->get_logger(), "detect_current_leg: no routes found, defaulting to leg 0");
+        return 0;
+    }
+
+    // -----------------------------------------------------------------
     // Navigation Goal Management
     // -----------------------------------------------------------------
     void send_goal(int leg_idx) {
@@ -568,7 +751,12 @@ private:
 
         // Find the rejoin point: the first path point that is >= blend_dist
         // along the path from the start.
-        double blend_dist = 0.35;  // meters of transition arc
+        // Scale blend distance with heading error — larger errors need longer arcs
+        // to avoid extreme curvature in the Hermite transition
+        double base_blend = 0.35;
+        double err_scale = std::abs(heading_err) / (M_PI / 2.0);  // 1.0 at 90°
+        double blend_dist = base_blend + 0.35 * std::min(err_scale, 2.0);
+        blend_dist = std::min(blend_dist, 1.0);  // cap at 1.0m
         double cum = 0.0;
         int rejoin_idx = 1;
         for (size_t i = 1; i < mx.size(); i++) {
@@ -655,9 +843,36 @@ private:
 
         auto& [qx, qy] = *path;
 
+        // Validate QLabs path bounds (track is ~3.5m x 6m)
+        {
+            double qx_min = *std::min_element(qx.begin(), qx.end());
+            double qx_max = *std::max_element(qx.begin(), qx.end());
+            double qy_min = *std::min_element(qy.begin(), qy.end());
+            double qy_max = *std::max_element(qy.begin(), qy.end());
+            RCLCPP_INFO(this->get_logger(), "Road graph QLabs path: %zu pts, bbox=(%.2f..%.2f, %.2f..%.2f)",
+                         qx.size(), qx_min, qx_max, qy_min, qy_max);
+        }
+
         // Transform to map frame
         std::vector<double> mx, my;
         acc::qlabs_path_to_map(qx, qy, tp_, mx, my);
+
+        // Validate map-frame path bounds (should be similar magnitude)
+        {
+            double mx_min = *std::min_element(mx.begin(), mx.end());
+            double mx_max = *std::max_element(mx.begin(), mx.end());
+            double my_min = *std::min_element(my.begin(), my.end());
+            double my_max = *std::max_element(my.begin(), my.end());
+            RCLCPP_INFO(this->get_logger(), "Map frame path: bbox=(%.2f..%.2f, %.2f..%.2f)",
+                         mx_min, mx_max, my_min, my_max);
+            double span_x = mx_max - mx_min;
+            double span_y = my_max - my_min;
+            if (span_x > 8.0 || span_y > 10.0) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "MAP PATH BOUNDS CHECK FAILED: spans %.1f x %.1fm (expected <8x10). "
+                    "coordinate_transform.h qlabs_to_map may use wrong rotation direction!", span_x, span_y);
+            }
+        }
 
         // Align path start with vehicle heading to prevent initial mismatch
         if (pose) {
@@ -687,6 +902,7 @@ private:
             path_msg.poses.push_back(ps);
         }
 
+        base_path_ = path_msg;
         current_path_ = path_msg;
         path_pub_->publish(path_msg);
         goal_result_received_ = true;
@@ -743,14 +959,17 @@ private:
             auto& path = result.result->path;
             if (!path.poses.empty()) {
                 RCLCPP_INFO(this->get_logger(), "Path computed: %zu poses", path.poses.size());
+                base_path_ = path;
                 current_path_ = path;
                 path_pub_->publish(path);
             } else {
                 RCLCPP_WARN(this->get_logger(), "Empty path received");
+                base_path_.reset();
                 current_path_.reset();
                 on_goal_failure();
             }
         } else {
+            base_path_.reset();
             current_path_.reset();
             on_goal_failure();
         }
@@ -859,6 +1078,7 @@ private:
         leg_index_++;
         retry_count_ = 0;
         recovery_idx_ = 0;
+        replan_count_ = 0;
 
         if (mpcc_mode_) publish_hold(false);
 
@@ -1024,26 +1244,50 @@ private:
             if (json.find(']', search) < json.find('{', search)) break;
         }
 
-        // Check if current path needs avoidance re-planning
-        if (state_ == MissionState::GO_LEG && mpcc_mode_ && current_path_ && !mapped_obstacles_.empty()) {
+        // Check if current path needs avoidance re-planning.
+        // Complements MPCC solver's soft penalty constraints with path-level modification.
+        // Cooldown (2s) prevents compounding modifications from causing spiral paths.
+        if (enable_path_avoidance_ && state_ == MissionState::GO_LEG && mpcc_mode_ &&
+            base_path_ && !mapped_obstacles_.empty() &&
+            (now_sec() - last_avoidance_time_) >= AVOIDANCE_COOLDOWN_S) {
             check_path_avoidance();
         }
     }
 
     void check_path_avoidance() {
-        if (!current_path_ || current_path_->poses.size() < 3) return;
+        // Always compute from base_path_ (never from already-modified current_path_)
+        if (!base_path_ || base_path_->poses.size() < 3) return;
 
-        // Extract path as xy vectors
+        // Extract base path as xy vectors
         std::vector<double> px, py;
-        px.reserve(current_path_->poses.size());
-        py.reserve(current_path_->poses.size());
-        for (auto& ps : current_path_->poses) {
+        px.reserve(base_path_->poses.size());
+        py.reserve(base_path_->poses.size());
+        for (auto& ps : base_path_->poses) {
             px.push_back(ps.pose.position.x);
             py.push_back(ps.pose.position.y);
         }
 
         int blocked_idx = acc::PathModifier::check_path_blocked(px, py, mapped_obstacles_);
-        if (blocked_idx < 0) return;  // path clear
+        if (blocked_idx < 0) {
+            // Path is clear — revert to base path if it was previously modified
+            if (current_path_ && base_path_ &&
+                current_path_->poses.size() == base_path_->poses.size()) {
+                bool differs = false;
+                for (size_t i = 0; i < current_path_->poses.size() && !differs; i++) {
+                    if (current_path_->poses[i].pose.position.x != base_path_->poses[i].pose.position.x ||
+                        current_path_->poses[i].pose.position.y != base_path_->poses[i].pose.position.y) {
+                        differs = true;
+                    }
+                }
+                if (differs) {
+                    current_path_ = base_path_;
+                    current_path_->header.stamp = this->get_clock()->now();
+                    path_pub_->publish(*current_path_);
+                    log_behavior("PATH_AVOIDANCE_CLEARED", "Reverted to base path");
+                }
+            }
+            return;
+        }
 
         // Find which obstacle blocks the path
         double min_d = 1e9;
@@ -1062,13 +1306,16 @@ private:
             blocked_idx, blocking->obj_class.c_str(), blocking->x, blocking->y);
 
         if (acc::PathModifier::generate_avoidance_path(px, py, *blocking)) {
-            // Update current_path_ with modified waypoints
-            for (size_t i = 0; i < px.size(); i++) {
-                current_path_->poses[i].pose.position.x = px[i];
-                current_path_->poses[i].pose.position.y = py[i];
+            // Build a new current_path_ from modified waypoints + base orientations
+            auto modified = *base_path_;
+            for (size_t i = 0; i < px.size() && i < modified.poses.size(); i++) {
+                modified.poses[i].pose.position.x = px[i];
+                modified.poses[i].pose.position.y = py[i];
             }
-            current_path_->header.stamp = this->get_clock()->now();
+            modified.header.stamp = this->get_clock()->now();
+            current_path_ = modified;
             path_pub_->publish(*current_path_);
+            last_avoidance_time_ = now_sec();
             log_behavior("PATH_AVOIDANCE",
                 "Modified path around " + blocking->obj_class +
                 " at (" + std::to_string(blocking->x) + ", " + std::to_string(blocking->y) + ")");
@@ -1246,9 +1493,22 @@ private:
         RCLCPP_INFO(this->get_logger(), "Starting mission with %zu legs", legs_.size());
         log_behavior("MISSION_START", std::to_string(legs_.size()) + " legs");
         set_led(LED_HUB);
-        leg_index_ = 0;
+
+        // Detect starting leg from current position (supports arbitrary start)
+        if (mpcc_mode_ && road_graph_) {
+            leg_index_ = detect_current_leg();
+            RCLCPP_INFO(this->get_logger(), "Auto-detected start leg: %d (%s)",
+                         leg_index_,
+                         leg_index_ < static_cast<int>(legs_.size())
+                             ? legs_[leg_index_].label.c_str() : "?");
+            log_behavior("START_LEG_DETECTED", "leg=" + std::to_string(leg_index_));
+        } else {
+            leg_index_ = 0;
+        }
+
+        replan_count_ = 0;
         state_ = MissionState::GO_LEG;
-        send_goal(0);
+        send_goal(leg_index_);
     }
 
     // -----------------------------------------------------------------
@@ -1292,6 +1552,20 @@ private:
     double last_path_pub_time_ = 0;
     double last_pos_log_time_ = 0;
     std::optional<nav_msgs::msg::Path> current_path_;
+    std::optional<nav_msgs::msg::Path> base_path_;  // unmodified road_graph path
+    double last_avoidance_time_ = 0;
+    static constexpr double AVOIDANCE_COOLDOWN_S = 2.0;
+    bool enable_path_avoidance_ = false;  // disabled: lidar-only obstacle tracker has too many
+                                          // false positives (yield signs, walls) causing the path
+                                          // to balloon and vehicle to get stuck. The MPCC solver's
+                                          // built-in halfspace obstacle constraints handle avoidance
+                                          // at the control level (same as reference implementation).
+
+    // Dynamic replanning
+    double last_replan_time_ = 0.0;
+    int replan_count_ = 0;
+    static constexpr double REPLAN_COOLDOWN_S = 5.0;
+    static constexpr int MAX_REPLANS_PER_LEG = 5;
 
     // Road graph
     std::unique_ptr<acc::RoadGraph> road_graph_;
@@ -1320,6 +1594,7 @@ private:
     // Subscribers
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr motion_sub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mpcc_status_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr replan_sub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr traffic_sub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr obstacle_map_sub_;
 

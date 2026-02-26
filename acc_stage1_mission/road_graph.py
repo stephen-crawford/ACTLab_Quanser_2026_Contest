@@ -3,26 +3,19 @@ Road-network-based path planner for SDCS competition track.
 
 Ported from the reference repo's SDCSRoadMap (mats.py), SCSPath and
 RoadMap (path_planning.py) classes. Uses Straight-Curve-Straight (SCS)
-path generation with configurable graph search for proper road-following
-geometry.
-
-Path planning backends (selected via config/modules.yaml or ROS param):
-  - experience_astar: A* with caching, 13x faster on repeated queries [DEFAULT]
-  - astar:            Standard A*, optimal
-  - weighted_astar:   Bounded suboptimal, fewer expansions
-  - dijkstra:         Optimal baseline, more expansions
-
-How to switch:
-  ROS param:   path_planning_algorithm:=astar
-  Config file: config/modules.yaml -> path_planning.backend
+path generation with A* graph search for proper road-following geometry.
 
 All coordinates are in QLabs world frame (meters).
+
+Note: The primary path planning runs in C++ (road_graph.cpp). This Python
+version is used by visualization tools (path_overlay, generate_report).
 """
 
 import math
 import heapq
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Optional
+from scipy.interpolate import splprep, splev
 
 # ---------------------------------------------------------------------------
 # Math utilities (ported from pal.utilities.math)
@@ -86,7 +79,12 @@ def SCSPath(startPose, endPose, radius, stepSize=0.01):
     t1 = np.array([[np.cos(th1)], [np.sin(th1)]])
     t2 = np.array([[np.cos(th2)], [np.sin(th2)]])
 
-    direction = 1 if _signed_angle(t1, p2 - p1) > 0 else -1
+    sa = _signed_angle(t1, p2 - p1)
+    # When heading points directly at dest (sa≈0), the direction is ambiguous.
+    # Resolve by using the actual heading change (end - start) instead.
+    if abs(sa) < 0.05:
+        sa = _wrap_to_pi(th2 - th1)
+    direction = 1 if sa > 0 else -1
 
     n1 = radius * np.array([[-t1[1, 0]], [t1[0, 0]]]) * direction
     n2 = radius * np.array([[-t2[1, 0]], [t2[0, 0]]]) * direction
@@ -286,8 +284,22 @@ class RoadMap:
 
         return None
 
-    def generate_path(self, nodeSequence):
-        """Generate shortest path through a sequence of node indices."""
+    def generate_path(self, nodeSequence, spacing=0.001, scale_factor=None):
+        """Generate shortest path through a sequence of node indices.
+
+        Matches reference 2025: B-spline resample + optional scale factor.
+
+        Args:
+            nodeSequence: list of node indices
+            spacing: resample spacing in meters (default 0.001 = 1mm, matches ref)
+            scale_factor: [sx, sy] scale factors (default [1.01, 1.0], matches ref)
+
+        Returns:
+            2xN numpy array of waypoints, or None if no path exists.
+        """
+        if scale_factor is None:
+            scale_factor = [1.01, 1.0]
+
         path = np.empty((2, 0))
         for i in range(len(nodeSequence) - 1):
             segment = self.find_shortest_path(
@@ -298,7 +310,26 @@ class RoadMap:
         # Add final node
         final_node = self.nodes[nodeSequence[-1]]
         path = np.hstack((path, final_node.pose[:2, :]))
+
+        # B-spline resample to uniform spacing (matches reference splprep/splev)
+        if path.shape[1] >= 4:
+            path = self._resample_waypoints(path, spacing=spacing)
+
+        # Apply scale factor (reference uses [1.01, 1.0] for lane centering)
+        path[0, :] *= scale_factor[0]
+        path[1, :] *= scale_factor[1]
+
         return path
+
+    @staticmethod
+    def _resample_waypoints(path, spacing=0.001):
+        """Resample path to uniform spacing using B-spline (matches reference)."""
+        total_len = np.sum(np.sqrt(np.sum(np.diff(path, axis=1)**2, axis=0)))
+        n_out = max(int(total_len / spacing), 10)
+        tck, u = splprep([path[0], path[1]], s=0)
+        u_new = np.linspace(0, 1, n_out)
+        out = splev(u_new, tck)
+        return np.vstack(out)
 
 
 # ---------------------------------------------------------------------------
@@ -413,13 +444,26 @@ class SDCSRoadMap(RoadMap):
         for edgeConfig in edgeConfigs:
             self.add_edge(*edgeConfig)
 
+        # Reference 2025 uses D* with +20 penalty on traffic-controlled edges.
+        # This steers routing away from intersections with traffic lights/crosswalks.
+        # Apply the same penalties to our A* — verified to produce identical routes.
+        # Penalties added AFTER edge creation so SCS waypoints are unaffected.
+        penalized_edges = {1, 2, 7, 8, 11, 12, 15, 17, 20, 22, 23, 24}
+        for idx in penalized_edges:
+            if idx < len(self.edges):
+                self.edges[idx].length += 20.0
+
         # Spawn node (node 24): the vehicle's starting position at the hub.
-        # Ported from reference repo (MPC_node.py:127-131).
-        # This eliminates the gap between hub and the road graph.
-        self.add_node([-1.205, -0.83, -44.7 * np.pi / 180.0])  # node 24
-        self.add_edge(24, 2, radius=0.0)       # spawn -> node 2
-        self.add_edge(10, 24, radius=0.0)      # straight — nodes only 0.38m apart, SCSPath curve infeasible
-        self.add_edge(24, 1, radius=0)  # spawn -> node 1 (straight line; was 0.866 which created 270deg southward arc)
+        # Reference 2025 uses: -44.7 % (2*pi) where -44.7 is in radians.
+        # This gives 5.5655 rad. Edge radii from reference are tuned for this heading.
+        hub_heading = (-44.7) % (2 * np.pi)  # = 5.5655 rad, matches reference
+        self.add_node([-1.205, -0.83, hub_heading])  # node 24
+        self.add_edge(24, 2, radius=0.0)        # straight to node 2
+        # Note: reference uses radius=1.48202 for 10→24 but the SCS geometry is
+        # infeasible at this heading (beta > tol). Use straight line since nodes
+        # are only 0.38m apart. The reference also silently fails on this edge.
+        self.add_edge(10, 24, radius=0.0)       # straight from node 10 (0.38m)
+        self.add_edge(24, 1, radius=0.866326)   # curved to node 1 (reference radius)
 
 
 # ---------------------------------------------------------------------------
@@ -437,100 +481,81 @@ class RoadGraph:
     """
     Pre-defined road network for the SDCS track.
 
-    Uses the reference repo's SDCSRoadMap with SCSPath geometry and a
-    configurable path planning backend to generate proper lane-following
-    waypoints. The planner backend is used for dynamic re-planning
-    (plan_path_from_pose); pre-computed routes use fixed node sequences.
+    Uses the reference repo's SDCSRoadMap with SCSPath geometry to generate
+    proper lane-following waypoints. Pre-computes three mission leg routes
+    from a single loop path, matching C++ road_graph.cpp.
     """
 
-    # Node sequences for each mission leg (A* finds shortest path between
-    # consecutive nodes in each sequence)
-    # Node 24 is the spawn node at the hub position (-1.205, -0.83).
-    # Pickup is near node 20. Dropoff is near node 8.
-    #
-    # hub_to_pickup:  24 -> 1 -> 13 -> 19 -> 17 -> 20
-    # pickup_to_dropoff: 21 -> 16 -> 18 -> 11 -> 12 -> 8
-    # dropoff_to_hub: 8 -> 10 -> 24
+    # Reference 2025 approach: single loop path through [24, 20, 9, 10],
+    # then slice at pickup and dropoff indices to produce three mission legs.
+    # The loop visits: Hub -> (node 2,4,14,20=Pickup area) -> (node 22,9=Dropoff area)
+    # -> (node 13,19,17,20,22,10) -> Hub.
+    _LOOP_NODE_SEQUENCE = [24, 20, 9, 10]
 
-    _ROUTE_NODE_SEQUENCES = {
-        'hub_to_pickup': [24, 1, 13, 19, 17, 20],
-        'pickup_to_dropoff': [21, 16, 18, 11, 12, 8],
-        'dropoff_to_hub': [8, 10, 24],
-    }
-
-    def __init__(self, ds: float = 0.01, planner=None):
+    def __init__(self, ds: float = 0.001):
         """
         Args:
-            ds: Waypoint spacing in meters (default 0.01 = 1cm).
-            planner: PathPlannerBackend instance for dynamic re-planning.
-                If None, defaults to ExperienceAStarPlanner (benchmark winner:
-                identical paths to A*, cached calls 13x faster).
+            ds: Waypoint spacing in meters (default 0.001 = 1mm, matches C++ and reference).
         """
         self.ds = ds
         self._roadmap = SDCSRoadMap(leftHandTraffic=False, useSmallMap=False)
         self._routes = {}
 
-        # Set up planner backend (used for dynamic re-planning)
-        if planner is not None:
-            self._planner = planner
-        else:
-            from acc_stage1_mission.planner_interface import ExperienceAStarPlanner
-            self._planner = ExperienceAStarPlanner()
+        # Generate single loop path (matching C++ road_graph.cpp)
+        loop_2xN = self._roadmap.generate_path(
+            self._LOOP_NODE_SEQUENCE, spacing=self.ds, scale_factor=[1.01, 1.0])
+        if loop_2xN is None:
+            return
+        loop_path = loop_2xN.T  # Nx2
 
-        for name, node_seq in self._ROUTE_NODE_SEQUENCES.items():
-            path_2xN = self._roadmap.generate_path(node_seq)
-            if path_2xN is not None:
-                # Convert from 2xN to Nx2 for consistency with rest of codebase
-                route = path_2xN.T
-                # Attach mission endpoints where the route doesn't already
-                # start/end at the exact location (spawn node handles hub).
-                route = self._attach_endpoints(name, route)
-                self._routes[name] = route
+        # Find waypoint indices for slicing. The loop passes near Pickup TWICE
+        # (outbound via node 20, then returning via inner track). Use first-pass
+        # search for correct ordering: Hub -> Pickup -> Dropoff -> Hub.
+        pickup_pt = np.array(PICKUP)
+        dropoff_pt = np.array(DROPOFF)
+
+        dists_pickup = np.linalg.norm(loop_path - pickup_pt, axis=1)
+        dists_dropoff = np.linalg.norm(loop_path - dropoff_pt, axis=1)
+
+        pickup_idx = self._find_first_local_min(dists_pickup, threshold=0.5)
+        dropoff_idx = pickup_idx + self._find_first_local_min(
+            dists_dropoff[pickup_idx:], threshold=0.5)
+
+        # Slice into three legs (same as C++ road_graph.cpp)
+        self._routes['hub_to_pickup'] = loop_path[:pickup_idx + 1]
+        if pickup_idx < dropoff_idx:
+            self._routes['pickup_to_dropoff'] = loop_path[pickup_idx:dropoff_idx + 1]
+        self._routes['dropoff_to_hub'] = loop_path[dropoff_idx:]
+
+        self._loop_path = loop_path
+        self._pickup_idx = pickup_idx
+        self._dropoff_idx = dropoff_idx
 
     @staticmethod
-    def _interpolate_gap(p1: np.ndarray, p2: np.ndarray,
-                         ds: float = 0.01) -> np.ndarray:
-        """Create evenly-spaced points between p1 and p2 (exclusive)."""
-        dist = np.linalg.norm(p2 - p1)
-        if dist < ds * 1.5:
-            return np.empty((0, 2))
-        n = max(int(dist / ds), 2)
-        t = np.linspace(0, 1, n + 1)[1:-1]  # exclude endpoints
-        pts = np.outer(1 - t, p1) + np.outer(t, p2)
-        return pts
+    def _find_first_local_min(dists: np.ndarray, threshold: float = 0.5) -> int:
+        """Find index of the first local minimum below threshold.
 
-    def _attach_endpoints(self, route_name: str,
-                          route: np.ndarray) -> np.ndarray:
-        """Prepend start and append goal mission location to route.
-
-        With spawn node 24 at the hub, hub_to_pickup already starts at hub
-        and dropoff_to_hub already ends at hub. Only non-hub endpoints
-        (pickup, dropoff) need attachment.
+        Scans forward until entering a region within threshold, then returns
+        the argmin within that contiguous region. Falls back to global argmin.
         """
-        if route_name == 'hub_to_pickup':
-            # Start is hub (spawn node 24) — already in graph
-            # End is pickup — may need attachment
-            end = np.array(PICKUP)
-            if np.linalg.norm(route[-1] - end) > 0.02:
-                gap = self._interpolate_gap(route[-1], end, self.ds)
-                route = np.vstack([route, gap, end.reshape(1, 2)])
-        elif route_name == 'pickup_to_dropoff':
-            start = np.array(PICKUP)
-            end = np.array(DROPOFF)
-            if np.linalg.norm(route[0] - start) > 0.02:
-                gap = self._interpolate_gap(start, route[0], self.ds)
-                route = np.vstack([start.reshape(1, 2), gap, route])
-            if np.linalg.norm(route[-1] - end) > 0.02:
-                gap = self._interpolate_gap(route[-1], end, self.ds)
-                route = np.vstack([route, gap, end.reshape(1, 2)])
-        elif route_name == 'dropoff_to_hub':
-            # Start is dropoff — may need attachment
-            # End is hub (spawn node 24) — already in graph
-            start = np.array(DROPOFF)
-            if np.linalg.norm(route[0] - start) > 0.02:
-                gap = self._interpolate_gap(start, route[0], self.ds)
-                route = np.vstack([start.reshape(1, 2), gap, route])
-        return route
+        in_region = False
+        region_start = 0
+        best_idx = int(np.argmin(dists))  # fallback
+
+        for i in range(len(dists)):
+            if dists[i] < threshold:
+                if not in_region:
+                    in_region = True
+                    region_start = i
+            else:
+                if in_region:
+                    best_idx = region_start + int(
+                        np.argmin(dists[region_start:i]))
+                    return best_idx
+        if in_region:
+            best_idx = region_start + int(
+                np.argmin(dists[region_start:]))
+        return best_idx
 
     def get_route(self, route_name: str) -> Optional[np.ndarray]:
         """Get pre-computed route waypoints. Returns Mx2 array or None."""
@@ -539,133 +564,20 @@ class RoadGraph:
     def get_route_names(self) -> List[str]:
         return list(self._routes.keys())
 
-    def get_route_for_leg(self, start_label: str,
-                          goal_label: str) -> Optional[str]:
-        """Determine which route to use based on mission leg labels."""
-        sl = start_label.lower() if start_label else ""
-        gl = goal_label.lower() if goal_label else ""
-        if 'pickup' in gl and ('hub' in sl or not sl):
-            return 'hub_to_pickup'
-        elif 'dropoff' in gl and 'pickup' in sl:
-            return 'pickup_to_dropoff'
-        elif 'hub' in gl and 'dropoff' in sl:
-            return 'dropoff_to_hub'
-        return None
-
-    def plan_path_for_mission_leg(
-        self,
-        route_name: str,
-        current_pos_qlabs: Tuple[float, float],
-    ) -> Optional[np.ndarray]:
-        """
-        Get path for a specific mission leg, starting from current position.
-
-        Returns Mx2 array of waypoints in QLabs frame, or None.
-        """
-        route = self._routes.get(route_name)
-        if route is None:
-            return None
-
-        pos = np.array(current_pos_qlabs[:2])
-        start_idx = self._find_closest_idx(route, pos)
-        route_segment = route[start_idx:]
-
-        if len(route_segment) < 5:
-            route_segment = route[max(0, len(route) - 20):]
-
-        dist_to_start = np.linalg.norm(pos - route_segment[0])
-        if dist_to_start > 0.02 and len(route_segment) >= 2:
-            # Check if prepending creates a direction reversal.
-            # The prepend segment (pos -> route[0]) should roughly align with
-            # the route's first segment (route[0] -> route[1]).
-            prepend_dir = route_segment[0] - pos
-            route_dir = route_segment[1] - route_segment[0]
-            if np.dot(prepend_dir, route_dir) >= 0:
-                return np.vstack([pos.reshape(1, 2), route_segment])
-        return route_segment.copy()
-
-    def plan_path(self, start_qlabs: Tuple[float, float],
-                  goal_qlabs: Tuple[float, float]) -> Optional[np.ndarray]:
-        """Find the best route from start to goal."""
-        start = np.array(start_qlabs[:2])
-        goal = np.array(goal_qlabs[:2])
-
-        best_route = None
-        best_score = float('inf')
-
-        for name, waypoints in self._routes.items():
-            route_start = waypoints[0]
-            route_end = waypoints[-1]
-            start_dist = np.linalg.norm(start - route_start)
-            end_dist = np.linalg.norm(goal - route_end)
-            score = start_dist + end_dist
-            if score < best_score:
-                best_score = score
-                best_route = waypoints
-
-        if best_route is None:
-            return None
-
-        start_idx = self._find_closest_idx(best_route, start)
-        goal_idx = self._find_closest_idx(best_route, goal)
-
-        if goal_idx <= start_idx:
-            return best_route.copy()
-        return best_route[start_idx:goal_idx + 1].copy()
-
-    def plan_path_from_pose(
-        self,
-        current_pos_qlabs: Tuple[float, float],
-        goal_qlabs: Tuple[float, float]
-    ) -> Optional[np.ndarray]:
-        """Plan a path from current position to goal."""
-        pos = np.array(current_pos_qlabs[:2])
-        goal = np.array(goal_qlabs[:2])
-
-        best_route = None
-        best_score = float('inf')
-
-        for name, waypoints in self._routes.items():
-            route_end = waypoints[-1]
-            end_dist = np.linalg.norm(goal - route_end)
-            closest_idx = self._find_closest_idx(waypoints, pos)
-            start_dist = np.linalg.norm(pos - waypoints[closest_idx])
-            score = start_dist + 2.0 * end_dist
-            if score < best_score:
-                best_score = score
-                best_route = waypoints
-
-        if best_route is None:
-            return None
-
-        start_idx = self._find_closest_idx(best_route, pos)
-        route_segment = best_route[start_idx:]
-
-        if len(route_segment) < 5:
-            route_segment = best_route[max(0, len(best_route) - 20):]
-
-        dist_to_start = np.linalg.norm(pos - route_segment[0])
-        if dist_to_start > 0.02 and len(route_segment) >= 2:
-            prepend_dir = route_segment[0] - pos
-            route_dir = route_segment[1] - route_segment[0]
-            if np.dot(prepend_dir, route_dir) >= 0:
-                return np.vstack([pos.reshape(1, 2), route_segment])
-        return route_segment.copy()
-
-    @staticmethod
-    def _find_closest_idx(waypoints: np.ndarray, point: np.ndarray) -> int:
-        dists = np.linalg.norm(waypoints - point, axis=1)
-        return int(np.argmin(dists))
-
 
 def qlabs_path_to_map_path(
     qlabs_waypoints: np.ndarray,
     origin_x: float = -1.205,
     origin_y: float = -0.83,
     origin_heading_deg: float = -44.7,
-    origin_heading_rad: float = None,
+    origin_heading_rad: float = 0.7177,
 ) -> np.ndarray:
-    """Transform Mx2 waypoints from QLabs frame to Cartographer map frame."""
+    """Transform Mx2 waypoints from QLabs frame to Cartographer map frame.
+
+    The transform angle 0.7177 rad is derived from the reference heading:
+    2*pi - (-44.7 % 2*pi) = 0.7177 rad. This is empirically calibrated
+    and matches the reference 2025 MPC_node.py.
+    """
     if origin_heading_rad is not None:
         theta = origin_heading_rad
     else:

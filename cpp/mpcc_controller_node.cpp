@@ -163,10 +163,12 @@ struct ReferencePath {
 
     // Get path references for the MPCC solver at progress offsets
     std::vector<mpcc::PathRef> get_path_refs(double start_progress, int horizon,
-                                              double v_ref, double dt) const {
-        std::vector<mpcc::PathRef> refs(horizon);
-        for (int k = 0; k < horizon; k++) {
-            double s = start_progress + k * v_ref * dt;
+                                              double v_ref, double dt,
+                                              double /*max_velocity*/ = 1.2) const {
+        std::vector<mpcc::PathRef> refs(horizon + 1);
+        double lookahead_speed = v_ref;  // Match reference: use v_ref for horizon spacing
+        for (int k = 0; k <= horizon; k++) {
+            double s = start_progress + k * lookahead_speed * dt;
             s = std::clamp(s, 0.0, total_length - 0.001);
 
             // Find segment
@@ -197,16 +199,24 @@ struct ReferencePath {
 class MPCCControllerNode : public rclcpp::Node {
 public:
     MPCCControllerNode() : Node("mpcc_controller_cpp") {
-        // Parameters (defaults match tuned values from root cause analysis)
-        this->declare_parameter("reference_velocity", 0.65);
-        this->declare_parameter("contour_weight", 8.0);
-        this->declare_parameter("lag_weight", 12.0);
-        this->declare_parameter("horizon", 20);
-        this->declare_parameter("boundary_weight", 20.0);
+        // Parameters — tuned via full-mission simulation (Feb 2026)
+        // contour=20 + heading=3.0 gives 0.094m max CTE in combined sim
+        this->declare_parameter("reference_velocity", 0.45);
+        this->declare_parameter("contour_weight", 20.0);
+        this->declare_parameter("lag_weight", 10.0);
+        this->declare_parameter("horizon", 10);
+        this->declare_parameter("boundary_weight", 0.0);
         this->declare_parameter("boundary_default_width", 0.22);
         this->declare_parameter("road_boundaries_config", std::string(""));
         this->declare_parameter("use_direct_motor", true);
-        this->declare_parameter("use_state_estimator", true);
+        this->declare_parameter("use_state_estimator", false);
+        // Startup weight overrides (reference uses different weights during first 3s)
+        this->declare_parameter("startup_contour_weight", 1.0);
+        this->declare_parameter("startup_lag_weight", 10.0);
+        this->declare_parameter("startup_velocity_weight", 5.0);
+        this->declare_parameter("startup_heading_weight", 3.0);
+        this->declare_parameter("startup_steering_rate_weight", 0.05);
+        this->declare_parameter("startup_curvature_decay", -5.0);
 
         // Initialize solver with tuned config
         mpcc::Config cfg;
@@ -214,26 +224,32 @@ public:
         cfg.dt = 0.1;
         cfg.wheelbase = 0.256;
         cfg.max_velocity = 1.2;   // Raised (ref uses 2.0; qcar2_hardware PD handles speed)
-        cfg.min_velocity = 0.05;  // Must always move forward (prevents solver from settling at v=0)
-        cfg.max_steering = 0.45;
-        cfg.max_acceleration = 0.8;   // Raised from 0.6 for faster response
-        cfg.max_steering_rate = 0.8;  // Raised from 0.6 for faster steering
+        cfg.min_velocity = 0.0;   // Reference uses u_min=[0.0, ...]
+        cfg.max_steering = M_PI / 6.0;  // ±30° — matches reference (PolyCtrl 2025)
+        cfg.max_acceleration = 1.5;   // Reference has no explicit limit; allow fast response
+        cfg.max_steering_rate = 1.5;  // Reference has no explicit limit; allow fast steering
         cfg.reference_velocity = this->get_parameter("reference_velocity").as_double();
         cfg.contour_weight = this->get_parameter("contour_weight").as_double();
         cfg.lag_weight = this->get_parameter("lag_weight").as_double();
         cfg.velocity_weight = 15.0;  // Track v_ref strongly (ref: R_ref[0]=17.0)
-        cfg.steering_weight = 2.0;   // Reduced for more responsive steering
-        cfg.acceleration_weight = 1.0;  // Reduced for faster speed changes
-        cfg.steering_rate_weight = 3.0; // Reduced for more agile steering
-        cfg.jerk_weight = 0.3;       // Reduced for smoother response
+        cfg.steering_weight = 0.05;   // Reference R_ref[1]=0.05, penalizes |δ| gently
+        cfg.acceleration_weight = 0.01;  // Reference R_u[0]=0.005; near-zero for fast speed changes
+        cfg.steering_rate_weight = 1.0; // Smooth steering, prevents bang-bang oscillation; ref R_u[1]=1.1
+        cfg.jerk_weight = 0.0;       // Reference has no jerk penalty
         cfg.robot_radius = 0.13;
         cfg.safety_margin = 0.10;
         cfg.obstacle_weight = 200.0;
         cfg.boundary_weight = this->get_parameter("boundary_weight").as_double();
         cfg.boundary_default_width = this->get_parameter("boundary_default_width").as_double();
-        cfg.max_sqp_iterations = 3;
-        cfg.max_qp_iterations = 10;
+        cfg.max_sqp_iterations = 5;   // PyMPC uses 5; was 3 (insufficient for curve convergence)
+        cfg.max_qp_iterations = 20;   // ×10 internally = 200 ADMM iterations
         cfg.qp_tolerance = 1e-5;
+        cfg.startup_contour_weight = this->get_parameter("startup_contour_weight").as_double();
+        cfg.startup_lag_weight = this->get_parameter("startup_lag_weight").as_double();
+        cfg.startup_velocity_weight = this->get_parameter("startup_velocity_weight").as_double();
+        cfg.startup_heading_weight = this->get_parameter("startup_heading_weight").as_double();
+        cfg.startup_steering_rate_weight = this->get_parameter("startup_steering_rate_weight").as_double();
+        cfg.startup_curvature_decay = this->get_parameter("startup_curvature_decay").as_double();
         solver_.init(cfg);
         config_ = cfg;
 
@@ -280,6 +296,8 @@ public:
             "/mpcc/predicted_path", 10);
         telemetry_pub_ = this->create_publisher<std_msgs::msg::String>(
             "/mpcc/telemetry", 10);
+        replan_pub_ = this->create_publisher<std_msgs::msg::String>(
+            "/mpcc/replan_request", 10);
 
         // Subscribers
         auto qos_be = rclcpp::QoS(1).best_effort();
@@ -287,9 +305,14 @@ public:
             "/odom", qos_be,
             [this](nav_msgs::msg::Odometry::SharedPtr msg) { odom_callback(msg); });
 
-        auto qos_tl = rclcpp::QoS(10).transient_local().reliable();
+        // Use reliable() but NOT transient_local() for /plan subscription.
+        // Nav2's planner also publishes on /plan with volatile durability.
+        // A transient_local subscriber rejects volatile publishers, causing
+        // "incompatible QoS DURABILITY_QOS_POLICY" and dropping all messages.
+        // The mission manager republishes every 2s, so latching isn't needed.
+        auto qos_plan = rclcpp::QoS(10).reliable();
         path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
-            "/plan", qos_tl,
+            "/plan", qos_plan,
             [this](nav_msgs::msg::Path::SharedPtr msg) { path_callback(msg); });
 
         motion_sub_ = this->create_subscription<std_msgs::msg::Bool>(
@@ -369,9 +392,14 @@ public:
                 parse_obstacle_map(msg->data);
             });
 
-        // Control timer (20 Hz)
+        // Control timer — MUST match solver dt (0.1s = 10Hz)
+        // Reference (PolyCtrl 2025) uses controllerUpdateRate=10 with dt=0.1.
+        // Running at 20Hz with dt=0.1 causes warm-start mismatch: the solver
+        // shifts trajectory by one step (0.1s) every 0.05s call, making the
+        // predicted trajectory out of sync with reality by 2x.
+        int control_rate_ms = static_cast<int>(cfg.dt * 1000.0);  // 100ms for dt=0.1
         control_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(50),
+            std::chrono::milliseconds(control_rate_ms),
             [this]() { control_loop(); });
 
         start_time_ = this->now();
@@ -444,10 +472,20 @@ private:
         }
 
         if (path_changed) {
+            // Reset startup ramp timer on EVERY new path (not just the first).
+            // Each mission leg starts from a stop with a new path, so it needs
+            // its own startup ramp. Previously only reset on first path, causing
+            // legs 2 and 3 to never get a startup ramp.
+            start_time_ = this->now();
+
             ref_path_.build(waypoints);
             has_path_ = true;
             current_progress_ = ref_path_.find_closest_progress(state_x_, state_y_);
             solver_.reset();
+            // Reset state_delta_ to match solver's reset u_prev_ = (0.2, 0.0).
+            // Without this, state_delta_ carries over from the previous leg,
+            // creating inconsistency with the solver's fresh state.
+            state_delta_ = 0.0;
 
             // Build cubic spline path too (for smooth curvature)
             try {
@@ -461,6 +499,32 @@ private:
             }
 
             bool spline_ok = spline_path_ && spline_path_->is_built();
+
+            // Set up adaptive path re-projection for the solver.
+            // This lets the solver re-project predicted positions onto the path
+            // each SQP iteration, matching the reference MPCC where arc-length
+            // progress θ is a decision variable. Without this, pre-computed
+            // references race ahead on curves, causing overshoot.
+            if (spline_ok) {
+                double tl = spline_path_->total_length();
+                solver_.path_lookup.lookup = [this, tl](
+                    double px, double py, double s_min, double* s_out) -> mpcc::PathRef
+                {
+                    double s = spline_path_->find_closest_progress_from(px, py, s_min);
+                    s = std::clamp(s, 0.0, tl - 0.001);
+                    if (s_out) *s_out = s;
+                    mpcc::PathRef ref;
+                    double ct, st;
+                    spline_path_->get_path_reference(s, ref.x, ref.y, ct, st);
+                    ref.cos_theta = ct;
+                    ref.sin_theta = st;
+                    ref.curvature = spline_path_->get_curvature(s);
+                    return ref;
+                };
+            } else {
+                solver_.path_lookup.lookup = nullptr;
+            }
+
             RCLCPP_INFO(this->get_logger(), "Path received: %zu waypoints, length=%.2fm, spline=%s",
                          waypoints.size(), ref_path_.total_length,
                          spline_ok ? "smooth" : "linear");
@@ -579,7 +643,7 @@ private:
     }
 
     void parse_obstacle_map(const std::string& json) {
-        // Parse mapped obstacles as solver obstacles
+        // Parse mapped obstacles as solver obstacles (with velocity from Kalman tracker)
         // Merge with raw detections (mapped obstacles have filtered positions)
         mapped_obstacles_.clear();
         size_t pos = json.find("\"obstacles\"");
@@ -599,6 +663,8 @@ private:
             obs.x = parse_json_double(obj, "\"x\"");
             obs.y = parse_json_double(obj, "\"y\"");
             obs.radius = parse_json_double(obj, "\"radius\"");
+            obs.vx = parse_json_double(obj, "\"vx\"");
+            obs.vy = parse_json_double(obj, "\"vy\"");
             if (obs.radius > 0.01) {
                 mapped_obstacles_.push_back(obs);
             }
@@ -659,13 +725,28 @@ private:
     // Unlike piecewise-linear ReferencePath, CubicSplinePath provides C2-continuous
     // tangent angles and bounded curvature, preventing solver oscillation at sharp
     // path segment junctions where curvature can spike to >100.
+    //
+    // Uses curvature-adaptive lookahead: on curves, horizon points are spaced
+    // closer together (matching actual vehicle capability), preventing the solver
+    // from chasing distant references that race ahead of the vehicle.
+    // This matches the reference MPCC (CasADi/IPOPT) where arc-length progress
+    // is a decision variable that naturally slows on curves.
     std::vector<mpcc::PathRef> get_spline_path_refs(
-        double start_progress, int horizon, double v_ref, double dt)
+        double start_progress, int horizon, double v_ref, double dt,
+        double /*actual_v*/)
     {
-        std::vector<mpcc::PathRef> refs(horizon);
+        // Need horizon+1 refs: the solver evaluates cost at k=0..N (N+1 points)
+        // and the condensed QP builds sensitivity for k=1..N
+        std::vector<mpcc::PathRef> refs(horizon + 1);
         double total_len = spline_path_->total_length();
-        for (int k = 0; k < horizon; k++) {
-            double s = start_progress + k * v_ref * dt;
+        // Use v_ref as base speed for lookahead. This ensures sufficient horizon
+        // coverage (~0.65m) even during startup or low-speed situations.
+        // Curvature decay tightens spacing on curves where the vehicle naturally
+        // slows, preventing references from racing ahead of the vehicle.
+        // (Don't use actual_v — it collapses the horizon to ~0.15m at startup,
+        // making the solver blind to upcoming curves and causing loops.)
+        double s = start_progress;
+        for (int k = 0; k <= horizon; k++) {
             s = std::clamp(s, 0.0, total_len - 0.001);
 
             double ref_x, ref_y, cos_t, sin_t;
@@ -676,6 +757,15 @@ private:
             refs[k].cos_theta = cos_t;
             refs[k].sin_theta = sin_t;
             refs[k].curvature = spline_path_->get_curvature(s);
+
+            // Advance by curvature-adaptive speed at this point.
+            // On straights (κ≈0): step = v_ref * dt = 0.065m (full lookahead)
+            // On curves (κ=1.25): step = v_ref * exp(-0.5) * dt = 0.039m (40% tighter)
+            // On tight curves (κ=2): step = v_ref * exp(-0.8) * dt = 0.029m (55% tighter)
+            double curv = std::abs(refs[k].curvature);
+            double step_speed = v_ref * std::exp(-0.4 * curv);
+            step_speed = std::max(step_speed, 0.10);
+            s += step_speed * dt;
         }
         return refs;
     }
@@ -683,24 +773,29 @@ private:
     // Generate road boundary constraints from path geometry or YAML config.
     // Uses spline path for smooth tangent angles (avoids boundary discontinuities at
     // piecewise-linear segment junctions).
+    // Uses curvature-adaptive spacing to match get_spline_path_refs — boundaries
+    // are evaluated at the same arc-length positions as path references.
     std::vector<mpcc::BoundaryConstraint> generate_boundaries(
-        double start_progress, int horizon, double v_ref, double dt)
+        double start_progress, int horizon, double v_ref, double dt,
+        double /*actual_v*/)
     {
         std::vector<mpcc::BoundaryConstraint> boundaries(horizon);
         double half_width = config_.boundary_default_width;
         bool use_spline = spline_path_ && spline_path_->is_built();
         double total_len = use_spline ? spline_path_->total_length() : ref_path_.total_length;
+        double s = start_progress;
 
         for (int k = 0; k < horizon; k++) {
-            double s = start_progress + k * v_ref * dt;
             s = std::clamp(s, 0.0, total_len - 0.001);
 
             double cx, cy, ta;
+            double curv = 0.0;
 
             if (use_spline) {
                 // Smooth spline-based position and tangent
                 spline_path_->get_position(s, cx, cy);
                 ta = spline_path_->get_tangent(s);
+                curv = std::abs(spline_path_->get_curvature(s));
             } else {
                 // Fallback: piecewise-linear
                 int idx = 0;
@@ -739,6 +834,11 @@ private:
                 boundaries[k].b_left = center_proj + half_width;
                 boundaries[k].b_right = -(center_proj - half_width);
             }
+
+            // Advance by curvature-adaptive speed (matching get_spline_path_refs)
+            double step_speed = v_ref * std::exp(-0.4 * curv);
+            step_speed = std::max(step_speed, 0.10);
+            s += step_speed * dt;
         }
         return boundaries;
     }
@@ -748,6 +848,7 @@ private:
 
         // Use state estimator if available and recent (< 0.5s)
         double now_s = this->now().seconds();
+        bool using_estimator = false;
         if (use_state_estimator_ && has_estimator_state_ &&
             (now_s - last_estimator_time_) < 0.5) {
             state_x_ = estimator_x_;
@@ -755,6 +856,7 @@ private:
             state_theta_ = estimator_theta_;
             state_v_ = estimator_v_;
             has_odom_ = true;
+            using_estimator = true;
         } else {
             // Fallback: raw TF + encoder
             update_state_from_tf();
@@ -767,13 +869,22 @@ private:
             }
         }
 
+        // Log position source on first acquisition
+        if (has_odom_ && !logged_first_odom_) {
+            logged_first_odom_ = true;
+            RCLCPP_INFO(this->get_logger(),
+                "First vehicle position acquired via %s: (%.3f, %.3f, %.1f deg)",
+                using_estimator ? "state_estimator" : "raw TF",
+                state_x_, state_y_, state_theta_ * 180.0 / M_PI);
+        }
+
         if (!has_odom_ || !has_path_ || ref_path_.n_points < 2) {
-            // Log why we're not running (throttled to every 2s)
-            if (control_skip_counter_++ % 40 == 0) {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                    "Control loop skipping: has_odom=%d, has_path=%d, n_points=%d",
-                    has_odom_, has_path_, ref_path_.n_points);
-            }
+            // Log why we're not running (throttled to every 5s)
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "Control loop waiting: has_odom=%d (estimator=%d, tf_fallback=%d), "
+                "has_path=%d, n_points=%d",
+                has_odom_, has_estimator_state_,
+                (has_odom_ && !has_estimator_state_), has_path_, ref_path_.n_points);
             return;
         }
 
@@ -783,8 +894,12 @@ private:
             return;
         }
 
-        // Check motion enable (with timeout to prevent permanent stop from
-        // false-positive obstacle detections)
+        // Check motion enable — instead of binary stop, use obstacle-aware speed
+        // limiting. The MPCC solver should always run (with obstacles in its cost
+        // function) so it can steer around obstacles. Only fully stop if the
+        // obstacle is very close AND the controller has been trying to avoid
+        // for a sustained duration.
+        bool obstacle_speed_limit_active = false;
         if (!motion_enabled_) {
             double now_s = this->now().seconds();
             if (motion_disabled_time_ > 0 &&
@@ -802,9 +917,14 @@ private:
                 }
                 motion_enabled_ = true;
                 motion_disabled_time_ = 0.0;
-                // Set cooldown to ignore re-disabling for a few seconds
                 motion_resume_cooldown_time_ = now_s;
+            } else if (!detected_obstacles_.empty() || !mapped_obstacles_.empty()) {
+                // Obstacles detected: don't fully stop, let the MPCC solver handle
+                // avoidance. Apply speed limit instead.
+                obstacle_speed_limit_active = true;
+                // Allow the solver to run with reduced speed
             } else {
+                // No obstacles detected but motion disabled (traffic sign/light stop)
                 publish_stop();
                 return;
             }
@@ -821,7 +941,10 @@ private:
             }
         }
 
-        // Update progress (forward-only) — prefer spline for consistency with path refs
+        // Update progress (monotonic forward-only, matching reference MPC_node.py)
+        // Reference uses index-based monotonic progression: theta_idx only increases.
+        // This prevents the solver from getting confused when the vehicle veers
+        // laterally — closest-point can jump backward, causing oscillation.
         double new_progress;
         double path_total_len;
         if (spline_path_ && spline_path_->is_built()) {
@@ -831,8 +954,29 @@ private:
             new_progress = ref_path_.find_closest_progress(state_x_, state_y_);
             path_total_len = ref_path_.total_length;
         }
-        if (new_progress >= current_progress_ - 0.05) {
+        // Strictly monotonic: only advance, never go backward
+        if (new_progress > current_progress_) {
             current_progress_ = new_progress;
+            stuck_timer_ = 0.0;  // reset stuck timer on progress
+        } else {
+            // Stuck detection: if steering is saturated and no progress for 3s,
+            // the solver is trapped in a local minimum. Reset progress to the
+            // actual closest point to break the deadlock.
+            double max_steer = config_.max_steering;
+            if (std::abs(state_delta_) > max_steer * 0.95) {
+                stuck_timer_ += config_.dt;  // Matches control loop period
+                if (stuck_timer_ > 3.0) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "Stuck detected: steering saturated for %.1fs with no progress. "
+                        "Resetting progress %.3f -> %.3f",
+                        stuck_timer_, current_progress_, new_progress);
+                    current_progress_ = new_progress;
+                    solver_.reset();
+                    stuck_timer_ = 0.0;
+                }
+            } else {
+                stuck_timer_ = 0.0;
+            }
         }
 
         // Check goal reached
@@ -854,21 +998,26 @@ private:
         solver_.config = config_;
 
         // Get path references — prefer spline (smooth curvature) over piecewise-linear
+        // Uses curvature-adaptive lookahead: reference spacing based on max of actual
+        // vehicle speed and half of reference velocity. This prevents the horizon from
+        // extending too far ahead at startup (when v≈0), which caused the solver to
+        // see aggressive curves and command bang-bang steering oscillation.
+        double lookahead_v = std::max(state_v_, config_.reference_velocity * 0.5);
         std::vector<mpcc::PathRef> path_refs;
         if (spline_path_ && spline_path_->is_built()) {
             path_refs = get_spline_path_refs(
                 current_progress_, config_.horizon,
-                config_.reference_velocity, config_.dt);
+                lookahead_v, config_.dt, state_v_);
         } else {
             path_refs = ref_path_.get_path_refs(
                 current_progress_, config_.horizon,
-                config_.reference_velocity, config_.dt);
+                lookahead_v, config_.dt);
         }
 
         // Generate road boundary constraints from path geometry
         auto boundaries = generate_boundaries(
             current_progress_, config_.horizon,
-            config_.reference_velocity, config_.dt);
+            lookahead_v, config_.dt, state_v_);
 
         // Merge detected obstacles with mapped obstacles (prefer mapped — filtered)
         auto merged_obstacles = mapped_obstacles_.empty()
@@ -888,16 +1037,17 @@ private:
             }
         }
 
-        // Saturation recovery: if steering has been at max for multiple cycles,
-        // the warm-start is trapped in a local minimum. Reset to let solver
-        // find a better trajectory from scratch.
-        if (steering_saturated_count_ > SATURATION_RESET_THRESHOLD) {
-            solver_.reset();
-            steering_saturated_count_ = 0;
-            RCLCPP_WARN(this->get_logger(),
-                "Steering saturated for %d cycles, resetting solver warm-start",
-                SATURATION_RESET_THRESHOLD);
-            log_event("Solver warm-start reset: steering saturated");
+        // Saturation monitoring: log when steering has been at max for many cycles,
+        // but do NOT reset the solver warm-start. Resetting during sustained turns
+        // causes a deadlock where the solver never completes the curve — each reset
+        // throws away the accumulated trajectory and the fresh start also saturates,
+        // creating an infinite loop of reset → saturate → reset.
+        if (steering_saturated_count_ > SATURATION_RESET_THRESHOLD &&
+            steering_saturated_count_ % 50 == 0) {
+            RCLCPP_INFO(this->get_logger(),
+                "Steering saturated for %d cycles (progress=%.1f%%) — maintaining warm-start",
+                steering_saturated_count_,
+                100.0 * new_progress / path_total_len);
         }
 
         auto result = solver_.solve(x0, path_refs, current_progress_,
@@ -905,12 +1055,20 @@ private:
                                      merged_obstacles, boundaries);
 
         if (!result.success) {
+            solver_failure_count_++;
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "MPCC solver failed at progress=%.2f/%.2f, pos=(%.3f, %.3f)",
-                current_progress_, ref_path_.total_length, state_x_, state_y_);
+                "MPCC solver failed at progress=%.2f/%.2f, pos=(%.3f, %.3f), consecutive=%d",
+                current_progress_, ref_path_.total_length, state_x_, state_y_,
+                solver_failure_count_);
+            // Check if sustained solver failures warrant a replan request
+            double progress_pct = 100.0 * current_progress_ / path_total_len;
+            check_replan_needed(compute_cross_track_error(), progress_pct);
             publish_stop();
             return;
         }
+
+        // Reset solver failure counter on success
+        solver_failure_count_ = 0;
 
         double v_cmd = result.v_cmd;
         double delta_cmd = result.delta_cmd;
@@ -920,6 +1078,11 @@ private:
             double decel_factor = remaining / 0.5;
             v_cmd *= decel_factor;
             if (remaining > 0.2) v_cmd = std::max(v_cmd, 0.08);
+        }
+
+        // Apply obstacle speed limit: slow down but keep solver steering active
+        if (obstacle_speed_limit_active) {
+            v_cmd = std::min(v_cmd, 0.20);  // Creep at 0.20 m/s while avoiding
         }
 
         v_cmd = std::clamp(v_cmd, config_.min_velocity, config_.max_velocity);
@@ -985,6 +1148,9 @@ private:
         // Persistent CSV log
         log_cycle(v_cmd, delta_cmd, progress_pct, result.solve_time_us,
                   cross_track, heading_err, n_obs);
+
+        // Check if dynamic replanning is needed
+        check_replan_needed(cross_track, progress_pct);
     }
 
     // ---------------------------------------------------------------
@@ -996,8 +1162,13 @@ private:
         std::ostringstream ts;
         ts << std::put_time(&tm, "%Y%m%d_%H%M%S");
 
-        std::string log_dir = "/tmp/mission_logs";
-        try { std::filesystem::create_directories(log_dir); } catch (...) {}
+        // Write to the Docker-mounted workspace so logs appear on the host
+        std::string log_dir = "/workspaces/isaac_ros-dev/ros2/src/acc_stage1_mission/logs";
+        try { std::filesystem::create_directories(log_dir); } catch (...) {
+            // Fallback to /tmp if workspace mount not available
+            log_dir = "/tmp/mission_logs";
+            try { std::filesystem::create_directories(log_dir); } catch (...) {}
+        }
 
         mpcc_csv_path_ = log_dir + "/mpcc_" + ts.str() + ".csv";
         mpcc_event_path_ = log_dir + "/mpcc_events_" + ts.str() + ".log";
@@ -1016,6 +1187,9 @@ private:
               << " contour=" << config_.contour_weight
               << " lag=" << config_.lag_weight
               << " boundary=" << config_.boundary_weight
+              << " steer_rate=" << config_.steering_rate_weight
+              << " heading=" << config_.heading_weight
+              << " max_steer=" << config_.max_steering
               << " direct_motor=" << (use_direct_motor_ ? "true" : "false") << "\n\n";
         }
         log_start_time_ = this->now().seconds();
@@ -1025,9 +1199,8 @@ private:
     void log_cycle(double v_cmd, double delta_cmd, double progress_pct,
                    double solve_time_us, double cross_track, double heading_err,
                    int n_obstacles) {
-        // Throttle CSV writes to ~5Hz (every 4th control cycle at 20Hz)
+        // Log every control cycle for debugging (10Hz at dt=0.1s)
         log_cycle_counter_++;
-        if (log_cycle_counter_ % 4 != 0) return;
 
         double elapsed = this->now().seconds() - log_start_time_;
         double v_meas = has_joint_velocity_ ? joint_velocity_ : state_v_;
@@ -1055,6 +1228,58 @@ private:
             f << "[+" << std::fixed << std::setprecision(1) << elapsed << "s] "
               << event << "\n";
         } catch (...) {}
+    }
+
+    void check_replan_needed(double cross_track, double progress_pct) {
+        double now_s = this->now().seconds();
+
+        // Cooldown: don't request replan too frequently
+        if ((now_s - last_replan_request_time_) < REPLAN_COOLDOWN_S) return;
+
+        bool should_request = false;
+        std::string reason;
+        double ct_abs = std::abs(cross_track);
+
+        // Trigger 1: Sustained cross-track violation
+        if (ct_abs > REPLAN_CROSS_TRACK_THRESHOLD) {
+            if (sustained_cross_track_start_ <= 0.0) {
+                sustained_cross_track_start_ = now_s;
+            } else if (!replan_requested_ &&
+                       (now_s - sustained_cross_track_start_) > REPLAN_SUSTAINED_DURATION) {
+                should_request = true;
+                reason = "cross_track_violation";
+                replan_requested_ = true;  // debounce: one request per violation episode
+            }
+        } else {
+            // Cross-track recovered below threshold
+            sustained_cross_track_start_ = 0.0;
+            replan_requested_ = false;
+        }
+
+        // Trigger 2: Consecutive solver failures (checked separately in control_loop)
+        if (solver_failure_count_ >= REPLAN_SOLVER_FAILURE_THRESHOLD) {
+            should_request = true;
+            reason = "solver_failure";
+            solver_failure_count_ = 0;  // reset after requesting
+        }
+
+        if (should_request) {
+            char buf[512];
+            std::snprintf(buf, sizeof(buf),
+                "{\"reason\":\"%s\",\"cross_track_error\":%.4f,"
+                "\"progress_pct\":%.1f,\"vehicle_x\":%.4f,\"vehicle_y\":%.4f}",
+                reason.c_str(), cross_track, progress_pct, state_x_, state_y_);
+            auto msg = std_msgs::msg::String();
+            msg.data = buf;
+            replan_pub_->publish(msg);
+            last_replan_request_time_ = now_s;
+
+            RCLCPP_WARN(this->get_logger(),
+                "Replan requested: reason=%s, cross_track=%.3f, progress=%.1f%%",
+                reason.c_str(), cross_track, progress_pct);
+            log_event("Replan requested: " + reason +
+                      ", cross_track=" + std::to_string(cross_track));
+        }
     }
 
     void publish_stop() {
@@ -1117,6 +1342,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr telemetry_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr replan_pub_;
 
     // Subscribers
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
@@ -1138,6 +1364,7 @@ private:
     double state_v_ = 0.0, state_delta_ = 0.0;
     double odom_velocity_ = 0.0;
     bool has_odom_ = false;
+    bool logged_first_odom_ = false;
     bool has_path_ = false;
     bool motion_enabled_ = true;
     double motion_disabled_time_ = 0.0;
@@ -1148,9 +1375,21 @@ private:
     static constexpr int MOTION_ENABLE_HYSTERESIS = 2;  // ~200ms at 100ms publish rate (fast re-enable)
     int steering_saturated_count_ = 0;
     static constexpr int SATURATION_RESET_THRESHOLD = 10;  // Reset warm-start after 10 cycles (~0.5s) of saturated steering
+
+    // Replan request state
+    double sustained_cross_track_start_ = 0.0;
+    bool replan_requested_ = false;
+    double last_replan_request_time_ = 0.0;
+    int solver_failure_count_ = 0;
+    static constexpr double REPLAN_CROSS_TRACK_THRESHOLD = 0.40;  // meters
+    static constexpr double REPLAN_SUSTAINED_DURATION = 1.0;       // seconds
+    static constexpr double REPLAN_COOLDOWN_S = 5.0;               // min between requests
+    static constexpr int REPLAN_SOLVER_FAILURE_THRESHOLD = 20;     // 1s at 20Hz
+
     bool mission_hold_ = false;
     std::string traffic_state_json_;
     double current_progress_ = 0.0;
+    double stuck_timer_ = 0.0;
     ReferencePath ref_path_;
     std::vector<mpcc::Obstacle> detected_obstacles_;
 
@@ -1162,7 +1401,7 @@ private:
     bool use_direct_motor_ = true;
 
     // State estimator
-    bool use_state_estimator_ = true;
+    bool use_state_estimator_ = false;
     bool has_estimator_state_ = false;
     double estimator_x_ = 0, estimator_y_ = 0, estimator_theta_ = 0, estimator_v_ = 0;
     double last_estimator_time_ = 0;

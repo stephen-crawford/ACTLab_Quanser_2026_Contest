@@ -76,12 +76,14 @@ int mpcc_solve(
         path_refs[i].curvature = path[i].curvature;
     }
 
-    // Convert obstacles
+    // Convert obstacles (with velocities for dynamic obstacle prediction)
     std::vector<mpcc::Obstacle> obs_vec(n_obstacles);
     for (int i = 0; i < n_obstacles; i++) {
         obs_vec[i].x = obstacles[i].x;
         obs_vec[i].y = obstacles[i].y;
         obs_vec[i].radius = obstacles[i].radius;
+        obs_vec[i].vx = obstacles[i].vx;
+        obs_vec[i].vy = obstacles[i].vy;
     }
 
     // Convert boundaries

@@ -39,8 +39,8 @@ inline void qlabs_to_map(double qlabs_x, double qlabs_y, double qlabs_yaw,
     double cos_t = std::cos(tp.origin_heading_rad);
     double sin_t = std::sin(tp.origin_heading_rad);
 
-    map_x =  cos_t * dx + sin_t * dy;
-    map_y = -sin_t * dx + cos_t * dy;
+    map_x = cos_t * dx - sin_t * dy;
+    map_y = sin_t * dx + cos_t * dy;
     map_yaw = normalize_angle(qlabs_yaw + tp.origin_heading_rad);
 }
 
@@ -52,8 +52,8 @@ inline void map_to_qlabs(double map_x, double map_y, double map_yaw,
     double cos_t = std::cos(tp.origin_heading_rad);
     double sin_t = std::sin(tp.origin_heading_rad);
 
-    double rx = map_x * cos_t - map_y * sin_t;
-    double ry = map_x * sin_t + map_y * cos_t;
+    double rx =  map_x * cos_t + map_y * sin_t;
+    double ry = -map_x * sin_t + map_y * cos_t;
 
     qlabs_x = rx + tp.origin_x;
     qlabs_y = ry + tp.origin_y;
@@ -69,8 +69,8 @@ inline void qlabs_to_map_2d(double qlabs_x, double qlabs_y,
     double dy = qlabs_y - tp.origin_y;
     double cos_t = std::cos(tp.origin_heading_rad);
     double sin_t = std::sin(tp.origin_heading_rad);
-    map_x =  cos_t * dx + sin_t * dy;
-    map_y = -sin_t * dx + cos_t * dy;
+    map_x = cos_t * dx - sin_t * dy;
+    map_y = sin_t * dx + cos_t * dy;
 }
 
 /// Transform a 2D point (no heading) from map to QLabs frame.
@@ -80,8 +80,8 @@ inline void map_to_qlabs_2d(double map_x, double map_y,
 {
     double cos_t = std::cos(tp.origin_heading_rad);
     double sin_t = std::sin(tp.origin_heading_rad);
-    qlabs_x = map_x * cos_t - map_y * sin_t + tp.origin_x;
-    qlabs_y = map_x * sin_t + map_y * cos_t + tp.origin_y;
+    qlabs_x =  map_x * cos_t + map_y * sin_t + tp.origin_x;
+    qlabs_y = -map_x * sin_t + map_y * cos_t + tp.origin_y;
 }
 
 /// Batch transform Nx2 waypoints from QLabs to map frame.
@@ -100,8 +100,8 @@ inline void qlabs_path_to_map(const std::vector<double>& qlabs_x,
     for (size_t i = 0; i < n; ++i) {
         double dx = qlabs_x[i] - tp.origin_x;
         double dy = qlabs_y[i] - tp.origin_y;
-        map_x[i] =  cos_t * dx + sin_t * dy;
-        map_y[i] = -sin_t * dx + cos_t * dy;
+        map_x[i] = cos_t * dx - sin_t * dy;
+        map_y[i] = sin_t * dx + cos_t * dy;
     }
 }
 

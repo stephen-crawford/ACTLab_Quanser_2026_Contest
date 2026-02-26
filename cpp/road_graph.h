@@ -91,9 +91,14 @@ constexpr double HUB_X = -1.205, HUB_Y = -0.83;
 constexpr double PICKUP_X = 0.125, PICKUP_Y = 4.395;
 constexpr double DROPOFF_X = -0.905, DROPOFF_Y = 0.800;
 
+/// Resample a 2D path to uniform spacing using natural cubic spline interpolation.
+/// Reference 2025 uses scipy splprep/splev; this is a C++ equivalent.
+void resample_path(std::vector<double>& x, std::vector<double>& y,
+                   double spacing = 0.001);
+
 class RoadGraph {
 public:
-    explicit RoadGraph(double ds = 0.01);
+    explicit RoadGraph(double ds = 0.001);
 
     /// Get pre-computed route waypoints. Returns (x[], y[]) or nullopt.
     std::optional<std::pair<std::vector<double>, std::vector<double>>>
@@ -112,9 +117,36 @@ public:
     plan_path_for_mission_leg(const std::string& route_name,
                               double cur_x, double cur_y) const;
 
+    /// Find the best pre-computed route from start to goal (QLabs coords).
+    /// Returns (x[], y[]) or nullopt.
+    std::optional<std::pair<std::vector<double>, std::vector<double>>>
+    plan_path(double start_x, double start_y,
+              double goal_x, double goal_y) const;
+
+    /// Plan a path from current position to goal using the best matching route.
+    /// Returns (x[], y[]) or nullopt.
+    std::optional<std::pair<std::vector<double>, std::vector<double>>>
+    plan_path_from_pose(double cur_x, double cur_y,
+                        double goal_x, double goal_y) const;
+
+    /// Get the full loop path (all waypoints, QLabs frame).
+    const std::vector<double>& loop_x() const { return loop_x_; }
+    const std::vector<double>& loop_y() const { return loop_y_; }
+
+    /// Get waypoint indices for key locations on the loop.
+    int pickup_index() const { return pickup_idx_; }
+    int dropoff_index() const { return dropoff_idx_; }
+    int hub_index() const { return hub_idx_; }
+
 private:
     double ds_;
     SDCSRoadMap roadmap_;
+
+    // Full loop path (reference 2025 style: single [24,20,9,10] path)
+    std::vector<double> loop_x_, loop_y_;
+    int pickup_idx_ = -1;   // waypoint index closest to pickup
+    int dropoff_idx_ = -1;  // waypoint index closest to dropoff
+    int hub_idx_ = -1;      // waypoint index closest to hub (end of loop)
 
     struct Route {
         std::vector<double> x, y;
@@ -124,12 +156,14 @@ private:
     static int find_closest_idx(const std::vector<double>& wx,
                                 const std::vector<double>& wy,
                                 double px, double py);
-    static void interpolate_gap(double x1, double y1, double x2, double y2,
-                                double ds,
-                                std::vector<double>& out_x,
-                                std::vector<double>& out_y);
-    void attach_endpoints(const std::string& route_name,
-                          std::vector<double>& rx, std::vector<double>& ry);
+
+    /// Find the first local minimum within threshold of (px,py).
+    /// Avoids picking a later pass when the path visits the same area twice.
+    static int find_first_local_min(const std::vector<double>& wx,
+                                    const std::vector<double>& wy,
+                                    double px, double py,
+                                    double threshold = 0.5,
+                                    int start_from = 0);
 };
 
 }  // namespace acc

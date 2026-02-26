@@ -1,15 +1,12 @@
 """
-All-C++ Mission Launch File
+All-C++ Mission Launch File (legacy — prefer mpcc_mission_launch.py)
 
-Launches the complete mission stack using only C++ nodes:
-- odom_from_tf_node: TF -> /odom bridge
-- mpcc_controller_node: MPCC path following controller
-- mission_manager_node: Mission state machine (MPCC mode)
-- sign_detector_node: HSV traffic sign/light/cone detection
+This launch file is installed with the acc_mpcc_controller_cpp package.
+The primary launch file is launch/mpcc_mission_launch.py (acc_stage1_mission).
 
 Usage:
     ros2 launch acc_mpcc_controller_cpp cpp_mission_launch.py
-    ros2 launch acc_mpcc_controller_cpp cpp_mission_launch.py reference_velocity:=0.30
+    ros2 launch acc_mpcc_controller_cpp cpp_mission_launch.py reference_velocity:=0.40
 """
 
 from launch import LaunchDescription
@@ -19,35 +16,35 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # Launch arguments
+    # Launch arguments — must match mpcc_mission_launch.py defaults
     reference_velocity_arg = DeclareLaunchArgument(
         'reference_velocity',
-        default_value='0.35',
+        default_value='0.50',
         description='Target velocity (m/s)'
     )
 
     contour_weight_arg = DeclareLaunchArgument(
         'contour_weight',
-        default_value='25.0',
+        default_value='8.0',
         description='Weight for path contouring (lateral) error'
     )
 
     lag_weight_arg = DeclareLaunchArgument(
         'lag_weight',
-        default_value='5.0',
+        default_value='10.0',
         description='Weight for lag (progress) error'
     )
 
     horizon_arg = DeclareLaunchArgument(
         'horizon',
-        default_value='20',
+        default_value='25',
         description='MPC prediction horizon (steps)'
     )
 
     boundary_weight_arg = DeclareLaunchArgument(
         'boundary_weight',
-        default_value='30.0',
-        description='Road boundary constraint penalty weight'
+        default_value='0.0',
+        description='Road boundary constraint penalty weight (ref has 0)'
     )
 
     # Odom From TF Node (C++)

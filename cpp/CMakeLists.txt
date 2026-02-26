@@ -19,6 +19,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(action_msgs REQUIRED)
@@ -96,7 +97,11 @@ ament_target_dependencies(sign_detector_node
   rclcpp
   sensor_msgs
   std_msgs
+  geometry_msgs
   cv_bridge
+  tf2_ros
+  tf2
+  tf2_geometry_msgs
 )
 
 # =============================================================================

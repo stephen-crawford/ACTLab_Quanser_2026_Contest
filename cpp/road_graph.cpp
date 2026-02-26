@@ -71,6 +71,11 @@ SCSResult SCSPath(const double start[3], const double end[3],
     // Direction of turn
     double dp_x = p2x - p1x, dp_y = p2y - p1y;
     double sa = signed_angle_between(t1x, t1y, dp_x, dp_y);
+    // When heading points directly at dest (sa≈0), the direction is ambiguous.
+    // Resolve by using the actual heading change (end - start) instead.
+    if (std::abs(sa) < 0.05) {
+        sa = wrap_to_pi(th2 - th1);
+    }
     int direction = (sa > 0) ? 1 : -1;
 
     double n1x = radius * (-t1y) * direction;
@@ -410,13 +415,152 @@ SDCSRoadMap::SDCSRoadMap(bool /*left_hand_traffic*/, bool use_small_map)
     }
 
     // Spawn node (node 24): vehicle starting position at hub
-    double spawn_heading = std::fmod(-44.7 * pi / 180.0, 2.0 * pi);
-    if (spawn_heading < 0) spawn_heading += 2.0 * pi;
-    add_node(-1.205, -0.83, spawn_heading);  // node 24
+    // Reference 2025 uses: -44.7 % (2*pi) where -44.7 is in radians (NOT degrees).
+    // This gives 5.5655 rad. The edge radii below were tuned for this heading.
+    // Edge radii from reference: hub→2=0.0, 10→hub=1.48202, hub→1=0.866326
+    double hub_heading = std::fmod(-44.7, 2.0 * M_PI);
+    if (hub_heading < 0) hub_heading += 2.0 * M_PI;  // = 5.5655 rad
+    add_node(-1.205, -0.83, hub_heading);  // node 24
     add_edge(24, 2, 0.0);
+    // Note: reference uses radius=1.48202 for 10→24 but SCS geometry is infeasible
+    // at heading 5.5655 (beta > tol). Use straight line; nodes are only 0.38m apart.
     add_edge(10, 24, 0.0);
-    add_edge(24, 1, 0.0);  // Straight line (was 0.866 — the arc honored spawn heading 315deg,
-                            // creating a 270deg southward sweep before heading northeast)
+    add_edge(24, 1, 0.866326);
+
+    // Reference 2025 uses D* with +20 penalty on traffic-controlled edges
+    // (indices 1,2,7,8,11,12,15,17,20,22,23,24). This steers routing away from
+    // intersections with traffic lights/crosswalks. Apply the same penalties to
+    // our A* — verified to produce identical routes as the reference D*.
+    // Penalties are added AFTER edge creation so SCS waypoints are unaffected.
+    static const std::set<int> penalized_edges = {1,2, 7,8, 11,12, 15,17, 20, 22,23,24};
+    for (int idx : penalized_edges) {
+        if (idx < static_cast<int>(edges_.size())) {
+            edges_[idx].length += 20.0;
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// Spline resampling (C++ equivalent of scipy splprep/splev with s=0)
+// Uses natural cubic spline for exact-interpolation uniform-spacing resampling.
+// Replaces previous Catmull-Rom which overshoots at sharp direction changes.
+// -------------------------------------------------------------------------
+
+void resample_path(std::vector<double>& x, std::vector<double>& y, double spacing)
+{
+    size_t n = x.size();
+    if (n < 2) return;
+
+    // Compute cumulative arc lengths
+    std::vector<double> arc(n, 0.0);
+    for (size_t i = 1; i < n; ++i) {
+        arc[i] = arc[i-1] + std::hypot(x[i] - x[i-1], y[i] - y[i-1]);
+    }
+    double total_length = arc.back();
+    if (total_length < spacing) return;
+
+    // Remove duplicate arc-length points (zero-length segments cause spline issues)
+    std::vector<double> s_pts, x_pts, y_pts;
+    s_pts.reserve(n);
+    x_pts.reserve(n);
+    y_pts.reserve(n);
+    s_pts.push_back(arc[0]);
+    x_pts.push_back(x[0]);
+    y_pts.push_back(y[0]);
+    for (size_t i = 1; i < n; ++i) {
+        if (arc[i] - s_pts.back() > 1e-10) {
+            s_pts.push_back(arc[i]);
+            x_pts.push_back(x[i]);
+            y_pts.push_back(y[i]);
+        }
+    }
+    size_t m = s_pts.size();
+    if (m < 2) return;
+
+    // Linear fallback for 2 points
+    if (m == 2) {
+        int n_out = std::max(static_cast<int>(total_length / spacing), 2);
+        std::vector<double> rx(n_out + 1), ry(n_out + 1);
+        for (int i = 0; i <= n_out; ++i) {
+            double t = static_cast<double>(i) / n_out;
+            rx[i] = x_pts[0] + t * (x_pts[1] - x_pts[0]);
+            ry[i] = y_pts[0] + t * (y_pts[1] - y_pts[0]);
+        }
+        x = std::move(rx);
+        y = std::move(ry);
+        return;
+    }
+
+    // Build natural cubic spline second derivatives M[] via Thomas algorithm.
+    // Natural BC: M[0] = M[m-1] = 0.
+    // For interior nodes j=1..m-2:
+    //   h[j-1]*M[j-1] + 2*(h[j-1]+h[j])*M[j] + h[j]*M[j+1] = rhs[j]
+    auto build_spline_M = [m](const std::vector<double>& s,
+                               const std::vector<double>& f)
+        -> std::vector<double>
+    {
+        std::vector<double> M(m, 0.0);
+        if (m < 3) return M;
+
+        std::vector<double> h(m - 1);
+        for (size_t i = 0; i < m - 1; ++i)
+            h[i] = s[i + 1] - s[i];
+
+        size_t sz = m - 2;
+        std::vector<double> diag(sz), sup(sz), rhs(sz);
+        for (size_t k = 0; k < sz; ++k) {
+            diag[k] = 2.0 * (h[k] + h[k + 1]);
+            sup[k] = h[k + 1];
+            rhs[k] = 6.0 * ((f[k+2] - f[k+1]) / h[k+1]
+                           - (f[k+1] - f[k])   / h[k]);
+        }
+
+        // Thomas algorithm: forward elimination
+        for (size_t k = 1; k < sz; ++k) {
+            double w = h[k] / diag[k - 1];
+            diag[k] -= w * sup[k - 1];
+            rhs[k]  -= w * rhs[k - 1];
+        }
+
+        // Back substitution
+        M[sz] = rhs[sz - 1] / diag[sz - 1];
+        for (int k = static_cast<int>(sz) - 2; k >= 0; --k) {
+            M[k + 1] = (rhs[k] - sup[k] * M[k + 2]) / diag[k];
+        }
+
+        return M;
+    };
+
+    auto Mx = build_spline_M(s_pts, x_pts);
+    auto My = build_spline_M(s_pts, y_pts);
+
+    // Evaluate spline at uniform arc-length intervals
+    int n_out = static_cast<int>(total_length / spacing);
+    if (n_out < 2) return;
+
+    std::vector<double> rx, ry;
+    rx.reserve(n_out + 1);
+    ry.reserve(n_out + 1);
+
+    size_t seg = 0;
+    for (int i = 0; i <= n_out; ++i) {
+        double t = static_cast<double>(i) / n_out * total_length;
+        while (seg + 1 < m - 1 && s_pts[seg + 1] < t) ++seg;
+
+        double hi = s_pts[seg + 1] - s_pts[seg];
+        double a = (s_pts[seg + 1] - t) / hi;
+        double b = (t - s_pts[seg]) / hi;
+
+        rx.push_back(a * x_pts[seg] + b * x_pts[seg + 1] +
+                     (hi * hi / 6.0) * ((a*a*a - a) * Mx[seg] +
+                                        (b*b*b - b) * Mx[seg + 1]));
+        ry.push_back(a * y_pts[seg] + b * y_pts[seg + 1] +
+                     (hi * hi / 6.0) * ((a*a*a - a) * My[seg] +
+                                        (b*b*b - b) * My[seg + 1]));
+    }
+
+    x = std::move(rx);
+    y = std::move(ry);
 }
 
 // -------------------------------------------------------------------------
@@ -436,79 +580,113 @@ int RoadGraph::find_closest_idx(const std::vector<double>& wx,
     return idx;
 }
 
-void RoadGraph::interpolate_gap(double x1, double y1, double x2, double y2,
-                                double ds,
-                                std::vector<double>& out_x,
-                                std::vector<double>& out_y)
+int RoadGraph::find_first_local_min(const std::vector<double>& wx,
+                                    const std::vector<double>& wy,
+                                    double px, double py,
+                                    double threshold,
+                                    int start_from)
 {
-    double dist = std::hypot(x2 - x1, y2 - y1);
-    if (dist < ds * 1.5) return;
-    int n = std::max(static_cast<int>(dist / ds), 2);
-    for (int i = 1; i < n; ++i) {
-        double t = static_cast<double>(i) / n;
-        out_x.push_back(x1 + t * (x2 - x1));
-        out_y.push_back(y1 + t * (y2 - y1));
-    }
-}
+    // Find the first contiguous region within threshold of (px,py),
+    // then return the argmin within that region. This avoids picking
+    // a later pass when the path visits the same area twice.
+    double thresh_sq = threshold * threshold;
+    bool in_region = false;
+    int region_start = 0;
+    int best_idx = find_closest_idx(wx, wy, px, py);  // fallback
 
-void RoadGraph::attach_endpoints(const std::string& route_name,
-                                 std::vector<double>& rx,
-                                 std::vector<double>& ry)
-{
-    if (rx.empty()) return;
-
-    auto prepend = [&](double px, double py) {
-        if (std::hypot(rx.front() - px, ry.front() - py) > 0.02) {
-            std::vector<double> gx, gy;
-            interpolate_gap(px, py, rx.front(), ry.front(), ds_, gx, gy);
-            std::vector<double> nx, ny;
-            nx.push_back(px); ny.push_back(py);
-            nx.insert(nx.end(), gx.begin(), gx.end());
-            ny.insert(ny.end(), gy.begin(), gy.end());
-            nx.insert(nx.end(), rx.begin(), rx.end());
-            ny.insert(ny.end(), ry.begin(), ry.end());
-            rx = std::move(nx); ry = std::move(ny);
+    for (size_t i = static_cast<size_t>(start_from); i < wx.size(); ++i) {
+        double d_sq = (wx[i] - px) * (wx[i] - px) + (wy[i] - py) * (wy[i] - py);
+        if (d_sq < thresh_sq) {
+            if (!in_region) {
+                in_region = true;
+                region_start = static_cast<int>(i);
+            }
+        } else {
+            if (in_region) {
+                // Exited the first close region — find min within it
+                double best_d = 1e18;
+                for (int j = region_start; j < static_cast<int>(i); ++j) {
+                    double d = (wx[j] - px) * (wx[j] - px) + (wy[j] - py) * (wy[j] - py);
+                    if (d < best_d) { best_d = d; best_idx = j; }
+                }
+                return best_idx;
+            }
         }
-    };
-
-    auto append = [&](double px, double py) {
-        if (std::hypot(rx.back() - px, ry.back() - py) > 0.02) {
-            std::vector<double> gx, gy;
-            interpolate_gap(rx.back(), ry.back(), px, py, ds_, gx, gy);
-            rx.insert(rx.end(), gx.begin(), gx.end());
-            ry.insert(ry.end(), gy.begin(), gy.end());
-            rx.push_back(px); ry.push_back(py);
-        }
-    };
-
-    if (route_name == "hub_to_pickup") {
-        append(PICKUP_X, PICKUP_Y);
-    } else if (route_name == "pickup_to_dropoff") {
-        prepend(PICKUP_X, PICKUP_Y);
-        append(DROPOFF_X, DROPOFF_Y);
-    } else if (route_name == "dropoff_to_hub") {
-        prepend(DROPOFF_X, DROPOFF_Y);
     }
+    // If we ended while still in region
+    if (in_region) {
+        double best_d = 1e18;
+        for (int j = region_start; j < static_cast<int>(wx.size()); ++j) {
+            double d = (wx[j] - px) * (wx[j] - px) + (wy[j] - py) * (wy[j] - py);
+            if (d < best_d) { best_d = d; best_idx = j; }
+        }
+    }
+    return best_idx;
 }
 
 RoadGraph::RoadGraph(double ds) : ds_(ds) {
-    struct RouteSeq {
-        std::string name;
-        std::vector<int> nodes;
-    };
+    // Reference 2025 approach: single loop path through [24, 20, 9, 10]
+    // This traverses Hub → (via node 20) → node 9 → node 10 → (back to hub area)
+    // The D* pathfinder in the reference finds shortest weighted paths between
+    // consecutive nodes in this sequence, penalizing traffic lights/crosswalks.
+    // We use A* (equivalent for static graphs) with the same node sequence.
+    std::vector<int> loop_sequence = {24, 20, 9, 10};
 
-    std::vector<RouteSeq> route_defs = {
-        {"hub_to_pickup",      {24, 1, 13, 19, 17, 20}},
-        {"pickup_to_dropoff",  {21, 16, 18, 11, 12, 8}},
-        {"dropoff_to_hub",     {8, 10, 24}},
-    };
+    auto loop_path = roadmap_.generate_path(loop_sequence);
+    if (loop_path) {
+        loop_x_ = std::move(loop_path->first);
+        loop_y_ = std::move(loop_path->second);
 
-    for (auto& rd : route_defs) {
-        auto path = roadmap_.generate_path(rd.nodes);
-        if (path) {
-            auto& [px, py] = *path;
-            attach_endpoints(rd.name, px, py);
-            routes_[rd.name] = {std::move(px), std::move(py)};
+        // Resample to uniform spacing (reference uses scipy splprep at 0.001m)
+        resample_path(loop_x_, loop_y_, ds_);
+
+        // Apply scale factor [1.01, 1.0] (reference 2025 uses this for slight
+        // x-axis expansion to keep the car centered in lane)
+        for (auto& xv : loop_x_) {
+            xv *= 1.01;
+        }
+
+        // Find waypoint indices closest to key locations.
+        // The loop path passes near Pickup TWICE (once via node 20 outbound,
+        // once returning via inner track). Use find_first_local_min to get the
+        // FIRST pass for correct mission leg ordering: Hub -> Pickup -> Dropoff -> Hub.
+        pickup_idx_ = find_first_local_min(loop_x_, loop_y_, PICKUP_X, PICKUP_Y, 0.5, 0);
+        // Search for dropoff only AFTER pickup (it comes second in the loop)
+        dropoff_idx_ = find_first_local_min(loop_x_, loop_y_, DROPOFF_X, DROPOFF_Y, 0.5, pickup_idx_);
+        hub_idx_ = static_cast<int>(loop_x_.size()) - 1;  // end of loop
+    }
+
+    // Also generate individual route segments for the mission manager
+    // (sliced from the loop path at the pickup/dropoff waypoint indices)
+    if (!loop_x_.empty() && pickup_idx_ >= 0 && dropoff_idx_ >= 0) {
+        // hub_to_pickup: from start (hub) to pickup index
+        {
+            int end = std::min(pickup_idx_ + 1, static_cast<int>(loop_x_.size()));
+            routes_["hub_to_pickup"] = {
+                std::vector<double>(loop_x_.begin(), loop_x_.begin() + end),
+                std::vector<double>(loop_y_.begin(), loop_y_.begin() + end)
+            };
+        }
+
+        // pickup_to_dropoff: from pickup index to dropoff index
+        {
+            int start = pickup_idx_;
+            int end = std::min(dropoff_idx_ + 1, static_cast<int>(loop_x_.size()));
+            if (start < end) {
+                routes_["pickup_to_dropoff"] = {
+                    std::vector<double>(loop_x_.begin() + start, loop_x_.begin() + end),
+                    std::vector<double>(loop_y_.begin() + start, loop_y_.begin() + end)
+                };
+            }
+        }
+
+        // dropoff_to_hub: from dropoff index to end (hub)
+        {
+            int start = dropoff_idx_;
+            routes_["dropoff_to_hub"] = {
+                std::vector<double>(loop_x_.begin() + start, loop_x_.end()),
+                std::vector<double>(loop_y_.begin() + start, loop_y_.end())
+            };
         }
     }
 }
@@ -568,10 +746,110 @@ RoadGraph::plan_path_for_mission_leg(const std::string& route_name,
     std::vector<double> ry(route.y.begin() + segment_start,
                            route.y.begin() + segment_start + segment_len);
 
-    // Prepend current position if not already close
-    if (std::hypot(cur_x - rx.front(), cur_y - ry.front()) > 0.02) {
-        rx.insert(rx.begin(), cur_x);
-        ry.insert(ry.begin(), cur_y);
+    // Prepend current position if not already close, but only if it doesn't
+    // create a direction reversal (matching Python plan_path_for_mission_leg).
+    double dist_to_start = std::hypot(cur_x - rx.front(), cur_y - ry.front());
+    if (dist_to_start > 0.02 && rx.size() >= 2) {
+        double prepend_dx = rx[0] - cur_x;
+        double prepend_dy = ry[0] - cur_y;
+        double route_dx = rx[1] - rx[0];
+        double route_dy = ry[1] - ry[0];
+        double dot = prepend_dx * route_dx + prepend_dy * route_dy;
+        if (dot >= 0) {
+            rx.insert(rx.begin(), cur_x);
+            ry.insert(ry.begin(), cur_y);
+        }
+    }
+
+    return std::make_pair(std::move(rx), std::move(ry));
+}
+
+std::optional<std::pair<std::vector<double>, std::vector<double>>>
+RoadGraph::plan_path(double start_x, double start_y,
+                     double goal_x, double goal_y) const
+{
+    // Find the route whose start/end is closest to the requested start/goal
+    const Route* best_route = nullptr;
+    double best_score = 1e18;
+
+    for (auto& [name, route] : routes_) {
+        if (route.x.empty()) continue;
+        double start_dist = std::hypot(start_x - route.x.front(),
+                                       start_y - route.y.front());
+        double end_dist = std::hypot(goal_x - route.x.back(),
+                                     goal_y - route.y.back());
+        double score = start_dist + end_dist;
+        if (score < best_score) {
+            best_score = score;
+            best_route = &route;
+        }
+    }
+
+    if (!best_route) return std::nullopt;
+
+    int start_idx = find_closest_idx(best_route->x, best_route->y, start_x, start_y);
+    int goal_idx = find_closest_idx(best_route->x, best_route->y, goal_x, goal_y);
+
+    if (goal_idx <= start_idx) {
+        return std::make_pair(best_route->x, best_route->y);
+    }
+    return std::make_pair(
+        std::vector<double>(best_route->x.begin() + start_idx,
+                            best_route->x.begin() + goal_idx + 1),
+        std::vector<double>(best_route->y.begin() + start_idx,
+                            best_route->y.begin() + goal_idx + 1));
+}
+
+std::optional<std::pair<std::vector<double>, std::vector<double>>>
+RoadGraph::plan_path_from_pose(double cur_x, double cur_y,
+                               double goal_x, double goal_y) const
+{
+    // Find the route whose endpoint is closest to goal and has the vehicle nearby
+    const Route* best_route = nullptr;
+    double best_score = 1e18;
+
+    for (auto& [name, route] : routes_) {
+        if (route.x.empty()) continue;
+        double end_dist = std::hypot(goal_x - route.x.back(),
+                                     goal_y - route.y.back());
+        int closest = find_closest_idx(route.x, route.y, cur_x, cur_y);
+        double start_dist = std::hypot(cur_x - route.x[closest],
+                                       cur_y - route.y[closest]);
+        double score = start_dist + 2.0 * end_dist;  // weight goal proximity higher
+        if (score < best_score) {
+            best_score = score;
+            best_route = &route;
+        }
+    }
+
+    if (!best_route) return std::nullopt;
+
+    int start_idx = find_closest_idx(best_route->x, best_route->y, cur_x, cur_y);
+    int n = static_cast<int>(best_route->x.size());
+    int segment_len = n - start_idx;
+
+    if (segment_len < 5) {
+        start_idx = std::max(0, n - 20);
+        segment_len = n - start_idx;
+    }
+
+    std::vector<double> rx(best_route->x.begin() + start_idx,
+                           best_route->x.begin() + start_idx + segment_len);
+    std::vector<double> ry(best_route->y.begin() + start_idx,
+                           best_route->y.begin() + start_idx + segment_len);
+
+    // Prepend current position if not already close, with direction check
+    double dist_to_start = std::hypot(cur_x - rx.front(), cur_y - ry.front());
+    if (dist_to_start > 0.02 && rx.size() >= 2) {
+        double prepend_dx = rx[0] - cur_x;
+        double prepend_dy = ry[0] - cur_y;
+        double route_dx = rx[1] - rx[0];
+        double route_dy = ry[1] - ry[0];
+        double dot = prepend_dx * route_dx + prepend_dy * route_dy;
+        if (dot >= 0) {
+            rx.insert(rx.begin(), cur_x);
+            ry.insert(ry.begin(), cur_y);
+        }
     }
 
     return std::make_pair(std::move(rx), std::move(ry));

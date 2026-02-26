@@ -19,7 +19,8 @@
 #   ./run_mission.sh --2025      - Use PolyCtrl 2025 MPCC weights
 #   ./run_mission.sh --dashboard - Enable real-time telemetry dashboard
 #   ./run_mission.sh --overlay   - Enable path overlay map visualizer
-#   ./run_mission.sh --stop      - Stop all nodes
+#   ./run_mission.sh --stop      - Stop all nodes (sends zero motor commands first)
+#   ./run_mission.sh --stop --report - Stop + generate planned-vs-executed path report
 #   ./run_mission.sh --reset     - Reset scenario (sync code + rebuild + reset car)
 #   ./run_mission.sh --logs      - Show latest session logs
 #   ./run_mission.sh --logs <s>  - Show logs for specific session
@@ -44,6 +45,7 @@ USE_GPU_YOLO=auto   # "auto" = detect at launch, "true" = force on, "false" = fo
 USE_PRESET=""
 USE_DASHBOARD=false
 USE_OVERLAY=false
+GENERATE_REPORT=false
 SHOW_LOGS_SESSION=""  # specific session to view with --logs <session>
 PID_FILE="/tmp/acc_mission_pids.txt"
 WID_FILE="/tmp/acc_mission_wids.txt"
@@ -106,9 +108,7 @@ sync_to_workspace() {
         --exclude='.pytest_cache' \
         --exclude='*.pyc' \
         --exclude='run_mission.sh' \
-        --exclude='logs/*.log' \
-        --exclude='logs/*.csv' \
-        --exclude='logs/session_*' \
+        --exclude='logs/' \
         --exclude='mpcc_launch_args.txt' \
         "$QUANSER_ACC_DIR/" "$DOCKER_PKG_DIR/"
 
@@ -207,30 +207,63 @@ check_simulation() {
         quanser/virtual-qcar2:latest \
         bash -c "cd /home/qcar2_scripts/python && python3 Base_Scenarios_Python/$SCENARIO_SCRIPT"
 
-    # Wait for container to initialize and verify it's running
+    # Wait for container to initialize and verify it's running.
+    # The scenario script connects to QLabs, destroys old actors, and spawns
+    # floor + walls + car + signs + cameras + RT model. This takes 5-10s.
     print_info "Waiting for simulation scenario to initialize..."
-    sleep 3
+    sleep 5
     if ! docker ps --format '{{.Names}}' | grep -q "virtual-qcar2"; then
-        print_error "Simulation container exited - ensure QLabs is running with Plane world selected"
+        print_error "Simulation container exited — QLabs may not be running or accessible"
         print_info "Check logs with: docker logs virtual-qcar2"
+        print_info "Ensure QLabs is running with Plane world selected"
         exit 1
     fi
 
-    # Wait for virtual hardware ports to be available (QLabs needs time to spawn QCar2)
-    print_info "Waiting for virtual hardware ports (QCar2 HIL on port 18960)..."
+    # Verify the scenario script is still running (it enters an infinite traffic
+    # light loop after setup — if it exited, setup failed).
+    if ! docker exec virtual-qcar2 pgrep -f "$SCENARIO_SCRIPT" > /dev/null 2>&1; then
+        print_error "Scenario script exited during initialization"
+        print_info "The scenario connects to QLabs and spawns the competition environment."
+        print_info "If QLabs is not running or on the wrong world, the script exits immediately."
+        print_info "Check container logs: docker logs virtual-qcar2"
+        exit 1
+    fi
+
+    # Wait for ALL virtual hardware ports to be available.
+    # QLabs spawns sensors progressively — the lidar (port 18966) is critical
+    # for Cartographer SLAM. If it's not ready when the lidar node starts,
+    # the lidar node exits immediately and Cartographer never gets scan data.
+    # Ports: 18960=HIL, 18962=CSI, 18965=RGBD, 18966=Lidar, 18969=LED
+    local required_ports="18960 18965 18966"
+    print_info "Waiting for virtual hardware ports: HIL=18960, RGBD=18965, Lidar=18966..."
     local port_wait=0
-    local port_max=60
-    while ! ss -tln 2>/dev/null | grep -q ":18960 " && ! nc -z localhost 18960 2>/dev/null; do
+    local port_max=90
+    local all_ready=false
+    while [ "$all_ready" = false ]; do
         if [ $port_wait -ge $port_max ]; then
-            print_warning "Virtual hardware ports not detected after ${port_max}s - proceeding anyway"
+            print_warning "Not all virtual hardware ports detected after ${port_max}s — proceeding anyway"
             break
         fi
-        sleep 2
-        port_wait=$((port_wait + 2))
-        printf "\r${BLUE}[i]${NC} Waiting for simulation hardware... %ds" "$port_wait"
+        all_ready=true
+        for port in $required_ports; do
+            if ! ss -tln 2>/dev/null | grep -q ":${port} " && ! nc -z localhost "$port" 2>/dev/null; then
+                all_ready=false
+                break
+            fi
+        done
+        if [ "$all_ready" = false ]; then
+            sleep 2
+            port_wait=$((port_wait + 2))
+            printf "\r${BLUE}[i]${NC} Waiting for simulation hardware... %ds" "$port_wait"
+        fi
     done
     echo ""
-    print_status "Simulation container started - $SCENARIO_SCRIPT active"
+    # Extra settle time — even after ports open, QLabs may still be initializing sensors
+    if [ "$all_ready" = true ]; then
+        print_status "All virtual hardware ports ready"
+        sleep 3
+    fi
+    print_status "Simulation container started — $SCENARIO_SCRIPT active"
 }
 
 # Check if dev container is running
@@ -301,14 +334,16 @@ reset_car() {
             colcon build --packages-select acc_stage1_mission --symlink-install 2>&1 | tail -5
         ' && print_status "Python package rebuilt" || print_warning "Python build had warnings"
 
-        # Rebuild C++ nodes
+        # Rebuild C++ nodes (clean rebuild to ensure source changes take effect)
         docker exec "$CONTAINER_ID" bash -c '
             source /opt/ros/humble/setup.bash
             cd /workspaces/isaac_ros-dev/ros2
             ln -sfn /workspaces/isaac_ros-dev/ros2/src/acc_stage1_mission/cpp src/acc_mpcc_controller_cpp
+            rm -rf build/acc_mpcc_controller_cpp install/acc_mpcc_controller_cpp
+            find src/acc_mpcc_controller_cpp -name "*.cpp" -o -name "*.h" -o -name "*.hpp" | xargs touch 2>/dev/null
             colcon build --packages-select acc_mpcc_controller_cpp \
                 --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 2>&1 | tail -10
-        ' && print_status "C++ nodes rebuilt" || print_warning "C++ build had warnings"
+        ' && print_status "C++ nodes rebuilt (clean)" || print_warning "C++ build had warnings"
     fi
 
     # Ensure simulation container is running
@@ -345,6 +380,64 @@ reset_car() {
     fi
 }
 
+generate_report() {
+    print_info "Generating mission report..."
+
+    # CSV logs are written to the Docker-mounted workspace, so they appear on the host at:
+    #   $DOCKER_PKG_DIR/logs/mpcc_*.csv
+    # The quanser-acc/logs/ symlink or direct path also works after rsync.
+    local local_csv=""
+
+    # Primary: check the Docker workspace mount on the host (logs written directly here)
+    local_csv=$(ls -t "$DOCKER_PKG_DIR"/logs/mpcc_*.csv 2>/dev/null | head -1 || true)
+
+    # Fallback: check quanser-acc/logs/ (in case of local symlink or manual copy)
+    if [ -z "$local_csv" ]; then
+        local_csv=$(ls -t "$QUANSER_ACC_DIR"/logs/mpcc_*.csv 2>/dev/null | head -1 || true)
+    fi
+
+    # Last resort: try docker cp from /tmp/mission_logs (old log location)
+    if [ -z "$local_csv" ]; then
+        CONTAINER_ID=$(get_container_id)
+        if [ -n "$CONTAINER_ID" ]; then
+            local container_csv
+            container_csv=$(docker exec "$CONTAINER_ID" bash -c \
+                'ls -t /tmp/mission_logs/mpcc_*.csv 2>/dev/null | head -1' 2>/dev/null || true)
+            if [ -n "$container_csv" ]; then
+                mkdir -p "$QUANSER_ACC_DIR/logs"
+                local_csv="$QUANSER_ACC_DIR/logs/$(basename "$container_csv")"
+                docker cp "$CONTAINER_ID:$container_csv" "$local_csv" 2>/dev/null && {
+                    print_status "Copied CSV from container: $(basename "$container_csv")"
+                } || {
+                    print_error "Failed to copy CSV from container"
+                    local_csv=""
+                }
+            fi
+        fi
+    fi
+
+    if [ -z "$local_csv" ] || [ ! -f "$local_csv" ]; then
+        print_warning "No MPCC CSV log found — cannot generate report"
+        print_info "Run a mission first, then use --stop --report."
+        return 1
+    fi
+
+    print_info "Using CSV: $local_csv"
+
+    # Run the report generation script
+    if [ -f "$QUANSER_ACC_DIR/scripts/generate_report.py" ]; then
+        python3 "$QUANSER_ACC_DIR/scripts/generate_report.py" "$local_csv" && {
+            print_status "Report generated successfully"
+        } || {
+            print_error "Report generation failed"
+            return 1
+        }
+    else
+        print_error "Report script not found: scripts/generate_report.py"
+        return 1
+    fi
+}
+
 stop_all() {
     print_header
     print_info "Stopping all mission components..."
@@ -361,7 +454,8 @@ stop_all() {
 
     CONTAINER_ID=$(get_container_id)
 
-    # Step 1: Kill ROS2 processes inside the container
+    # Step 0: Kill ROS2 processes FIRST so qcar2_hardware releases the HIL port.
+    # We need the HIL port free to send zero motor commands directly.
     if [ -n "$CONTAINER_ID" ]; then
         print_info "Stopping ROS2 nodes in container..."
 
@@ -383,9 +477,51 @@ stop_all() {
         ' 2>/dev/null || true
 
         print_status "ROS2 nodes stopped"
+
+        # Brief pause for qcar2_hardware to release the HIL port
+        sleep 0.5
     else
         print_warning "Dev container not running"
     fi
+
+    # Step 0b: Zero motors via HIL + teleport to hub via QLabs API.
+    # qcar2_hardware is now dead so we can open the HIL port directly.
+    # HIL channels: 1000=steering_angle, 11000=motor_throttle (same as qcar2_hardware.cpp)
+    print_info "Zeroing motors via HIL and resetting car..."
+    timeout 5 docker exec virtual-qcar2 python3 -c "
+import numpy as np
+from quanser.hardware import HIL
+from qvl.qlabs import QuanserInteractiveLabs
+from qvl.qcar2 import QLabsQCar2
+
+# 1. Zero motors through HIL (clears retained steering/throttle)
+try:
+    card = HIL()
+    card.open('qcar2', '0@tcpip://localhost:18960')
+    ch = np.array([1000, 11000], dtype=np.uint32)
+    card.write_other(ch, 2, np.array([0.0, 0.0], dtype=np.float64))
+    card.close()
+    print('HIL motors zeroed')
+except Exception as e:
+    print(f'HIL zero skipped: {e}')
+
+# 2. Teleport to hub with dynamics OFF (stops any remaining motion)
+try:
+    qlabs = QuanserInteractiveLabs()
+    qlabs.open('localhost')
+    car = QLabsQCar2(qlabs)
+    car.actorNumber = 0
+    car.set_transform_and_request_state_degrees(
+        location=[-1.205, -0.83, 0.005], rotation=[0, 0, -44.7],
+        enableDynamics=False, headlights=False,
+        leftTurnSignal=False, rightTurnSignal=False,
+        brakeSignal=False, reverseSignal=False,
+        waitForConfirmation=True)
+    qlabs.close()
+    print('Car frozen at hub')
+except Exception as e:
+    print(f'QLabs reset skipped: {e}')
+" 2>&1 || true
 
     print_info "Closing terminal windows..."
 
@@ -424,12 +560,10 @@ stop_all() {
     pkill -9 -f "Waiting.*seconds.*Nav2" 2>/dev/null || true
 
     # Step 5: Use xdotool to close windows by our exact terminal names (backup)
-    # IMPORTANT: Only use exact hyphenated names we assigned in launch_terminal().
-    # Do NOT use partial matches (e.g. "QCar2", "SLAM") — they could close
-    # Quanser Interactive Labs or other unrelated windows.
+    # IMPORTANT: Only use exact names we assigned in launch_terminal().
     # Uses regex anchors (^...$) for exact matching to avoid substring collisions.
     if command -v xdotool &> /dev/null; then
-        for title in "QCar2-Hardware" "SLAM-Nav2" "YOLO-Bridge" "GPU-YOLO" "Obstacle-Detector" "MPCC-Mission" "Mission-Manager" "Path-Overlay"; do
+        for title in "QCar2-Hardware" "SLAM-Nav2" "SLAM" "YOLO-Bridge" "GPU-YOLO" "Obstacle-Detector" "MPCC-Mission" "Mission-Manager" "Path-Overlay"; do
             for wid in $(xdotool search --name "^${title}$" 2>/dev/null); do
                 # Skip the current terminal window
                 [ "$wid" = "$CURRENT_WID" ] && continue
@@ -441,7 +575,7 @@ stop_all() {
     # Step 6: Use wmctrl as backup (close by exact window titles only)
     # wmctrl -c does substring matching, so we verify with wmctrl -l first
     if command -v wmctrl &> /dev/null; then
-        for title in "QCar2-Hardware" "SLAM-Nav2" "YOLO-Bridge" "GPU-YOLO" "Obstacle-Detector" "MPCC-Mission" "Mission-Manager" "Path-Overlay"; do
+        for title in "QCar2-Hardware" "SLAM-Nav2" "SLAM" "YOLO-Bridge" "GPU-YOLO" "Obstacle-Detector" "MPCC-Mission" "Mission-Manager" "Path-Overlay"; do
             # Only close if the window title is an exact match
             # wmctrl -l format: "0x04800003  0 hostname Window Title"
             wmctrl -l | awk -v t="$title" '{
@@ -588,18 +722,80 @@ launch_mission() {
     # Check prerequisites
     check_simulation
 
-    # Reset the scenario so we start from a clean state (car at start, signs/lights reset)
-    print_info "Resetting scenario for fresh run..."
-    docker exec virtual-qcar2 pkill -f "python3.*Setup_" 2>/dev/null || true
-    sleep 1
-    docker exec -d virtual-qcar2 bash -c \
-        "cd /home/qcar2_scripts/python && python3 Base_Scenarios_Python/$SCENARIO_SCRIPT"
-    print_info "Waiting for scenario to initialize..."
-    sleep 5
+    # Verify the simulation container is still running (it may have exited between
+    # check_simulation() and here if the scenario script crashed on startup).
+    if ! docker ps --format '{{.Names}}' | grep -q "virtual-qcar2"; then
+        print_error "Simulation container exited after check_simulation() — QLabs may not be running"
+        print_info "Ensure QLabs is running with Plane world selected, then retry"
+        exit 1
+    fi
+
+    # Check if scenario process is running, and if so, verify the QLabs actors
+    # are still alive AND virtual hardware ports are open. If QLabs was restarted
+    # since the scenario was launched, the process is still running its traffic-light
+    # loop but all actors (car, signs, floor, etc.) were destroyed by the QLabs restart.
+    # The car position reset serves as a health check for actor liveness.
+    # The port check catches cases where actors exist but hardware is stale.
+    local scenario_needs_restart=false
     if docker exec virtual-qcar2 pgrep -f "$SCENARIO_SCRIPT" > /dev/null 2>&1; then
-        print_status "Scenario initialized: $SCENARIO_SCRIPT"
+        print_info "Scenario process is running — verifying QLabs actors are alive..."
+        if docker exec virtual-qcar2 python3 /home/qcar2_scripts/python/reset_car_position.py 2>&1; then
+            # Actor exists — now verify virtual hardware ports are actually open
+            # Ports: 18960=HIL, 18965=RGBD, 18966=Lidar
+            local ports_ok=true
+            for port in 18960 18965 18966; do
+                if ! nc -z localhost "$port" 2>/dev/null; then
+                    ports_ok=false
+                    print_warning "Port $port not open — virtual hardware is stale"
+                    break
+                fi
+            done
+            if [ "$ports_ok" = true ]; then
+                print_status "Scenario healthy: actors verified, hardware ports open"
+            else
+                print_warning "Scenario actors exist but hardware ports are stale"
+                print_info "Restarting scenario to re-initialize virtual hardware..."
+                scenario_needs_restart=true
+            fi
+        else
+            print_warning "Scenario process is running but QCar2 actor is missing"
+            print_info "QLabs was likely restarted — all actors need to be re-spawned"
+            scenario_needs_restart=true
+        fi
     else
-        print_warning "Scenario script may have exited - check QLabs"
+        print_info "Scenario is not running"
+        scenario_needs_restart=true
+    fi
+
+    if [ "$scenario_needs_restart" = true ]; then
+        # The scenario script is PID 1's child inside the container (started by
+        # docker run). Killing it causes the container to exit and be removed
+        # (--rm flag). We must stop the whole container and start a fresh one.
+        print_info "Stopping stale simulation container..."
+        docker stop virtual-qcar2 2>/dev/null || true
+        docker rm -f virtual-qcar2 2>/dev/null || true
+        sleep 2
+
+        # Start a fresh container with the scenario (calls check_simulation
+        # which handles container creation, scenario startup verification,
+        # and port readiness checks).
+        print_info "Starting fresh simulation with scenario..."
+        check_simulation
+
+        # Verify scenario is running after fresh start
+        if ! docker exec virtual-qcar2 pgrep -f "$SCENARIO_SCRIPT" > /dev/null 2>&1; then
+            print_error "Scenario failed to start after container restart"
+            print_info "Check: docker logs virtual-qcar2"
+            exit 1
+        fi
+
+        # Reset car to hub after fresh scenario start
+        print_info "Resetting car to taxi hub position..."
+        if docker exec virtual-qcar2 python3 /home/qcar2_scripts/python/reset_car_position.py 2>&1; then
+            print_status "Car reset to hub [-1.205, -0.83]"
+        else
+            print_info "Car position reset skipped (car spawns at hub from scenario script)"
+        fi
     fi
 
     check_dev_container
@@ -639,16 +835,32 @@ launch_mission() {
     # The C++ stack is the primary codebase — no Python fallbacks.
     # Colcon won't discover acc_mpcc_controller_cpp inside acc_stage1_mission/cpp/
     # (nested packages are not supported), so create a sibling symlink.
-    print_info "Building C++ nodes (acc_mpcc_controller_cpp)..."
+    #
+    # IMPORTANT: We force a clean C++ rebuild every time to ensure source changes
+    # take effect. Without this, colcon's build cache can skip recompilation if
+    # file timestamps don't appear newer (rsync -a preserves mtime). This was
+    # the root cause of "source fixes not reaching the running binary" bugs.
+    print_info "Building C++ nodes (acc_mpcc_controller_cpp) — CLEAN rebuild..."
     docker exec "$CONTAINER_ID" bash -c '
         source /opt/ros/humble/setup.bash
         cd /workspaces/isaac_ros-dev/ros2
+
+        # Create symlink so colcon discovers the C++ package
         ln -sfn /workspaces/isaac_ros-dev/ros2/src/acc_stage1_mission/cpp src/acc_mpcc_controller_cpp
+
+        # Force clean rebuild: remove stale build/install artifacts.
+        # This ensures ALL source changes are compiled into the binary.
+        rm -rf build/acc_mpcc_controller_cpp install/acc_mpcc_controller_cpp
+
+        # Touch all C++ source files to ensure timestamps are newer than any
+        # cached objects (rsync -a preserves mtime which can fool cmake)
+        find src/acc_mpcc_controller_cpp -name "*.cpp" -o -name "*.h" -o -name "*.hpp" | xargs touch 2>/dev/null
+
         colcon build --packages-select acc_mpcc_controller_cpp \
             --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 2>&1
     '
     if [ $? -eq 0 ]; then
-        print_status "C++ nodes built successfully"
+        print_status "C++ nodes built successfully (clean rebuild)"
     else
         print_error "C++ node build FAILED — cannot proceed without C++ stack"
         print_info "Check build output above for errors"
@@ -712,51 +924,94 @@ launch_mission() {
     rm -f "$PID_FILE" "$WID_FILE"
     touch "$PID_FILE" "$WID_FILE"
 
-    # Terminal 1: QCar2 Hardware Nodes (with retry if sim not ready)
-    print_info "Launching QCar2 hardware nodes..."
-    launch_terminal "QCar2-Hardware" "100x20+0+0" "
-        docker exec -it $CONTAINER_ID bash -c '
-            source /opt/ros/humble/setup.bash
-            source /workspace/cartographer_ws/install/setup.bash
-            source /workspaces/isaac_ros-dev/ros2/install/setup.bash
-            echo Starting QCar2 hardware nodes...
-            for attempt in 1 2 3; do
-                echo [Attempt \$attempt/3] Launching hardware nodes...
-                ros2 launch qcar2_nodes qcar2_virtual_launch.py &
-                HW_PID=\$!
-                sleep 5
-                if kill -0 \$HW_PID 2>/dev/null; then
-                    echo Hardware nodes running
-                    wait \$HW_PID
-                    break
-                else
-                    echo Hardware nodes exited early - simulation may still be starting
-                    if [ \$attempt -lt 3 ]; then
-                        echo Waiting 10s before retry...
-                        sleep 10
-                    fi
-                fi
-            done
-        '
-    "
-    sleep 5
+    # Terminal 1: Cartographer SLAM + Hardware Nodes
+    # Launch qcar2_cartographer_virtual_launch.py directly (NOT the full
+    # qcar2_slam_and_nav_bringup_virtual_launch.py). The bringup launch adds
+    # AMCL (conflicts with Cartographer), static_odom_tf (conflicts with
+    # Cartographer's provide_odom_frame=true), and Nav2 stack (unused — we have
+    # our own MPCC path planner). The reference team (PolyCtrl 2025) also
+    # launches qcar2_cartographer_virtual_launch.py directly.
+    #
+    # qcar2_cartographer_virtual_launch.py includes:
+    #   - qcar2_virtual_launch.py (lidar, cameras, qcar2_hardware)
+    #   - fixed_lidar_frame_virtual (base_link → base_scan TF)
+    #   - cartographer_node (SLAM: map → odom → base_link TF)
+    #   - cartographer_occupancy_grid_node (map publisher)
+    # Fix Cartographer tracking_frame to match reference (PolyCtrl 2025).
+    # The 2026 Quanser config changed tracking_frame to "base_scan" but the reference
+    # uses "base_link". With base_scan, Cartographer initializes vehicle heading at 0
+    # instead of ~41 deg, causing a 35 deg mismatch with the planned path.
+    docker exec "$CONTAINER_ID" bash -c '
+        CARTO_CFG="/workspaces/isaac_ros-dev/ros2/install/qcar2_nodes/share/qcar2_nodes/config/qcar2_2d.lua"
+        if [ -f "$CARTO_CFG" ]; then
+            sed -i "s/tracking_frame = \"base_scan\"/tracking_frame = \"base_link\"/" "$CARTO_CFG"
+            echo "Cartographer config: tracking_frame = base_link (reference-matched)"
+        else
+            echo "WARNING: Cartographer config not found at $CARTO_CFG"
+        fi
+    '
 
-    # Terminal 2: SLAM and Navigation
-    # Wait for hardware nodes to establish sensor connections and start publishing
-    print_info "Waiting for hardware sensor data to start flowing (10s)..."
-    sleep 10
-    print_info "Launching SLAM and Navigation (wait ~25s for full init)..."
-    launch_terminal "SLAM-Nav2" "100x20+0+400" "
-        docker exec -it $CONTAINER_ID bash -c '
-            source /opt/ros/humble/setup.bash
-            source /workspace/cartographer_ws/install/setup.bash
-            source /workspaces/isaac_ros-dev/ros2/install/setup.bash
-            echo Starting SLAM and Navigation...
-            echo Please wait ~25 seconds for Nav2 to fully initialize...
-            ros2 launch qcar2_nodes qcar2_slam_and_nav_bringup_virtual_launch.py
-        '
+    # Write SLAM launch helper script to Docker workspace (avoids nested quoting issues)
+    docker exec "$CONTAINER_ID" bash -c 'cat > /tmp/slam_launch.sh << '\''SCRIPT'\''
+#!/bin/bash
+source /opt/ros/humble/setup.bash
+source /workspace/cartographer_ws/install/setup.bash
+source /workspaces/isaac_ros-dev/ros2/install/setup.bash
+
+echo "=== Cartographer SLAM + Hardware ==="
+echo "Checking QLabs virtual hardware ports from inside container..."
+for p in 18960 18962 18965 18966 18969; do
+    if timeout 1 bash -c "echo > /dev/tcp/localhost/$p" 2>/dev/null; then
+        echo "  Port $p: OPEN"
+    else
+        echo "  Port $p: CLOSED"
+    fi
+done
+
+echo ""
+echo "Waiting for critical ports: 18960=HIL, 18965=RGBD, 18966=Lidar..."
+WAIT=0
+MAX_WAIT=90
+while true; do
+    ALL_OK=true
+    for p in 18960 18965 18966; do
+        if ! timeout 1 bash -c "echo > /dev/tcp/localhost/$p" 2>/dev/null; then
+            ALL_OK=false
+            break
+        fi
+    done
+    if [ "$ALL_OK" = true ]; then
+        echo "All critical ports ready!"
+        break
+    fi
+    WAIT=$((WAIT + 2))
+    if [ $WAIT -ge $MAX_WAIT ]; then
+        echo "WARNING: Not all ports ready after ${MAX_WAIT}s - launching anyway"
+        echo "Final port status:"
+        for p in 18960 18962 18965 18966 18969; do
+            if timeout 1 bash -c "echo > /dev/tcp/localhost/$p" 2>/dev/null; then
+                echo "  Port $p: OPEN"
+            else
+                echo "  Port $p: CLOSED"
+            fi
+        done
+        break
+    fi
+    sleep 2
+    printf "\r  Waiting for hardware ports... %ds" $WAIT
+done
+echo ""
+
+echo "Launching Cartographer SLAM + hardware nodes..."
+ros2 launch qcar2_nodes qcar2_cartographer_virtual_launch.py
+SCRIPT
+chmod +x /tmp/slam_launch.sh'
+
+    print_info "Launching Cartographer SLAM + Hardware (wait ~30s for init)..."
+    launch_terminal "SLAM" "100x20+0+400" "
+        docker exec -it $CONTAINER_ID bash /tmp/slam_launch.sh
     "
-    sleep 5
+    sleep 10
 
     # Terminal 3: Detection
     # C++ sign_detector always runs inside the MPCC launch file.
@@ -1025,56 +1280,38 @@ show_logs() {
     fi
 }
 
-# Parse arguments (supports combining flags)
+# Parse arguments — collect all flags first, then execute actions.
+# This allows flags like --report to work regardless of order (e.g. --stop --report or --report --stop).
+DO_STOP=false
+DO_RESET=false
+DO_LOGS=false
+DO_HELP=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --stop|-s)
-            stop_all
-            exit 0
+            DO_STOP=true
+            shift
+            ;;
+        --report)
+            GENERATE_REPORT=true
+            shift
             ;;
         --reset|-r)
-            reset_car
-            exit 0
+            DO_RESET=true
+            shift
             ;;
         --logs|-l)
+            DO_LOGS=true
             # Check if next arg is a session name (not another flag)
             if [ $# -gt 1 ] && [[ "$2" != --* ]]; then
                 SHOW_LOGS_SESSION="$2"
                 shift
             fi
-            show_logs
-            exit 0
+            shift
             ;;
         --help|-h)
-            print_header
-            echo "Usage: $0 [OPTIONS]"
-            echo ""
-            echo "  ./run_mission.sh             Launch full stack (auto-detects GPU)"
-            echo "  ./run_mission.sh --no-gpu    Launch without GPU YOLO (C++ HSV only)"
-            echo "  ./run_mission.sh --2025      Use PolyCtrl 2025 MPCC weights"
-            echo "  ./run_mission.sh --dashboard Enable real-time telemetry dashboard"
-            echo "  ./run_mission.sh --overlay   Enable path overlay map visualizer"
-            echo ""
-            echo "  ./run_mission.sh --stop      Stop all mission terminals"
-            echo "  ./run_mission.sh --reset     Reset scenario (sync + rebuild + reset car)"
-            echo "  ./run_mission.sh --logs      Show latest session logs"
-            echo "  ./run_mission.sh --logs <s>  Show logs for specific session"
-            echo ""
-            echo "C++ Stack (always launched):"
-            echo "  mpcc_controller_node    C++ SQP MPCC controller"
-            echo "  mission_manager_node    C++ mission state machine + road graph A*"
-            echo "  sign_detector_node      C++ HSV sign/light/cone detection"
-            echo "  odom_from_tf_node       C++ TF -> /odom bridge"
-            echo "  state_estimator_node    C++ EKF state estimator"
-            echo "  obstacle_tracker_node   C++ Kalman + lidar tracker"
-            echo "  traffic_light_map_node  C++ spatial traffic light mapping"
-            echo ""
-            echo "GPU YOLO (auto-detected, alongside C++ HSV):"
-            echo "  Requires: nvidia-smi + Python 3.10 + torch CUDA + YOLO model"
-            echo "  Disable with --no-gpu if GPU detection causes issues"
-            echo ""
-            echo "Flags can be combined: ./run_mission.sh --2025 --dashboard"
-            exit 0
+            DO_HELP=true
+            shift
             ;;
         --no-gpu)
             USE_GPU_YOLO=false
@@ -1100,5 +1337,114 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# If we didn't exit from --stop/--reset/--logs/--help, launch the mission
+# Execute action flags (mutually exclusive: stop > reset > logs > help > launch)
+if [ "$DO_HELP" = true ]; then
+    print_header
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "  ./run_mission.sh             Launch full stack (auto-detects GPU)"
+    echo "  ./run_mission.sh --no-gpu    Launch without GPU YOLO (C++ HSV only)"
+    echo "  ./run_mission.sh --2025      Use PolyCtrl 2025 MPCC weights"
+    echo "  ./run_mission.sh --dashboard Enable real-time telemetry dashboard"
+    echo "  ./run_mission.sh --overlay   Enable path overlay map visualizer"
+    echo ""
+    echo "  ./run_mission.sh --stop      Stop + reset car to hub"
+    echo "  ./run_mission.sh --stop --report  Stop + reset + generate path report PNG"
+    echo "  ./run_mission.sh --reset     Reset scenario (sync + rebuild + reset car)"
+    echo "  ./run_mission.sh --logs      Show latest session logs"
+    echo "  ./run_mission.sh --logs <s>  Show logs for specific session"
+    echo ""
+    echo "C++ Stack (always launched):"
+    echo "  mpcc_controller_node    C++ SQP MPCC controller"
+    echo "  mission_manager_node    C++ mission state machine + road graph A*"
+    echo "  sign_detector_node      C++ HSV sign/light/cone detection"
+    echo "  odom_from_tf_node       C++ TF -> /odom bridge"
+    echo "  state_estimator_node    C++ EKF state estimator"
+    echo "  obstacle_tracker_node   C++ Kalman + lidar tracker"
+    echo "  traffic_light_map_node  C++ spatial traffic light mapping"
+    echo ""
+    echo "GPU YOLO (auto-detected, alongside C++ HSV):"
+    echo "  Requires: nvidia-smi + Python 3.10 + torch CUDA + YOLO model"
+    echo "  Disable with --no-gpu if GPU detection causes issues"
+    echo ""
+    echo "Flags can be combined: ./run_mission.sh --2025 --dashboard"
+    exit 0
+fi
+
+if [ "$DO_STOP" = true ]; then
+    stop_all
+    # Reset car to taxi hub spawn after stopping.
+    # Use inline Python to (1) zero velocity/steering, (2) teleport to hub.
+    # enableDynamics=False freezes the car so it doesn't coast after teleport.
+    # Then re-enable dynamics so the next run can drive.
+    print_info "Resetting car to taxi hub position..."
+    if timeout 10 docker exec virtual-qcar2 python3 -c "
+import sys, time
+import numpy as np
+from quanser.hardware import HIL
+from qvl.qlabs import QuanserInteractiveLabs
+from qvl.qcar2 import QLabsQCar2
+
+# Zero HIL motors (steering=ch1000, throttle=ch11000)
+try:
+    card = HIL()
+    card.open('qcar2', '0@tcpip://localhost:18960')
+    ch = np.array([1000, 11000], dtype=np.uint32)
+    card.write_other(ch, 2, np.array([0.0, 0.0], dtype=np.float64))
+    card.close()
+except: pass
+
+# Teleport to hub, dynamics OFF, then ON
+qlabs = QuanserInteractiveLabs()
+try:
+    qlabs.open('localhost')
+except:
+    sys.exit(1)
+car = QLabsQCar2(qlabs)
+car.actorNumber = 0
+car.set_transform_and_request_state_degrees(
+    location=[-1.205, -0.83, 0.005], rotation=[0, 0, -44.7],
+    enableDynamics=False, headlights=False, leftTurnSignal=False,
+    rightTurnSignal=False, brakeSignal=False, reverseSignal=False,
+    waitForConfirmation=True)
+time.sleep(0.3)
+
+# Zero HIL again before re-enabling dynamics
+try:
+    card = HIL()
+    card.open('qcar2', '0@tcpip://localhost:18960')
+    ch = np.array([1000, 11000], dtype=np.uint32)
+    card.write_other(ch, 2, np.array([0.0, 0.0], dtype=np.float64))
+    card.close()
+except: pass
+
+car.set_transform_and_request_state_degrees(
+    location=[-1.205, -0.83, 0.005], rotation=[0, 0, -44.7],
+    enableDynamics=True, headlights=False, leftTurnSignal=False,
+    rightTurnSignal=False, brakeSignal=False, reverseSignal=False,
+    waitForConfirmation=True)
+qlabs.close()
+print('Car reset to hub, HIL motors zeroed')
+" 2>&1; then
+        print_status "Car reset to hub [-1.205, -0.83]"
+    else
+        print_warning "Car position reset failed or timed out (QLabs may not be running)"
+    fi
+    if [ "$GENERATE_REPORT" = true ]; then
+        generate_report
+    fi
+    exit 0
+fi
+
+if [ "$DO_RESET" = true ]; then
+    reset_car
+    exit 0
+fi
+
+if [ "$DO_LOGS" = true ]; then
+    show_logs
+    exit 0
+fi
+
+# If no action flag was set, launch the mission
 launch_mission

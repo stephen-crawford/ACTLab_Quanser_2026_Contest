@@ -9,7 +9,6 @@
 
 #pragma once
 
-#include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -31,8 +30,14 @@ public:
             throw std::runtime_error("CubicSplinePath: need at least 2 waypoints");
         }
 
+        // Smooth waypoints to limit curvature to vehicle capability.
+        // Sharp corners (e.g. SCS path segment junctions with curvature >> 2.0)
+        // are physically impossible to track and cause sustained CTE spikes.
+        // This pass averages points near high-curvature regions to round corners,
+        // while preserving smooth sections exactly.
         wp_x_ = wx;
         wp_y_ = wy;
+        smooth_sharp_corners(wp_x_, wp_y_);
 
         // Compute cumulative arc length
         s_values_.resize(n_points_);
@@ -111,10 +116,11 @@ public:
         double denom = std::pow(dx_ds * dx_ds + dy_ds * dy_ds, 1.5);
         if (std::abs(denom) < 1e-10) return 0.0;
         double kappa = (dx_ds * d2y_ds - dy_ds * d2x_ds) / denom;
-        // Clamp curvature to prevent spikes at sharp corners between straight
-        // segments (e.g. 58-degree corner at node 1 in hub_to_pickup route).
-        // Max curvature ~5.0 corresponds to a minimum turn radius of 0.2m,
-        // well within QCar2 capability but prevents solver over-reaction.
+        // Clamp curvature to vehicle's physical capability.
+        // Max steering δ_max = π/6 (30°), wheelbase L = 0.256m.
+        // Max achievable curvature: κ_max = tan(δ_max)/L = tan(30°)/0.256 ≈ 2.26.
+        // Higher curvature causes physically impossible reference points that
+        // the solver can never track, leading to sustained CTE spikes.
         return std::clamp(kappa, -max_curvature_, max_curvature_);
     }
 
@@ -184,6 +190,63 @@ public:
         sin_t = std::sin(theta);
     }
 
+    /// Find closest point on path to (x,y), searching forward from s_min.
+    /// Returns arc-length of closest point. Searches within a window of ~1m.
+    /// Used by solver for fast adaptive path re-projection during SQP.
+    double find_closest_progress_from(double x, double y, double s_min) const {
+        // Find starting waypoint index at s_min
+        int start_idx = 0;
+        for (int i = 0; i < n_points_ - 1; i++) {
+            if (s_values_[i + 1] >= s_min) { start_idx = i; break; }
+        }
+        // Allow small backward search (5 points) for accuracy
+        start_idx = std::max(0, start_idx - 5);
+
+        // Search forward up to ~1.5m from s_min (covers full horizon)
+        double s_end = s_min + 1.5;
+        int end_idx = n_points_ - 1;
+        for (int i = start_idx; i < n_points_; i++) {
+            if (s_values_[i] > s_end) { end_idx = i; break; }
+        }
+
+        double best_dist_sq = 1e18;
+        int closest_idx = start_idx;
+        for (int i = start_idx; i <= end_idx; ++i) {
+            double dx = wp_x_[i] - x;
+            double dy = wp_y_[i] - y;
+            double d2 = dx * dx + dy * dy;
+            if (d2 < best_dist_sq) {
+                best_dist_sq = d2;
+                closest_idx = i;
+            }
+        }
+        double best_s = s_values_[closest_idx];
+        double best_dist = std::sqrt(best_dist_sq);
+
+        // Fine: project onto adjacent segments
+        int lo = std::max(start_idx, closest_idx - 1);
+        int hi = std::min(end_idx, closest_idx + 2);
+        for (int i = lo; i < hi; ++i) {
+            if (i >= n_points_ - 1) continue;
+            double vx = wp_x_[i + 1] - wp_x_[i];
+            double vy = wp_y_[i + 1] - wp_y_[i];
+            double seg_sq = vx * vx + vy * vy;
+            if (seg_sq < 1e-10) continue;
+            double ux = x - wp_x_[i];
+            double uy = y - wp_y_[i];
+            double t = std::clamp((ux * vx + uy * vy) / seg_sq, 0.0, 1.0);
+            double px = wp_x_[i] + t * vx;
+            double py = wp_y_[i] + t * vy;
+            double d = std::hypot(x - px, y - py);
+            if (d < best_dist) {
+                best_dist = d;
+                best_s = s_values_[i] + t * std::sqrt(seg_sq);
+            }
+        }
+        // Enforce monotonicity: result must be >= s_min
+        return std::max(best_s, s_min);
+    }
+
     /// Waypoint accessors
     double waypoint_x(int i) const { return wp_x_[i]; }
     double waypoint_y(int i) const { return wp_y_[i]; }
@@ -192,7 +255,10 @@ public:
 private:
     struct Coeffs { double a, b, c, d; };
 
-    /// Natural cubic spline tridiagonal solver.
+    /// Natural cubic spline using Thomas algorithm (tridiagonal solver, O(n)).
+    /// The system is tridiagonal: only diagonals -1, 0, +1 are non-zero.
+    /// Using a dense matrix + QR decomposition would be O(n^3) and allocate
+    /// n^2 doubles — catastrophic for large paths (e.g. 9769 points = 760 MB).
     static void compute_spline_coeffs(const std::vector<double>& t,
                                       const std::vector<double>& y,
                                       std::vector<Coeffs>& out)
@@ -200,35 +266,57 @@ private:
         int n = static_cast<int>(t.size()) - 1;
 
         // h[i] = t[i+1] - t[i]
-        Eigen::VectorXd h(n);
+        std::vector<double> h(n);
         for (int i = 0; i < n; ++i)
-            h(i) = t[i + 1] - t[i];
+            h[i] = t[i + 1] - t[i];
 
-        // Set up tridiagonal system for second derivatives (c)
-        Eigen::MatrixXd A = Eigen::MatrixXd::Zero(n + 1, n + 1);
-        Eigen::VectorXd rhs = Eigen::VectorXd::Zero(n + 1);
+        // Tridiagonal system for natural cubic spline second derivatives (c).
+        // Boundary conditions: c[0] = 0, c[n] = 0 (natural spline).
+        // Interior rows: h[i-1]*c[i-1] + 2*(h[i-1]+h[i])*c[i] + h[i]*c[i+1] = rhs[i]
+        // Thomas algorithm: forward sweep then back substitution.
+        std::vector<double> diag(n + 1, 0.0);   // main diagonal
+        std::vector<double> upper(n + 1, 0.0);   // upper diagonal
+        std::vector<double> rhs(n + 1, 0.0);     // right-hand side
 
-        A(0, 0) = 1.0;
-        A(n, n) = 1.0;
+        // Boundary rows
+        diag[0] = 1.0;
+        diag[n] = 1.0;
 
+        // Interior rows
         for (int i = 1; i < n; ++i) {
-            A(i, i - 1) = h(i - 1);
-            A(i, i) = 2.0 * (h(i - 1) + h(i));
-            A(i, i + 1) = h(i);
-            rhs(i) = 3.0 * ((y[i + 1] - y[i]) / h(i) -
-                             (y[i] - y[i - 1]) / h(i - 1));
+            // lower[i] = h[i-1] (used inline during forward sweep)
+            diag[i] = 2.0 * (h[i - 1] + h[i]);
+            upper[i] = h[i];
+            rhs[i] = 3.0 * ((y[i + 1] - y[i]) / h[i] -
+                             (y[i] - y[i - 1]) / h[i - 1]);
         }
 
-        Eigen::VectorXd c_vec = A.colPivHouseholderQr().solve(rhs);
+        // Forward sweep (eliminate lower diagonal)
+        for (int i = 1; i <= n; ++i) {
+            double lower_i = (i <= n - 1) ? h[i - 1] : 0.0;
+            if (i == n) lower_i = 0.0;  // boundary row has no lower
+            double w = (std::abs(diag[i - 1]) > 1e-30) ? lower_i / diag[i - 1] : 0.0;
+            diag[i] -= w * upper[i - 1];
+            rhs[i] -= w * rhs[i - 1];
+        }
+
+        // Back substitution
+        std::vector<double> c_vec(n + 1, 0.0);
+        c_vec[n] = (std::abs(diag[n]) > 1e-30) ? rhs[n] / diag[n] : 0.0;
+        for (int i = n - 1; i >= 0; --i) {
+            c_vec[i] = (std::abs(diag[i]) > 1e-30)
+                ? (rhs[i] - upper[i] * c_vec[i + 1]) / diag[i]
+                : 0.0;
+        }
 
         out.resize(n);
         for (int i = 0; i < n; ++i) {
             Coeffs& cf = out[i];
             cf.a = y[i];
-            cf.b = (y[i + 1] - y[i]) / h(i) -
-                   h(i) * (2.0 * c_vec(i) + c_vec(i + 1)) / 3.0;
-            cf.c = c_vec(i);
-            cf.d = (c_vec(i + 1) - c_vec(i)) / (3.0 * h(i));
+            cf.b = (y[i + 1] - y[i]) / h[i] -
+                   h[i] * (2.0 * c_vec[i] + c_vec[i + 1]) / 3.0;
+            cf.c = c_vec[i];
+            cf.d = (c_vec[i + 1] - c_vec[i]) / (3.0 * h[i]);
         }
     }
 
@@ -260,11 +348,59 @@ private:
                           wp_x_[idx + 1] - wp_x_[idx]);
     }
 
+    /// Gaussian smoothing of path waypoints to spread out sharp curvature
+    /// transitions. The cubic spline amplifies curvature at points where the
+    /// path heading changes rapidly (e.g., SCS straight→arc junctions). Even
+    /// though discrete curvature of raw waypoints may be within limits, the
+    /// spline's C2 continuity creates overshoot at these transitions.
+    ///
+    /// Gaussian smoothing with σ=150 (~150mm at 1mm spacing) spreads curvature
+    /// transitions over ~300mm, giving the solver ~3 control steps to adapt
+    /// steering. On straight sections this has zero effect (averaging collinear
+    /// points returns the same line). On constant-curvature arcs, it slightly
+    /// reduces curvature (~σ²/(2R) ≈ 22mm displacement for R=0.5m).
+    static void smooth_sharp_corners(std::vector<double>& x, std::vector<double>& y) {
+        int n = static_cast<int>(x.size());
+        if (n < 100) return;
+
+        const int sigma = 150;  // Gaussian σ in waypoint indices (~150mm at 1mm spacing)
+        const int half = sigma * 3;  // 3σ coverage for kernel
+
+        // Build Gaussian kernel
+        std::vector<double> kernel(2 * half + 1);
+        double ksum = 0.0;
+        for (int i = -half; i <= half; i++) {
+            kernel[i + half] = std::exp(-0.5 * (double)(i * i) / (double)(sigma * sigma));
+            ksum += kernel[i + half];
+        }
+        for (auto& k : kernel) k /= ksum;
+
+        // Convolve — clamp at boundaries (extends edge values)
+        std::vector<double> nx(n), ny(n);
+        for (int i = 0; i < n; i++) {
+            double sx = 0.0, sy = 0.0;
+            for (int j = -half; j <= half; j++) {
+                int idx = std::clamp(i + j, 0, n - 1);
+                sx += x[idx] * kernel[j + half];
+                sy += y[idx] * kernel[j + half];
+            }
+            nx[i] = sx;
+            ny[i] = sy;
+        }
+
+        // Preserve exact start and end positions
+        nx[0] = x[0]; ny[0] = y[0];
+        nx[n - 1] = x[n - 1]; ny[n - 1] = y[n - 1];
+
+        x = nx;
+        y = ny;
+    }
+
     bool built_ = false;
     bool use_linear_ = true;
     int n_points_ = 0;
     double total_length_ = 0.0;
-    double max_curvature_ = 5.0;  // ~0.2m minimum turn radius
+    double max_curvature_ = 2.25;  // tan(30°)/0.256m ≈ vehicle's min turn radius
 
     std::vector<double> wp_x_, wp_y_;
     std::vector<double> s_values_;

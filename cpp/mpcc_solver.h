@@ -1,21 +1,17 @@
 /**
  * MPCC Solver - Model Predictive Contouring Control for QCar2
  *
- * High-performance C++ implementation using Eigen.
- * Uses proper iLQR (iterative Linear Quadratic Regulator) with:
- * - Full Hessian for x-y coupling (not diagonal approximation)
- * - Feedback gains (K matrix) in forward rollout
- * - Cost-based line search for robust convergence
- * - Bicycle model with slip angle (matching reference repo)
+ * Matches reference architecture (PolyCtrl 2025 MPCC.py):
+ * - 3D kinematic state [x, y, θ] with direct controls [v, δ]
+ * - Condensed QP + ADMM solver (from PyMPC/cpp_mpc)
+ * - Contouring + lag cost, control smoothness (u[k]-u[k-1])²
+ * - Obstacle avoidance via linearized halfspace QP constraints
  *
- * Key features:
- * - Ackermann dynamics with slip angle beta
- * - RK4 for simulation, Euler for Jacobian linearization
- * - Contouring + lag cost with proper x-y Hessian coupling
- * - Linearized obstacle avoidance (soft penalty)
- * - Road boundary soft constraints
- * - Warm-starting from previous solution
- * - ~150us solve time for N=25 horizon
+ * Key difference from previous version:
+ * - Direct controls [speed, steering_angle] instead of rate controls [accel, steer_rate]
+ * - 3D state instead of 5D — simpler, more robust, matches hardware interface
+ * - No steering lag — solver sets steering angle directly each step
+ * - Matches reference MPCC.py dynamics exactly
  */
 
 #ifndef MPCC_SOLVER_H
@@ -26,55 +22,61 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <functional>
 
 namespace mpcc {
 
 struct Config {
-    int horizon = 20;
+    int horizon = 10;  // Match reference (PolyCtrl 2025 K=10). Longer horizons cause oscillation with linearized QP.
     double dt = 0.1;
     double wheelbase = 0.256;
-    double max_velocity = 1.2;   // Raised from 0.70 (ref uses 2.0; qcar2_hardware PD handles speed control)
-    double min_velocity = 0.05;  // Always move forward (prevents v=0 equilibrium)
-    double max_steering = 0.45;
-    double max_acceleration = 0.8;  // Raised from 0.6 for faster response
-    double max_steering_rate = 0.8; // Raised from 0.6 for faster steering response
-    double reference_velocity = 0.65;  // Raised from 0.55 (ref uses 0.70)
+    double max_velocity = 1.2;
+    double min_velocity = 0.0;
+    double max_steering = M_PI / 6.0;  // ±30° — matches reference (PolyCtrl 2025)
 
-    // Cost weights — Aligned with reference (PolyCtrl 2025):
-    // Reference: contour=1.8, lag=7.0, R_ref[0]=17.0 (velocity tracking)
-    // Key insight: reference prioritizes PROGRESS over lane centering.
-    // Previous over-tuning (contour=25, lag=5) caused vehicle to find
-    // "staying still in lane" as the optimal solution.
-    double contour_weight = 8.0;   // Reduced from 25.0 (ref: 1.8) — lane keeping still weighted
-    double lag_weight = 12.0;      // Raised from 5.0 (ref: 7.0) — prioritize forward progress
-    double velocity_weight = 15.0; // Raised from 8.0 (ref: 17.0) — track v_ref strongly
-    double steering_weight = 2.0;  // Reduced from 3.0 for more responsive steering
-    double acceleration_weight = 1.0;  // Reduced from 1.5 for faster speed changes
-    double steering_rate_weight = 3.0; // Reduced from 4.0 for more agile steering
-    double jerk_weight = 0.3;      // Reduced from 0.5 for smoother response
-    double heading_weight = 3.0;   // Penalize (theta - path_tangent)^2 to help initial alignment
+    // Legacy rate limits (used only by AckermannModel for simulation tests)
+    double max_acceleration = 1.5;
+    double max_steering_rate = 1.5;
 
-    // Startup ramp: for the first startup_ramp_duration_s seconds,
-    // use lower reference velocity to let the controller settle.
-    // Reduced from 3.0 to 1.5s: the heading-aligned path makes the initial
-    // trajectory smooth, so the solver no longer needs a long low-speed phase.
-    double startup_ramp_duration_s = 1.5;
-    double startup_elapsed_s = 0.0;  // Set by the caller each solve
+    double reference_velocity = 0.45;
+
+    // Cost weights — tuned via full-mission combined simulation (Feb 2026)
+    // contour=20 + heading=3.0 gives 0.094m max CTE with 0% steering saturation
+    double contour_weight = 20.0;      // ref q_c=1.8 — higher for tighter lateral tracking
+    double lag_weight = 10.0;          // ref q_l=7.0
+    double velocity_weight = 15.0;     // ref R_ref[0]=17.0 — tracks v_ref
+    double steering_weight = 0.05;     // ref R_ref[1]=0.05 — tracks δ_ref=0 (no feedforward)
+    double acceleration_weight = 0.01; // ref R_u[0]=0.005 — smoothness (Δv)²
+    double steering_rate_weight = 1.0; // ref R_u[1]=1.1 — smooth steering, prevents bang-bang oscillation
+    double jerk_weight = 0.0;          // not in reference
+    double heading_weight = 3.0;       // not in reference; helps our QP solver align heading faster
+    double progress_weight = 1.0;     // ref gamma=1.0 — rewards forward progress (-gamma*v*dt)
+
+    // Startup ramp — disabled (0.0). The reference MPCC (PolyCtrl 2025) uses
+    // constant weights from the first iteration. The ramp caused a 24x jump in
+    // steering_rate_weight (0.05→1.2) over 3s, triggering oscillation at startup.
+    double startup_ramp_duration_s = 0.0;
+    double startup_elapsed_s = 0.0;
+    double startup_contour_weight = 1.0;
+    double startup_lag_weight = 10.0;
+    double startup_velocity_weight = 5.0;
+    double startup_heading_weight = 3.0;
+    double startup_steering_rate_weight = 0.05;
+    double startup_progress_weight = 5.0;    // ref gamma=5.0 during startup (aggressive progress)
+    double startup_curvature_decay = -5.0;
 
     // Obstacle
     double robot_radius = 0.13;
     double safety_margin = 0.10;
     double obstacle_weight = 200.0;
 
-    // Boundary
-    double boundary_weight = 20.0;  // Reduced from 30.0 — was too restrictive with high contour
-
-    // Road half-width for boundary generation
+    // Boundary — disabled (ref has 0; boundary cost fights contour cost on curves)
+    double boundary_weight = 0.0;
     double boundary_default_width = 0.22;
 
     // Solver
-    int max_sqp_iterations = 3;
-    int max_qp_iterations = 10;
+    int max_sqp_iterations = 5;   // PyMPC uses 5; was 3 (insufficient for curve convergence)
+    int max_qp_iterations = 20;   // PyMPC uses 200; *10 internally = 200 ADMM iterations
     double qp_tolerance = 1e-5;
 };
 
@@ -82,12 +84,33 @@ struct PathRef {
     double x, y, cos_theta, sin_theta, curvature;
 };
 
+/**
+ * Callback for re-projecting predicted positions onto the path.
+ * This allows the solver to update path references during SQP iterations,
+ * matching the reference MPCC's theta-as-decision-variable behavior.
+ *
+ * Given a predicted position (px, py) and a minimum arc-length (s_min),
+ * returns the closest-point PathRef and the arc-length of that point.
+ */
+struct PathLookup {
+    using LookupFn = std::function<PathRef(double px, double py, double s_min, double* s_out)>;
+    LookupFn lookup = nullptr;
+    bool valid() const { return lookup != nullptr; }
+};
+
 struct Obstacle {
     double x, y, radius;
+    double vx = 0.0, vy = 0.0;
+};
+
+struct ObstacleHalfspace {
+    double nx, ny, b;
+    double weight;
+    bool active;
 };
 
 struct BoundaryConstraint {
-    double nx, ny;  // Normal vector
+    double nx, ny;
     double b_left, b_right;
 };
 
@@ -103,7 +126,13 @@ struct Result {
     double cost;
 };
 
-// Type aliases for clarity
+// Solver uses 3D state, 2D control
+using Vec3 = Eigen::Vector3d;
+using Vec2 = Eigen::Vector2d;
+using Mat33 = Eigen::Matrix3d;
+using Mat32 = Eigen::Matrix<double, 3, 2>;
+
+// Legacy 5D types for AckermannModel (used by simulation tests)
 using VecX = Eigen::Matrix<double, 5, 1>;
 using VecU = Eigen::Matrix<double, 2, 1>;
 using MatXX = Eigen::Matrix<double, 5, 5>;
@@ -112,50 +141,35 @@ using MatUX = Eigen::Matrix<double, 2, 5>;
 using MatUU = Eigen::Matrix<double, 2, 2>;
 
 /**
- * Ackermann/bicycle dynamics for QCar2.
- * State: [x, y, theta, v, delta] (5D)
- * Control: [a, delta_dot] (2D)
+ * Kinematic bicycle model — matches reference MPCC.py exactly.
+ * State: [x, y, θ] (3D)
+ * Control: [v, δ] (direct speed and steering angle)
  *
- * Uses bicycle model with slip angle beta for accuracy:
- *   beta = atan(tan(delta) / 2)
- *   dx/dt = v * cos(theta + beta)
- *   dy/dt = v * sin(theta + beta)
- *   dtheta/dt = v / L * sin(beta)
- *   dv/dt = a
- *   ddelta/dt = delta_dot
+ *   β = atan(tan(δ) / 2)
+ *   ẋ = v · cos(θ + β)
+ *   ẏ = v · sin(θ + β)
+ *   θ̇ = v / L · tan(δ) · cos(β)
  */
-class AckermannModel {
+class KinematicModel {
 public:
-    static constexpr int NX = 5;
+    static constexpr int NX = 3;
     static constexpr int NU = 2;
+    double L;
 
-    double L;  // wheelbase
+    KinematicModel(double wheelbase = 0.256) : L(wheelbase) {}
 
-    AckermannModel(double wheelbase = 0.256) : L(wheelbase) {}
-
-    // Continuous dynamics: dx/dt = f(x, u) with slip angle
-    VecX dynamics(const VecX& x, const VecU& u) const
-    {
-        VecX xdot;
-        double v = x(3);
-        double delta = x(4);
-        double theta = x(2);
-
-        // Slip angle: beta = atan(tan(delta) / 2)
-        // This accounts for CG being at L/2 from rear axle
+    Vec3 dynamics(const Vec3& x, const Vec2& u) const {
+        double v = u(0), delta = u(1), theta = x(2);
         double beta = std::atan(std::tan(delta) / 2.0);
-
-        xdot(0) = v * std::cos(theta + beta);
-        xdot(1) = v * std::sin(theta + beta);
-        xdot(2) = v / L * std::sin(beta);
-        xdot(3) = u(0);  // acceleration
-        xdot(4) = u(1);  // steering rate
-        return xdot;
+        double cos_beta = std::cos(beta);
+        return Vec3(
+            v * std::cos(theta + beta),
+            v * std::sin(theta + beta),
+            v / L * std::tan(delta) * cos_beta
+        );
     }
 
-    // RK4 step
-    VecX rk4_step(const VecX& x, const VecU& u, double dt) const
-    {
+    Vec3 rk4_step(const Vec3& x, const Vec2& u, double dt) const {
         auto k1 = dynamics(x, u);
         auto k2 = dynamics(x + 0.5 * dt * k1, u);
         auto k3 = dynamics(x + 0.5 * dt * k2, u);
@@ -163,25 +177,13 @@ public:
         return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4);
     }
 
-    // Linearize: x_{k+1} = A*x_k + B*u_k + c
-    void linearize(
-        const VecX& x_ref,
-        const VecU& u_ref,
-        double dt,
-        MatXX& A,
-        MatXU& B,
-        VecX& c) const
-    {
-        double v = x_ref(3);
-        double delta = x_ref(4);
-        double theta = x_ref(2);
-
-        // Slip angle and its derivatives
+    void linearize(const Vec3& x, const Vec2& u, double dt,
+                   Mat33& A, Mat32& B, Vec3& c) const {
+        double v = u(0), delta = u(1), theta = x(2);
         double tan_del = std::tan(delta);
         double beta = std::atan(tan_del / 2.0);
         double cos_del = std::cos(delta);
         double sec2_del = 1.0 / (cos_del * cos_del);
-        // d(beta)/d(delta) = (sec^2(delta) / 2) / (1 + tan^2(delta)/4)
         double dbeta_ddelta = (sec2_del / 2.0) / (1.0 + tan_del * tan_del / 4.0);
 
         double cos_tb = std::cos(theta + beta);
@@ -189,163 +191,284 @@ public:
         double sin_beta = std::sin(beta);
         double cos_beta = std::cos(beta);
 
-        // Jacobian df/dx (continuous)
-        MatXX Ac = MatXX::Zero();
-        // dx/dtheta = -v * sin(theta + beta)
+        // df/dx (3x3)
+        Mat33 Ac = Mat33::Zero();
         Ac(0, 2) = -v * sin_tb;
-        // dx/dv = cos(theta + beta)
-        Ac(0, 3) = cos_tb;
-        // dx/ddelta = -v * sin(theta + beta) * dbeta_ddelta
-        Ac(0, 4) = -v * sin_tb * dbeta_ddelta;
+        Ac(1, 2) =  v * cos_tb;
 
-        // dy/dtheta = v * cos(theta + beta)
-        Ac(1, 2) = v * cos_tb;
-        // dy/dv = sin(theta + beta)
-        Ac(1, 3) = sin_tb;
-        // dy/ddelta = v * cos(theta + beta) * dbeta_ddelta
-        Ac(1, 4) = v * cos_tb * dbeta_ddelta;
+        // df/du (3x2) — controls directly affect dynamics (unlike rate model)
+        Mat32 Bc = Mat32::Zero();
+        // df/dv
+        Bc(0, 0) = cos_tb;
+        Bc(1, 0) = sin_tb;
+        Bc(2, 0) = tan_del * cos_beta / L;
+        // df/dδ
+        Bc(0, 1) = -v * sin_tb * dbeta_ddelta;
+        Bc(1, 1) =  v * cos_tb * dbeta_ddelta;
+        Bc(2, 1) = v / L * (sec2_del * cos_beta - tan_del * sin_beta * dbeta_ddelta);
 
-        // dtheta/dv = sin(beta) / L
-        Ac(2, 3) = sin_beta / L;
-        // dtheta/ddelta = v / L * cos(beta) * dbeta_ddelta
-        Ac(2, 4) = v / L * cos_beta * dbeta_ddelta;
-
-        // Jacobian df/du (continuous)
-        MatXU Bc = MatXU::Zero();
-        Bc(3, 0) = 1.0;  // dv/da = 1
-        Bc(4, 1) = 1.0;  // ddelta/ddelta_dot = 1
-
-        // Euler discretization
-        A = MatXX::Identity() + dt * Ac;
+        A = Mat33::Identity() + dt * Ac;
         B = dt * Bc;
-
-        // Affine term: c = x_ref + dt*f(x_ref, u_ref) - A*x_ref - B*u_ref
-        auto f_ref = dynamics(x_ref, u_ref);
-        c = x_ref + dt * f_ref - A * x_ref - B * u_ref;
+        c = x + dt * dynamics(x, u) - A * x - B * u;
     }
 };
 
 /**
- * MPCC Solver using proper iLQR with full Hessian.
+ * Legacy Ackermann model for simulation/testing (5D state, rate controls).
+ */
+class AckermannModel {
+public:
+    static constexpr int NX = 5;
+    static constexpr int NU = 2;
+    double L;
+
+    AckermannModel(double wheelbase = 0.256) : L(wheelbase) {}
+
+    VecX dynamics(const VecX& x, const VecU& u) const {
+        VecX xdot;
+        double v = x(3), delta = x(4), theta = x(2);
+        double beta = std::atan(std::tan(delta) / 2.0);
+        double cos_beta = std::cos(beta);
+        xdot(0) = v * std::cos(theta + beta);
+        xdot(1) = v * std::sin(theta + beta);
+        xdot(2) = v / L * std::tan(delta) * cos_beta;
+        xdot(3) = u(0);
+        xdot(4) = u(1);
+        return xdot;
+    }
+
+    VecX rk4_step(const VecX& x, const VecU& u, double dt) const {
+        auto k1 = dynamics(x, u);
+        auto k2 = dynamics(x + 0.5 * dt * k1, u);
+        auto k3 = dynamics(x + 0.5 * dt * k2, u);
+        auto k4 = dynamics(x + dt * k3, u);
+        return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4);
+    }
+};
+
+/**
+ * MPCC Solver — 3D kinematic model with direct controls.
  *
- * Key improvements over previous version:
- * 1. Full NX x NX Hessian (not diagonal) for proper x-y coupling
- * 2. Feedback gains K in forward rollout
- * 3. Cost-based line search
- * 4. Bicycle model with slip angle
+ * Matches reference MPCC.py architecture:
+ * - Controls u = [v, δ] applied directly (no rate dynamics)
+ * - Control smoothness via (u[k] - u[k-1])² (matching R_u)
+ * - Velocity/steering tracking via (u[k] - u_ref)² (matching R_ref)
+ * - Condensed QP + ADMM solver
  */
 class Solver {
 public:
-    static constexpr int NX = AckermannModel::NX;
-    static constexpr int NU = AckermannModel::NU;
+    static constexpr int NX = 3;
+    static constexpr int NU = 2;
 
     Config config;
-    AckermannModel model;
+    KinematicModel model;
 
-    // Warm-start trajectory
-    std::vector<VecX> X_warm;
-    std::vector<VecU> U_warm;
+    // Path lookup for adaptive reference re-projection during SQP
+    PathLookup path_lookup;
+
+    // For simulation tests — legacy 5D model
+    AckermannModel ackermann_model;
+
+    // Warm-start
+    std::vector<Vec3> X_warm;
+    std::vector<Vec2> U_warm;
     bool has_warmstart = false;
 
-    Solver() : model(0.256) {}
+    // Previous control (for first-step smoothness, matching reference u_prev)
+    Vec2 u_prev_ = Vec2(0.0, 0.0);
+
+    // Current arc-length progress (for adaptive re-projection)
+    double current_progress_ = 0.0;
+
+    Solver() : model(0.256), ackermann_model(0.256) {}
 
     void init(const Config& cfg) {
         config = cfg;
-        model = AckermannModel(cfg.wheelbase);
+        model = KinematicModel(cfg.wheelbase);
+        ackermann_model = AckermannModel(cfg.wheelbase);
         has_warmstart = false;
         X_warm.resize(cfg.horizon + 1);
         U_warm.resize(cfg.horizon);
+        u_prev_ = Vec2(0.2, 0.0);  // Start with min speed, zero steering
     }
 
     void reset() {
         has_warmstart = false;
+        u_prev_ = Vec2(0.2, 0.0);
     }
 
+    /**
+     * Solve MPCC with 3D state [x, y, θ] and direct controls [v, δ].
+     *
+     * @param x0  Current vehicle state [x, y, θ]
+     * @param path_refs  Path reference points (N+1)
+     * @param obstacles  Obstacle list
+     * @param boundaries  Road boundary constraints
+     * @param measured_v  Measured vehicle velocity (used for u_prev, matching
+     *                    reference MPC_node.py line 553: u_prev[0] = v)
+     * @param measured_delta  Measured steering angle (last commanded)
+     */
     Result solve(
-        const VecX& x0,
+        const Vec3& x0,
         const std::vector<PathRef>& path_refs,
         double current_progress,
-        double path_total_length,
+        double /*path_total_length*/,
         const std::vector<Obstacle>& obstacles,
-        const std::vector<BoundaryConstraint>& boundaries)
+        const std::vector<BoundaryConstraint>& boundaries,
+        double measured_v = -1.0,
+        double measured_delta = -999.0)
     {
         auto t_start = std::chrono::high_resolution_clock::now();
-
         int N = config.horizon;
+        current_progress_ = current_progress;
         Result result;
         result.success = false;
 
-        // Initialize trajectory
-        std::vector<VecX> X(N + 1);
-        std::vector<VecU> U(N);
+        // Update u_prev with measured values (matching reference MPC_node.py:553)
+        // Reference: self.u_prev[0] = v (measured velocity)
+        // This ensures smoothness cost (u[0] - u_prev)² uses actual vehicle state,
+        // not the solver's previous command which may differ due to hardware lag.
+        if (measured_v >= 0.0) {
+            u_prev_(0) = measured_v;
+        }
+        if (measured_delta > -900.0) {
+            u_prev_(1) = measured_delta;
+        }
+
+        std::vector<Vec3> X(N + 1);
+        std::vector<Vec2> U(N);
 
         if (has_warmstart) {
-            // Shift warm-start forward by one step
             for (int k = 0; k < N; k++) {
                 X[k] = (k + 1 < (int)X_warm.size()) ? X_warm[k + 1] : X_warm.back();
                 U[k] = (k + 1 < (int)U_warm.size()) ? U_warm[k + 1] : U_warm.back();
             }
             X[N] = X_warm.back();
             X[0] = x0;
-        } else {
-            // Cold start: straight-line prediction
-            double v0 = std::max(x0(3), 0.1);
-            for (int k = 0; k <= N; k++) {
-                X[k] = x0;
-                X[k](0) = x0(0) + k * config.dt * v0 * std::cos(x0(2));
-                X[k](1) = x0(1) + k * config.dt * v0 * std::sin(x0(2));
-                X[k](3) = v0;
-            }
+            // Clamp controls and re-propagate
             for (int k = 0; k < N; k++) {
-                U[k] = VecU::Zero();
+                U[k](0) = clamp(U[k](0), config.min_velocity, config.max_velocity);
+                U[k](1) = clamp(U[k](1), -config.max_steering, config.max_steering);
+                X[k + 1] = model.rk4_step(X[k], U[k], config.dt);
+            }
+        } else {
+            // Cold start: use measured velocity/steering for initial trajectory.
+            // After reset between legs, u_prev_ = (0.2, 0.0). But if the vehicle
+            // is already moving at 0.5+ m/s, the speed mismatch causes large
+            // velocity tracking error in the first solve. Use measured values
+            // when available (measured_v >= 0 means valid measurement).
+            double v0 = std::max(measured_v >= 0.0 ? measured_v : u_prev_(0), 0.15);
+            double d0 = measured_delta > -900.0 ? measured_delta : u_prev_(1);
+            X[0] = x0;
+            for (int k = 0; k < N; k++) {
+                U[k] = Vec2(v0, d0);
+                X[k + 1] = model.rk4_step(X[k], U[k], config.dt);
             }
         }
 
-        // SQP iterations: re-linearize and solve iLQR
-        for (int sqp = 0; sqp < config.max_sqp_iterations; sqp++) {
-            // Linearize dynamics around current trajectory
-            std::vector<MatXX> As(N);
-            std::vector<MatXU> Bs(N);
-            std::vector<VecX> cs(N);
+        // Adaptive path references: if path_lookup is available, re-project
+        // predicted positions onto the path each SQP iteration.
+        // This matches the reference MPCC where theta (path progress) is a
+        // decision variable — the solver adapts which path points to track
+        // based on the current predicted trajectory. On tight curves, references
+        // naturally tighten because predicted positions are closer together.
+        std::vector<PathRef> adaptive_refs = path_refs;  // Start with pre-computed
 
+        // SQP iterations
+        for (int sqp = 0; sqp < config.max_sqp_iterations; sqp++) {
+            // Re-project path references from predicted positions
+            if (path_lookup.valid()) {
+                double s_min = current_progress_;
+                for (int k = 0; k <= N; k++) {
+                    double s_out = s_min;
+                    adaptive_refs[k] = path_lookup.lookup(
+                        X[k](0), X[k](1), s_min, &s_out);
+                    s_min = s_out;  // Monotonic: each ref must be ahead of previous
+                }
+            }
+
+            std::vector<Mat33> As(N);
+            std::vector<Mat32> Bs(N);
+            std::vector<Vec3> cs(N);
             for (int k = 0; k < N; k++) {
                 model.linearize(X[k], U[k], config.dt, As[k], Bs[k], cs[k]);
             }
 
-            // Run iLQR backward-forward pass
-            bool converged = solve_ilqr(x0, X, U, As, Bs, cs, path_refs,
-                                         obstacles, boundaries);
+            auto obs_hs = precompute_obstacle_halfspaces(X, obstacles);
 
-            // Re-simulate forward with nonlinear (RK4) dynamics
-            X[0] = x0;
-            for (int k = 0; k < N; k++) {
-                U[k](0) = clamp(U[k](0), -config.max_acceleration, config.max_acceleration);
-                U[k](1) = clamp(U[k](1), -config.max_steering_rate, config.max_steering_rate);
-                X[k + 1] = model.rk4_step(X[k], U[k], config.dt);
-                X[k + 1](3) = clamp(X[k + 1](3), config.min_velocity, config.max_velocity);
-                X[k + 1](4) = clamp(X[k + 1](4), -config.max_steering, config.max_steering);
+            Eigen::VectorXd delta_u = solve_condensed_qp(
+                X, U, As, Bs, adaptive_refs, obs_hs, boundaries);
+
+            if (delta_u.norm() < config.qp_tolerance) break;
+
+            // Line search with nonlinear rollout
+            std::vector<Vec2> best_U = U;
+            std::vector<Vec3> best_X = X;
+            double best_cost = compute_total_cost(X, U, adaptive_refs, obs_hs, boundaries);
+            bool improved = false;
+
+            double alpha = 1.0;
+            for (int ls = 0; ls < 4; ls++) {
+                std::vector<Vec2> trial_U(N);
+                for (int k = 0; k < N; k++) {
+                    trial_U[k](0) = U[k](0) + alpha * delta_u(NU * k);
+                    trial_U[k](1) = U[k](1) + alpha * delta_u(NU * k + 1);
+                    trial_U[k](0) = clamp(trial_U[k](0), config.min_velocity, config.max_velocity);
+                    trial_U[k](1) = clamp(trial_U[k](1), -config.max_steering, config.max_steering);
+                }
+
+                std::vector<Vec3> trial_X(N + 1);
+                trial_X[0] = x0;
+                for (int k = 0; k < N; k++) {
+                    trial_X[k + 1] = model.rk4_step(trial_X[k], trial_U[k], config.dt);
+                }
+
+                // Re-project references for trial trajectory too
+                std::vector<PathRef> trial_refs = adaptive_refs;
+                if (path_lookup.valid()) {
+                    double s_min = current_progress_;
+                    for (int k = 0; k <= N; k++) {
+                        double s_out = s_min;
+                        trial_refs[k] = path_lookup.lookup(
+                            trial_X[k](0), trial_X[k](1), s_min, &s_out);
+                        s_min = s_out;
+                    }
+                }
+
+                auto trial_hs = precompute_obstacle_halfspaces(trial_X, obstacles);
+                double trial_cost = compute_total_cost(trial_X, trial_U, trial_refs, trial_hs, boundaries);
+
+                if (trial_cost < best_cost) {
+                    best_cost = trial_cost;
+                    best_U = trial_U;
+                    best_X = trial_X;
+                    adaptive_refs = trial_refs;
+                    improved = true;
+                    break;
+                }
+                alpha *= 0.5;
             }
 
-            if (converged) break;
+            if (improved) { U = best_U; X = best_X; }
+            else break;
         }
 
-        // Store warm-start
+        // Store warm-start and u_prev
         X_warm = X;
         U_warm = U;
         has_warmstart = true;
+        u_prev_ = U[0];
 
-        // Extract result (use step 1, not step 0, for one-step delay)
-        result.v_cmd = clamp(X[1](3), config.min_velocity, config.max_velocity);
-        result.delta_cmd = clamp(X[1](4), -config.max_steering, config.max_steering);
+        // Extract result — direct control output (no one-step delay!)
+        result.v_cmd = clamp(U[0](0), config.min_velocity, config.max_velocity);
+        result.delta_cmd = clamp(U[0](1), -config.max_steering, config.max_steering);
 
-        // Compute angular velocity for Twist message
         if (std::abs(result.v_cmd) > 0.001) {
             result.omega_cmd = result.v_cmd * std::tan(result.delta_cmd) / config.wheelbase;
         } else {
             result.omega_cmd = 0.0;
         }
 
-        // Store predicted trajectory
         result.predicted_x.resize(N + 1);
         result.predicted_y.resize(N + 1);
         result.predicted_theta.resize(N + 1);
@@ -355,7 +478,8 @@ public:
             result.predicted_theta[k] = X[k](2);
         }
 
-        result.cost = compute_total_cost(X, U, path_refs, obstacles, boundaries);
+        auto final_hs = precompute_obstacle_halfspaces(X, obstacles);
+        result.cost = compute_total_cost(X, U, adaptive_refs, final_hs, boundaries);
         result.success = true;
 
         auto t_end = std::chrono::high_resolution_clock::now();
@@ -363,6 +487,22 @@ public:
             t_end - t_start).count();
 
         return result;
+    }
+
+    // Overload: accept 5D state for backward compatibility with controller node
+    // Extracts measured v and delta from 5D state for u_prev correction
+    Result solve(
+        const VecX& x0_5d,
+        const std::vector<PathRef>& path_refs,
+        double current_progress,
+        double path_total_length,
+        const std::vector<Obstacle>& obstacles,
+        const std::vector<BoundaryConstraint>& boundaries)
+    {
+        Vec3 x0_3d(x0_5d(0), x0_5d(1), x0_5d(2));
+        // Pass measured velocity and steering from 5D state
+        return solve(x0_3d, path_refs, current_progress, path_total_length,
+                     obstacles, boundaries, x0_5d(3), x0_5d(4));
     }
 
 private:
@@ -376,369 +516,422 @@ private:
         return a;
     }
 
-    /**
-     * Compute stage cost, gradient, and FULL Hessian for a state.
-     * Returns the scalar cost value.
-     *
-     * Uses full NX x NX Hessian (not diagonal) to properly couple
-     * x and y in the contouring/lag cost.
-     */
-    double compute_state_cost_full(
-        const VecX& xk,
-        const PathRef& ref,
-        const std::vector<Obstacle>& obstacles,
-        const std::vector<BoundaryConstraint>& boundaries,
-        int k,
-        VecX& grad_x,
-        MatXX& hess_x)
+    double startup_progress() const {
+        if (config.startup_ramp_duration_s <= 0.0) return 1.0;
+        return std::clamp(config.startup_elapsed_s / config.startup_ramp_duration_s, 0.0, 1.0);
+    }
+
+    static double lerp_weight(double startup_val, double normal_val, double progress) {
+        return startup_val + progress * (normal_val - startup_val);
+    }
+
+    std::vector<std::vector<ObstacleHalfspace>> precompute_obstacle_halfspaces(
+        const std::vector<Vec3>& X,
+        const std::vector<Obstacle>& obstacles)
     {
-        grad_x.setZero();
-        hess_x.setZero();
-        double cost = 0.0;
+        int N = config.horizon;
+        std::vector<std::vector<ObstacleHalfspace>> halfspaces(N + 1);
 
-        double dx = xk(0) - ref.x;
-        double dy = xk(1) - ref.y;
-        double e_c = -ref.sin_theta * dx + ref.cos_theta * dy;  // contouring (lateral)
-        double e_l =  ref.cos_theta * dx + ref.sin_theta * dy;  // lag (longitudinal)
-
-        cost += config.contour_weight * e_c * e_c;
-        cost += config.lag_weight * e_l * e_l;
-
-        // Curvature-adaptive velocity reference (matched to reference MPC)
-        // Reference uses exp(-0.4*curvature) with u_ref_max=0.7 normal, 0.2 startup
-        double v_ref;
-        if (config.startup_elapsed_s < config.startup_ramp_duration_s) {
-            // Startup: low speed to let controller settle (ref uses 0.2 m/s for 3s)
-            v_ref = 0.20 * std::exp(-0.4 * std::abs(ref.curvature));
-        } else {
-            // Normal: gentler curvature decay matching reference (-0.4 vs our old -1.2)
-            v_ref = config.reference_velocity * std::exp(-0.4 * std::abs(ref.curvature));
-        }
-        v_ref = std::clamp(v_ref, config.min_velocity, config.max_velocity);
-
-        // --- Contouring + lag gradient ---
-        // d(e_c)/dx = -sin_theta, d(e_c)/dy = cos_theta
-        // d(e_l)/dx = cos_theta,  d(e_l)/dy = sin_theta
-        grad_x(0) = 2.0 * config.contour_weight * e_c * (-ref.sin_theta)
-                   + 2.0 * config.lag_weight * e_l * ref.cos_theta;
-        grad_x(1) = 2.0 * config.contour_weight * e_c * ref.cos_theta
-                   + 2.0 * config.lag_weight * e_l * ref.sin_theta;
-
-        // --- Contouring + lag FULL Hessian for (x, y) block ---
-        // H = 2*w_c * [d(e_c)/dx]^T [d(e_c)/dx] + 2*w_l * [d(e_l)/dx]^T [d(e_l)/dx]
-        //   = 2*w_c * [-sin; cos] [-sin, cos] + 2*w_l * [cos; sin] [cos, sin]
-        double s = ref.sin_theta;
-        double c = ref.cos_theta;
-        double wc = config.contour_weight;
-        double wl = config.lag_weight;
-
-        // Full 2x2 block for states 0,1 (x,y):
-        hess_x(0, 0) = 2.0 * (wc * s * s + wl * c * c);
-        hess_x(0, 1) = 2.0 * (-wc * s * c + wl * c * s);  // = 2*(wl - wc)*s*c
-        hess_x(1, 0) = hess_x(0, 1);  // symmetric
-        hess_x(1, 1) = 2.0 * (wc * c * c + wl * s * s);
-
-        // --- Velocity tracking ---
-        double v_err = xk(3) - v_ref;
-        cost += config.velocity_weight * v_err * v_err;
-        grad_x(3) = 2.0 * config.velocity_weight * v_err;
-        hess_x(3, 3) = 2.0 * config.velocity_weight;
-
-        // --- Steering penalty ---
-        cost += config.steering_weight * xk(4) * xk(4);
-        grad_x(4) = 2.0 * config.steering_weight * xk(4);
-        hess_x(4, 4) = 2.0 * config.steering_weight;
-
-        // --- Heading alignment cost ---
-        // Penalize deviation of vehicle heading from path tangent direction.
-        // This helps the solver actively steer to align heading early,
-        // preventing the initial heading mismatch from compounding.
-        if (config.heading_weight > 0.0) {
-            double path_theta = std::atan2(ref.sin_theta, ref.cos_theta);
-            double heading_err = normalize_angle(xk(2) - path_theta);
-            cost += config.heading_weight * heading_err * heading_err;
-            grad_x(2) += 2.0 * config.heading_weight * heading_err;
-            hess_x(2, 2) += 2.0 * config.heading_weight;
-        }
-
-        // --- Obstacle penalty (smooth barrier) ---
         for (const auto& obs : obstacles) {
-            double odx = xk(0) - obs.x;
-            double ody = xk(1) - obs.y;
-            double dist_sq = odx * odx + ody * ody;
-            double dist = std::sqrt(dist_sq);
             double safe_r = obs.radius + config.robot_radius + config.safety_margin;
+            for (int k = 0; k <= N; k++) {
+                double ok_x = obs.x + k * config.dt * obs.vx;
+                double ok_y = obs.y + k * config.dt * obs.vy;
+                double dx = X[k](0) - ok_x;
+                double dy = X[k](1) - ok_y;
+                double dist = std::sqrt(dx * dx + dy * dy);
 
-            if (dist < safe_r + 0.5 && dist > 1e-4) {
-                double violation = safe_r - dist;
-                if (violation > 0) {
-                    cost += config.obstacle_weight * violation * violation;
-                    double factor = 2.0 * config.obstacle_weight * violation;
-                    double nx = odx / dist;
-                    double ny = ody / dist;
-                    grad_x(0) -= factor * nx;
-                    grad_x(1) -= factor * ny;
-                    // Hessian: add w * (I/dist - n*n^T/dist) + w * n*n^T
-                    // Simplified: just add diagonal for numerical stability
-                    hess_x(0, 0) += 2.0 * config.obstacle_weight;
-                    hess_x(1, 1) += 2.0 * config.obstacle_weight;
+                if (dist > safe_r + 1.0) continue;
+
+                ObstacleHalfspace hs;
+                hs.active = true;
+                if (dist < 1e-4) {
+                    double pt = std::atan2(
+                        X[k](1) - (k > 0 ? X[k-1](1) : X[k](1)),
+                        X[k](0) - (k > 0 ? X[k-1](0) : X[k](0)));
+                    hs.nx = -std::sin(pt);
+                    hs.ny =  std::cos(pt);
+                } else {
+                    hs.nx = dx / dist;
+                    hs.ny = dy / dist;
+                }
+                hs.b = hs.nx * ok_x + hs.ny * ok_y + safe_r;
+                hs.weight = config.obstacle_weight;
+                halfspaces[k].push_back(hs);
+            }
+        }
+        return halfspaces;
+    }
+
+    PathRef get_path_ref(int k, const std::vector<PathRef>& refs, const Vec3& xk) {
+        if (k < (int)refs.size()) return refs[k];
+        if (!refs.empty()) return refs.back();
+        PathRef r;
+        r.x = xk(0); r.y = xk(1);
+        r.cos_theta = std::cos(xk(2));
+        r.sin_theta = std::sin(xk(2));
+        r.curvature = 0.0;
+        return r;
+    }
+
+    /**
+     * Build and solve condensed QP for 3D kinematic model with direct controls.
+     *
+     * Decision variables: Δu[k] for k=0..N-1 where u=[v, δ]
+     * Sensitivity: M[k][j] = ∂x[k]/∂u[j] is 3×2
+     *
+     * Cost terms:
+     * 1. Contouring/lag: through position sensitivity (same as before)
+     * 2. Heading: through θ sensitivity (same as before)
+     * 3. Velocity tracking: wv*(u[k](0) - v_ref)² — diagonal on Δu
+     * 4. Steering tracking: ws*(u[k](1) - δ_ff)² — diagonal on Δu
+     * 5. Control smoothness: R_u*(u[k] - u[k-1])² — cross terms in Δu
+     */
+    Eigen::VectorXd solve_condensed_qp(
+        const std::vector<Vec3>& X,
+        const std::vector<Vec2>& U,
+        const std::vector<Mat33>& As,
+        const std::vector<Mat32>& Bs,
+        const std::vector<PathRef>& path_refs,
+        const std::vector<std::vector<ObstacleHalfspace>>& obs_hs,
+        const std::vector<BoundaryConstraint>& boundaries)
+    {
+        int N = config.horizon;
+        int n_dec = NU * N;
+
+        double sp = startup_progress();
+        double wc = lerp_weight(config.startup_contour_weight, config.contour_weight, sp);
+        double wl = lerp_weight(config.startup_lag_weight, config.lag_weight, sp);
+        double wv = lerp_weight(config.startup_velocity_weight, config.velocity_weight, sp);
+        double wh = lerp_weight(config.startup_heading_weight, config.heading_weight, sp);
+        double sr = lerp_weight(config.startup_steering_rate_weight, config.steering_rate_weight, sp);
+        double curv_decay = lerp_weight(config.startup_curvature_decay, -0.4, sp);
+
+        // Sensitivity matrices M_current[j] = M[k][j] (3×2)
+        std::vector<Mat32> M_current(N, Mat32::Zero());
+
+        Eigen::MatrixXd H = Eigen::MatrixXd::Zero(n_dec, n_dec);
+        Eigen::VectorXd g = Eigen::VectorXd::Zero(n_dec);
+
+        // Count obstacle constraints
+        int n_obs = 0;
+        for (int k = 1; k <= N; k++)
+            if (k < (int)obs_hs.size())
+                n_obs += (int)obs_hs[k].size();
+
+        Eigen::MatrixXd C_obs = Eigen::MatrixXd::Zero(n_obs, n_dec);
+        Eigen::VectorXd d_obs = Eigen::VectorXd::Zero(n_obs);
+        int ci = 0;
+
+        // ==== State-dependent costs (contouring, lag, heading, boundaries, obstacles) ====
+        for (int k = 1; k <= N; k++) {
+            // Update sensitivity: M_new[j] = A[k-1]*M_current[j], M_new[k-1] = B[k-1]
+            std::vector<Mat32> M_new(N, Mat32::Zero());
+            for (int j = 0; j < k - 1; j++)
+                M_new[j] = As[k - 1] * M_current[j];
+            M_new[k - 1] = Bs[k - 1];
+            M_current = M_new;
+
+            PathRef ref = get_path_ref(k, path_refs, X[k]);
+
+            double dx = X[k](0) - ref.x;
+            double dy = X[k](1) - ref.y;
+            double e_c0 = -ref.sin_theta * dx + ref.cos_theta * dy;
+            double e_l0 =  ref.cos_theta * dx + ref.sin_theta * dy;
+
+            // Build Jacobians through sensitivity matrices
+            Eigen::RowVectorXd Jc = Eigen::RowVectorXd::Zero(n_dec);
+            Eigen::RowVectorXd Jl = Eigen::RowVectorXd::Zero(n_dec);
+            Eigen::RowVectorXd Jh = Eigen::RowVectorXd::Zero(n_dec);
+
+            for (int j = 0; j < k; j++) {
+                const auto& Mkj = M_current[j];
+                int col = NU * j;
+                Jc.segment<NU>(col) = -ref.sin_theta * Mkj.row(0) + ref.cos_theta * Mkj.row(1);
+                Jl.segment<NU>(col) =  ref.cos_theta * Mkj.row(0) + ref.sin_theta * Mkj.row(1);
+                Jh.segment<NU>(col) = Mkj.row(2);
+            }
+
+            double w = (k == N) ? 2.0 : 1.0;
+
+            // Contouring + lag
+            H += (2.0 * wc * w) * Jc.transpose() * Jc;
+            g += (2.0 * wc * w * e_c0) * Jc.transpose();
+            H += (2.0 * wl * w) * Jl.transpose() * Jl;
+            g += (2.0 * wl * w * e_l0) * Jl.transpose();
+
+            // Heading
+            if (wh > 0.0) {
+                double path_theta = std::atan2(ref.sin_theta, ref.cos_theta);
+                double h_err0 = normalize_angle(X[k](2) - path_theta);
+                H += (2.0 * wh * w) * Jh.transpose() * Jh;
+                g += (2.0 * wh * w * h_err0) * Jh.transpose();
+            }
+
+            // Boundary penalty (soft)
+            if (k < (int)boundaries.size()) {
+                const auto& bd = boundaries[k];
+                Eigen::MatrixXd Jpos(2, n_dec);
+                Jpos.setZero();
+                for (int j = 0; j < k; j++)
+                    Jpos.block<2, NU>(0, NU * j) = M_current[j].block<2, NU>(0, 0);
+
+                double lv = bd.nx * X[k](0) + bd.ny * X[k](1) - bd.b_left;
+                if (lv > 0) {
+                    Eigen::RowVectorXd Jb = bd.nx * Jpos.row(0) + bd.ny * Jpos.row(1);
+                    H += (2.0 * config.boundary_weight) * Jb.transpose() * Jb;
+                    g += (2.0 * config.boundary_weight * lv) * Jb.transpose();
+                }
+                double rv = -bd.nx * X[k](0) - bd.ny * X[k](1) - bd.b_right;
+                if (rv > 0) {
+                    Eigen::RowVectorXd Jb = -bd.nx * Jpos.row(0) - bd.ny * Jpos.row(1);
+                    H += (2.0 * config.boundary_weight) * Jb.transpose() * Jb;
+                    g += (2.0 * config.boundary_weight * rv) * Jb.transpose();
+                }
+            }
+
+            // Obstacle halfspace constraints
+            if (k < (int)obs_hs.size()) {
+                for (const auto& hs : obs_hs[k]) {
+                    if (!hs.active) continue;
+                    Eigen::RowVectorXd Cn = Eigen::RowVectorXd::Zero(n_dec);
+                    for (int j = 0; j < k; j++)
+                        Cn.segment<NU>(NU * j) = hs.nx * M_current[j].row(0)
+                                                + hs.ny * M_current[j].row(1);
+                    if (ci < n_obs) {
+                        C_obs.row(ci) = Cn;
+                        d_obs(ci) = hs.b - (hs.nx * X[k](0) + hs.ny * X[k](1));
+                        ci++;
+                    }
                 }
             }
         }
 
-        // --- Boundary penalty (soft) ---
-        if (k < (int)boundaries.size()) {
-            const auto& bd = boundaries[k];
-            double left_val = bd.nx * xk(0) + bd.ny * xk(1) - bd.b_left;
-            double right_val = -bd.nx * xk(0) - bd.ny * xk(1) - bd.b_right;
+        // ==== Control-dependent costs (velocity tracking, steering tracking, smoothness) ====
+        for (int k = 0; k < N; k++) {
+            PathRef ref = get_path_ref(k, path_refs, X[k]);
 
-            if (left_val > 0) {
-                cost += config.boundary_weight * left_val * left_val;
-                grad_x(0) += 2.0 * config.boundary_weight * left_val * bd.nx;
-                grad_x(1) += 2.0 * config.boundary_weight * left_val * bd.ny;
-                hess_x(0, 0) += 2.0 * config.boundary_weight * bd.nx * bd.nx;
-                hess_x(0, 1) += 2.0 * config.boundary_weight * bd.nx * bd.ny;
-                hess_x(1, 0) += 2.0 * config.boundary_weight * bd.ny * bd.nx;
-                hess_x(1, 1) += 2.0 * config.boundary_weight * bd.ny * bd.ny;
-            }
-            if (right_val > 0) {
-                cost += config.boundary_weight * right_val * right_val;
-                grad_x(0) -= 2.0 * config.boundary_weight * right_val * bd.nx;
-                grad_x(1) -= 2.0 * config.boundary_weight * right_val * bd.ny;
-                hess_x(0, 0) += 2.0 * config.boundary_weight * bd.nx * bd.nx;
-                hess_x(0, 1) += 2.0 * config.boundary_weight * bd.nx * bd.ny;
-                hess_x(1, 0) += 2.0 * config.boundary_weight * bd.ny * bd.nx;
-                hess_x(1, 1) += 2.0 * config.boundary_weight * bd.ny * bd.ny;
+            // Velocity tracking: wv * (v[k] - v_ref)²
+            // v[k] = U[k](0), so this is diagonal on Δu[k](0)
+            double v_base = lerp_weight(0.20, config.reference_velocity, sp);
+            double v_ref = v_base * std::exp(curv_decay * std::abs(ref.curvature));
+            v_ref = std::clamp(v_ref, config.min_velocity, config.max_velocity);
+            double v_err = U[k](0) - v_ref;
+            H(NU * k, NU * k) += 2.0 * wv;
+            g(NU * k) += 2.0 * wv * v_err;
+
+            // Steering tracking: ws * (δ[k] - 0)² — reference tracks δ_ref=0
+            // Reference MPCC.py uses u_ref = [v_ref, 0] — NO feedforward.
+            // The solver is purely error-driven: contouring/lag/heading costs
+            // determine steering. This weight just regularizes toward zero.
+            H(NU * k + 1, NU * k + 1) += 2.0 * config.steering_weight;
+            g(NU * k + 1) += 2.0 * config.steering_weight * U[k](1);
+
+            // Progress reward: -gamma * v[k] * dt (matching reference MPCC.py line 90)
+            // In reference, V[k] is arc-length progress speed (decision variable).
+            // Here, v[k] = U[k](0) is vehicle speed. Since v[k] = U0[k] + Δu[k](0),
+            // the linear cost -gamma*v*dt contributes -gamma*dt to gradient on Δu[k](0).
+            double wp = lerp_weight(config.startup_progress_weight, config.progress_weight, sp);
+            g(NU * k) -= wp * config.dt;
+
+            // Control smoothness: (u[k] - u[k-1])² matching reference R_u
+            // For k=0: smoothness against u_prev_ (matching reference R_u_prev)
+            // For k>0: smoothness against u[k-1] (matching reference R_u)
+            Vec2 u_prev_k = (k == 0) ? u_prev_ : U[k - 1];
+            Vec2 du = U[k] - u_prev_k;
+
+            // Speed smoothness (R_u[0] = acceleration_weight)
+            H(NU * k, NU * k) += 2.0 * config.acceleration_weight;
+            g(NU * k) += 2.0 * config.acceleration_weight * du(0);
+            // Steering smoothness (R_u[1] = steering_rate_weight)
+            H(NU * k + 1, NU * k + 1) += 2.0 * sr;
+            g(NU * k + 1) += 2.0 * sr * du(1);
+
+            // Cross terms for k>0: (u[k]-u[k-1])² adds coupling
+            if (k > 0) {
+                int ik = NU * k, ikm = NU * (k - 1);
+                // Speed coupling
+                H(ikm, ikm) += 2.0 * config.acceleration_weight;
+                H(ik, ikm)  -= 2.0 * config.acceleration_weight;
+                H(ikm, ik)  -= 2.0 * config.acceleration_weight;
+                g(ikm) -= 2.0 * config.acceleration_weight * du(0);
+                // Steering coupling
+                H(ikm + 1, ikm + 1) += 2.0 * sr;
+                H(ik + 1, ikm + 1)  -= 2.0 * sr;
+                H(ikm + 1, ik + 1)  -= 2.0 * sr;
+                g(ikm + 1) -= 2.0 * sr * du(1);
             }
         }
 
-        return cost;
+        // Regularize
+        H.diagonal().array() += 1e-6;
+
+        // Box constraints: v ∈ [min_v, max_v], δ ∈ [-max_steer, max_steer]
+        Eigen::VectorXd lb(n_dec), ub(n_dec);
+        for (int k = 0; k < N; k++) {
+            lb(NU * k) = config.min_velocity - U[k](0);
+            ub(NU * k) = config.max_velocity - U[k](0);
+            lb(NU * k + 1) = -config.max_steering - U[k](1);
+            ub(NU * k + 1) = config.max_steering - U[k](1);
+        }
+
+        Eigen::MatrixXd C = C_obs.topRows(ci);
+        Eigen::VectorXd d = d_obs.head(ci);
+
+        return solve_admm_qp(H, g, C, d, lb, ub);
     }
 
-    /**
-     * Compute total trajectory cost (for line search evaluation).
-     */
+    Eigen::VectorXd solve_admm_qp(
+        const Eigen::MatrixXd& H,
+        const Eigen::VectorXd& g_vec,
+        const Eigen::MatrixXd& C,
+        const Eigen::VectorXd& d,
+        const Eigen::VectorXd& lb,
+        const Eigen::VectorXd& ub)
+    {
+        int n = (int)H.rows();
+        int m = (int)C.rows();
+        int m_total = m + n;
+
+        if (m == 0) {
+            Eigen::LLT<Eigen::MatrixXd> llt(H);
+            if (llt.info() != Eigen::Success) {
+                Eigen::MatrixXd Hr = H + 1e-6 * Eigen::MatrixXd::Identity(n, n);
+                llt.compute(Hr);
+            }
+            Eigen::VectorXd x = llt.solve(-g_vec);
+            // Apply box constraints
+            for (int i = 0; i < n; i++)
+                x(i) = std::clamp(x(i), lb(i), ub(i));
+            return x;
+        }
+
+        Eigen::MatrixXd A_aug(m_total, n);
+        A_aug.topRows(m) = C;
+        A_aug.bottomRows(n) = Eigen::MatrixXd::Identity(n, n);
+
+        double rho = 1.0;
+        const int max_iter = config.max_qp_iterations * 10;
+        const double abs_tol = config.qp_tolerance;
+        const double rel_tol = 1e-3;
+
+        Eigen::VectorXd x = Eigen::VectorXd::Zero(n);
+        Eigen::VectorXd z = Eigen::VectorXd::Zero(m_total);
+        Eigen::VectorXd lambda = Eigen::VectorXd::Zero(m_total);
+
+        auto factorize = [&](double rv) -> Eigen::LLT<Eigen::MatrixXd> {
+            Eigen::MatrixXd KKT = H + rv * A_aug.transpose() * A_aug;
+            KKT.diagonal().array() += 1e-8;
+            return Eigen::LLT<Eigen::MatrixXd>(KKT);
+        };
+
+        auto llt = factorize(rho);
+
+        for (int iter = 0; iter < max_iter; iter++) {
+            Eigen::VectorXd z_prev = z;
+
+            Eigen::VectorXd rhs = -g_vec + rho * A_aug.transpose() * (z - lambda);
+            x = llt.solve(rhs);
+
+            Eigen::VectorXd Ax = A_aug * x;
+            // Project: ineq >= d, box [lb, ub]
+            z = Ax + lambda;
+            for (int i = 0; i < m; i++) z(i) = std::max(z(i), d(i));
+            for (int i = 0; i < n; i++) z(m + i) = std::clamp(z(m + i), lb(i), ub(i));
+
+            Eigen::VectorXd r = Ax - z;
+            lambda += r;
+
+            double pri = r.norm();
+            double dua = (rho * A_aug.transpose() * (z - z_prev)).norm();
+            double eps_p = abs_tol * std::sqrt(m_total) + rel_tol * std::max(Ax.norm(), z.norm());
+            double eps_d = abs_tol * std::sqrt(n) + rel_tol * (rho * A_aug.transpose() * lambda).norm();
+
+            if (pri < eps_p && dua < eps_d) break;
+
+            if (iter > 0 && iter % 10 == 0) {
+                double ratio = pri / (dua + 1e-10);
+                if (ratio > 10.0) {
+                    rho = std::min(rho * 2.0, 1e6);
+                    llt = factorize(rho);
+                    lambda *= 0.5;
+                } else if (ratio < 0.1) {
+                    rho = std::max(rho / 2.0, 1e-6);
+                    llt = factorize(rho);
+                    lambda *= 2.0;
+                }
+            }
+        }
+        return x;
+    }
+
     double compute_total_cost(
-        const std::vector<VecX>& X,
-        const std::vector<VecU>& U,
+        const std::vector<Vec3>& X,
+        const std::vector<Vec2>& U,
         const std::vector<PathRef>& path_refs,
-        const std::vector<Obstacle>& obstacles,
+        const std::vector<std::vector<ObstacleHalfspace>>& obs_hs,
         const std::vector<BoundaryConstraint>& boundaries)
     {
         int N = config.horizon;
         double total = 0.0;
+        double sp = startup_progress();
+        double wc = lerp_weight(config.startup_contour_weight, config.contour_weight, sp);
+        double wl = lerp_weight(config.startup_lag_weight, config.lag_weight, sp);
+        double wv = lerp_weight(config.startup_velocity_weight, config.velocity_weight, sp);
+        double wh = lerp_weight(config.startup_heading_weight, config.heading_weight, sp);
+        double sr = lerp_weight(config.startup_steering_rate_weight, config.steering_rate_weight, sp);
+        double curv_decay = lerp_weight(config.startup_curvature_decay, -0.4, sp);
 
         for (int k = 0; k <= N; k++) {
             PathRef ref = get_path_ref(k, path_refs, X[k]);
-            VecX g; MatXX H;
-            double weight = (k == N) ? 2.0 : 1.0;
-            total += weight * compute_state_cost_full(X[k], ref, obstacles, boundaries, k, g, H);
+            double w = (k == N) ? 2.0 : 1.0;
+            double dx = X[k](0) - ref.x, dy = X[k](1) - ref.y;
+            double e_c = -ref.sin_theta * dx + ref.cos_theta * dy;
+            double e_l =  ref.cos_theta * dx + ref.sin_theta * dy;
+            total += w * wc * e_c * e_c;
+            total += w * wl * e_l * e_l;
+
+            if (wh > 0.0) {
+                double h_err = normalize_angle(X[k](2) - std::atan2(ref.sin_theta, ref.cos_theta));
+                total += w * wh * h_err * h_err;
+            }
+
+            if (k < (int)obs_hs.size()) {
+                for (const auto& hs : obs_hs[k]) {
+                    if (!hs.active) continue;
+                    double viol = hs.b - (hs.nx * X[k](0) + hs.ny * X[k](1));
+                    if (viol > 0) total += hs.weight * viol * viol;
+                }
+            }
+            if (k < (int)boundaries.size()) {
+                const auto& bd = boundaries[k];
+                double lv = bd.nx * X[k](0) + bd.ny * X[k](1) - bd.b_left;
+                if (lv > 0) total += config.boundary_weight * lv * lv;
+                double rv = -bd.nx * X[k](0) - bd.ny * X[k](1) - bd.b_right;
+                if (rv > 0) total += config.boundary_weight * rv * rv;
+            }
         }
 
         for (int k = 0; k < N; k++) {
-            total += config.acceleration_weight * U[k](0) * U[k](0);
-            total += config.steering_rate_weight * U[k](1) * U[k](1);
-            if (k > 0) {
-                VecU du = U[k] - U[k-1];
-                total += config.jerk_weight * du.squaredNorm();
-            }
-        }
+            PathRef ref = get_path_ref(k, path_refs, X[k]);
+            double v_base = lerp_weight(0.20, config.reference_velocity, sp);
+            double v_ref = v_base * std::exp(curv_decay * std::abs(ref.curvature));
+            v_ref = std::clamp(v_ref, config.min_velocity, config.max_velocity);
+            total += wv * (U[k](0) - v_ref) * (U[k](0) - v_ref);
 
+            // Steering tracking toward zero (no feedforward) — matches reference u_ref=[v,0]
+            total += config.steering_weight * U[k](1) * U[k](1);
+
+            // Progress reward: -gamma * v[k] * dt
+            double wp = lerp_weight(config.startup_progress_weight, config.progress_weight, sp);
+            total -= wp * U[k](0) * config.dt;
+
+            Vec2 u_prev_k = (k == 0) ? u_prev_ : U[k - 1];
+            Vec2 du = U[k] - u_prev_k;
+            total += config.acceleration_weight * du(0) * du(0);
+            total += sr * du(1) * du(1);
+        }
         return total;
-    }
-
-    PathRef get_path_ref(int k, const std::vector<PathRef>& path_refs, const VecX& xk) {
-        if (k < (int)path_refs.size()) {
-            return path_refs[k];
-        } else if (!path_refs.empty()) {
-            return path_refs.back();
-        } else {
-            PathRef ref;
-            ref.x = xk(0); ref.y = xk(1);
-            ref.cos_theta = std::cos(xk(2));
-            ref.sin_theta = std::sin(xk(2));
-            ref.curvature = 0.0;
-            return ref;
-        }
-    }
-
-    /**
-     * Proper iLQR with full Hessian, feedback gains, and line search.
-     *
-     * This is the standard iLQR algorithm:
-     * 1. Backward pass: compute feedback gains K_k and feedforward k_k
-     * 2. Forward pass: roll out new trajectory with line search
-     *
-     * Returns true if converged.
-     */
-    bool solve_ilqr(
-        const VecX& x0,
-        std::vector<VecX>& X,
-        std::vector<VecU>& U,
-        const std::vector<MatXX>& As,
-        const std::vector<MatXU>& Bs,
-        const std::vector<VecX>& cs,
-        const std::vector<PathRef>& path_refs,
-        const std::vector<Obstacle>& obstacles,
-        const std::vector<BoundaryConstraint>& boundaries)
-    {
-        int N = config.horizon;
-        double mu = 1e-3;  // Regularization parameter
-
-        for (int iter = 0; iter < config.max_qp_iterations; iter++) {
-
-            // === BACKWARD PASS ===
-            // Compute value function at terminal state
-            PathRef ref_N = get_path_ref(N, path_refs, X[N]);
-            VecX lx_N; MatXX lxx_N;
-            compute_state_cost_full(X[N], ref_N, obstacles, boundaries, N, lx_N, lxx_N);
-            // Terminal cost weighted 2x
-            VecX Vx = 2.0 * lx_N;
-            MatXX Vxx = 2.0 * lxx_N;
-
-            // Storage for feedback gains and feedforward terms
-            std::vector<MatUX> Ks(N);    // Feedback gains
-            std::vector<VecU> ks(N);     // Feedforward terms
-            double expected_reduction = 0.0;
-
-            bool backward_ok = true;
-            for (int k = N - 1; k >= 0; k--) {
-                PathRef ref = get_path_ref(k, path_refs, X[k]);
-
-                // Stage cost gradient and Hessian (full)
-                VecX lx; MatXX lxx;
-                compute_state_cost_full(X[k], ref, obstacles, boundaries, k, lx, lxx);
-
-                // Control cost gradient and Hessian
-                VecU lu;
-                MatUU luu = MatUU::Zero();
-                lu(0) = 2.0 * config.acceleration_weight * U[k](0);
-                lu(1) = 2.0 * config.steering_rate_weight * U[k](1);
-                luu(0, 0) = 2.0 * config.acceleration_weight;
-                luu(1, 1) = 2.0 * config.steering_rate_weight;
-
-                // Jerk penalty
-                if (k > 0) {
-                    lu(0) += 2.0 * config.jerk_weight * (U[k](0) - U[k-1](0));
-                    lu(1) += 2.0 * config.jerk_weight * (U[k](1) - U[k-1](1));
-                }
-                luu(0, 0) += 2.0 * config.jerk_weight;
-                luu(1, 1) += 2.0 * config.jerk_weight;
-
-                // Cross-term lxu is zero for our cost function (state and control costs are separable)
-                // MatXU lxu = MatXU::Zero();
-
-                // Q-function derivatives (standard iLQR formulas)
-                VecX Qx = lx + As[k].transpose() * Vx;
-                VecU Qu = lu + Bs[k].transpose() * Vx;
-                MatXX Qxx = lxx + As[k].transpose() * Vxx * As[k];
-                MatUU Quu = luu + Bs[k].transpose() * Vxx * Bs[k];
-                MatUX Qux = Bs[k].transpose() * Vxx * As[k];
-
-                // Regularize Quu to ensure positive definiteness
-                Quu(0, 0) += mu;
-                Quu(1, 1) += mu;
-
-                // Check positive definiteness via Cholesky
-                Eigen::LLT<MatUU> llt(Quu);
-                if (llt.info() != Eigen::Success) {
-                    // Increase regularization and retry
-                    mu *= 10.0;
-                    backward_ok = false;
-                    break;
-                }
-
-                // Feedback gain: K = -Quu^{-1} * Qux
-                // Feedforward:   k = -Quu^{-1} * Qu
-                MatUU Quu_inv = llt.solve(MatUU::Identity());
-                ks[k] = -Quu_inv * Qu;
-                Ks[k] = -Quu_inv * Qux;
-
-                // Clamp feedforward to prevent huge steps
-                ks[k](0) = clamp(ks[k](0), -1.0, 1.0);
-                ks[k](1) = clamp(ks[k](1), -1.0, 1.0);
-
-                // Expected cost reduction for line search
-                expected_reduction += ks[k].transpose() * Qu;
-
-                // Update value function (standard iLQR)
-                Vx = Qx + Ks[k].transpose() * Quu * ks[k]
-                   + Ks[k].transpose() * Qu + Qux.transpose() * ks[k];
-                Vxx = Qxx + Ks[k].transpose() * Quu * Ks[k]
-                    + Ks[k].transpose() * Qux + Qux.transpose() * Ks[k];
-                // Ensure symmetry
-                Vxx = 0.5 * (Vxx + Vxx.transpose());
-            }
-
-            if (!backward_ok) {
-                // Backward pass failed - try next iteration with higher regularization
-                continue;
-            }
-
-            // Decrease regularization on successful backward pass
-            mu = std::max(mu * 0.5, 1e-6);
-
-            // === FORWARD PASS with line search ===
-            double current_cost = compute_total_cost(X, U, path_refs, obstacles, boundaries);
-
-            bool improved = false;
-            double alpha = 1.0;
-
-            for (int ls = 0; ls < 6; ls++) {
-                std::vector<VecX> X_new(N + 1);
-                std::vector<VecU> U_new(N);
-
-                X_new[0] = x0;
-                for (int k = 0; k < N; k++) {
-                    // u_new = u + alpha * k + K * (x_new - x_ref)
-                    VecX dx = X_new[k] - X[k];
-                    U_new[k] = U[k] + alpha * ks[k] + Ks[k] * dx;
-
-                    // Clamp controls
-                    U_new[k](0) = clamp(U_new[k](0),
-                        -config.max_acceleration, config.max_acceleration);
-                    U_new[k](1) = clamp(U_new[k](1),
-                        -config.max_steering_rate, config.max_steering_rate);
-
-                    // Forward simulate using linearized dynamics
-                    X_new[k + 1] = As[k] * X_new[k] + Bs[k] * U_new[k] + cs[k];
-
-                    // Clamp states
-                    X_new[k + 1](3) = clamp(X_new[k + 1](3),
-                        config.min_velocity, config.max_velocity);
-                    X_new[k + 1](4) = clamp(X_new[k + 1](4),
-                        -config.max_steering, config.max_steering);
-                }
-
-                double new_cost = compute_total_cost(X_new, U_new, path_refs, obstacles, boundaries);
-
-                if (new_cost < current_cost) {
-                    X = X_new;
-                    U = U_new;
-                    improved = true;
-                    break;
-                }
-
-                alpha *= 0.5;  // Backtracking
-            }
-
-            if (!improved) {
-                // No improvement found - accept current trajectory
-                // Try with smaller step next outer SQP iteration
-                break;
-            }
-
-            // Check convergence
-            double max_du = 0.0;
-            for (int k = 0; k < N; k++) {
-                max_du = std::max(max_du, ks[k].squaredNorm());
-            }
-            if (max_du < config.qp_tolerance) {
-                return true;  // Converged
-            }
-        }
-
-        return false;
     }
 };
 
@@ -772,6 +965,7 @@ struct MPCCPathPoint {
 
 struct MPCCObstacle {
     double x, y, radius;
+    double vx, vy;
 };
 
 struct MPCCBoundary {
@@ -794,8 +988,8 @@ void mpcc_reset(void* solver);
 
 int mpcc_solve(
     void* solver,
-    const double* state,          // [x, y, theta, v, delta]
-    const MPCCPathPoint* path,    // array of path references
+    const double* state,
+    const MPCCPathPoint* path,
     int n_path,
     const MPCCObstacle* obstacles,
     int n_obstacles,

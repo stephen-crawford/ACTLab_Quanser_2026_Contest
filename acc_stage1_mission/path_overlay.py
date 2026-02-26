@@ -139,7 +139,7 @@ def map_to_qlabs(map_x, map_y):
 
 def map_yaw_to_qlabs_yaw(map_yaw):
     """Transform a heading from map frame to QLabs frame."""
-    return map_yaw + ORIGIN_HEADING_RAD
+    return map_yaw - ORIGIN_HEADING_RAD
 
 
 class PathOverlayNode(Node):
@@ -164,10 +164,17 @@ class PathOverlayNode(Node):
         # Mission leg info
         self.mission_status = ""
 
-        # Subscribe to /plan with transient local QoS to get latched path
+        # TF diagnostics
+        self._has_tf = False
+        self._tf_fail_count = 0
+
+        # Subscribe to /plan with volatile durability (NOT transient_local).
+        # transient_local causes QoS DURABILITY incompatibility with Nav2's
+        # planner which also publishes on /plan with volatile durability.
+        # Mission manager republishes every 2s, so latching isn't needed.
         plan_qos = QoSProfile(
             depth=10,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
             reliability=ReliabilityPolicy.RELIABLE,
         )
         self.create_subscription(Path, '/plan', self._plan_callback, plan_qos)
@@ -189,16 +196,66 @@ class PathOverlayNode(Node):
         """Receive planned path from mission manager and convert to QLabs."""
         xs = []
         ys = []
+        # Also collect raw map-frame coords for validation
+        map_xs = []
+        map_ys = []
         for pose in msg.poses:
             mx = pose.pose.position.x
             my = pose.pose.position.y
+            map_xs.append(mx)
+            map_ys.append(my)
             qx, qy = map_to_qlabs(mx, my)
             xs.append(qx)
             ys.append(qy)
         self.planned_path_x = xs
         self.planned_path_y = ys
+
+        if not xs:
+            return
+
+        # Diagnostic: bounding box in QLabs frame
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        span_x = x_max - x_min
+        span_y = y_max - y_min
+
+        # Diagnostic: bounding box in map frame
+        mx_min, mx_max = min(map_xs), max(map_xs)
+        my_min, my_max = min(map_ys), max(map_ys)
+        map_span_x = mx_max - mx_min
+        map_span_y = my_max - my_min
+
+        # Check for large jumps
+        max_step = 0.0
+        n_jumps = 0
+        for i in range(1, len(xs)):
+            step = math.hypot(xs[i] - xs[i-1], ys[i] - ys[i-1])
+            if step > max_step:
+                max_step = step
+            if step > 0.1:
+                n_jumps += 1
+
         self.get_logger().info(
-            "Received planned path: %d poses" % len(msg.poses))
+            "Path: %d poses, qlabs_bbox=(%.2f..%.2f, %.2f..%.2f), "
+            "map_bbox=(%.2f..%.2f, %.2f..%.2f), max_step=%.3fm, jumps=%d" % (
+                len(msg.poses), x_min, x_max, y_min, y_max,
+                mx_min, mx_max, my_min, my_max, max_step, n_jumps))
+
+        # Detect common coordinate transform bugs
+        # Track spans 3.5m x 6m in QLabs. A correct path should not span
+        # much more than that. If it does, the C++ qlabs_to_map transform
+        # is likely using the wrong rotation direction.
+        if span_x > 5.0 or span_y > 8.0:
+            self.get_logger().error(
+                "PATH TRANSFORM ERROR: QLabs bbox spans %.1f x %.1fm "
+                "(expected <3.5 x 6m). The C++ mission_manager likely needs "
+                "to be REBUILT: colcon build --packages-select "
+                "acc_mpcc_controller_cpp" % (span_x, span_y))
+        if map_span_x > 8.0 or map_span_y > 10.0:
+            self.get_logger().error(
+                "MAP FRAME PATH ERROR: spans %.1f x %.1fm. Check "
+                "coordinate_transform.h qlabs_to_map uses R(+theta), "
+                "not R(-theta)" % (map_span_x, map_span_y))
 
     def _status_callback(self, msg: String):
         self.mission_status = msg.data
@@ -216,6 +273,13 @@ class PathOverlayNode(Node):
                 2.0 * (q.w * q.z + q.x * q.y),
                 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
+            if not self._has_tf:
+                self._has_tf = True
+                self.get_logger().info(
+                    "First TF received: map(%.3f, %.3f) -> qlabs(%.3f, %.3f)" % (
+                        mx, my, *map_to_qlabs(mx, my)))
+                self._tf_fail_count = 0
+
             qx, qy = map_to_qlabs(mx, my)
             self.vehicle_x = qx
             self.vehicle_y = qy
@@ -229,7 +293,13 @@ class PathOverlayNode(Node):
                 self.trail_x.append(qx)
                 self.trail_y.append(qy)
         except TransformException:
-            pass
+            self._tf_fail_count += 1
+            # Log every 5 seconds (50 ticks at 10Hz) so the user knows TF is down
+            if self._tf_fail_count % 50 == 1:
+                self.get_logger().warn(
+                    "TF map->base_link unavailable (%d consecutive failures). "
+                    "Vehicle position frozen. Is SLAM running?" %
+                    self._tf_fail_count)
 
 
 def load_road_boundaries():
@@ -518,7 +588,9 @@ def main():
         lines = []
         if node.mission_status:
             lines.append("Mission: %s" % node.mission_status)
-        if node.vehicle_x is not None:
+        if not node._has_tf:
+            lines.append("TF: WAITING (no map->base_link)")
+        elif node.vehicle_x is not None:
             lines.append("Vehicle: (%.3f, %.3f)" % (
                 node.vehicle_x, node.vehicle_y))
             if node.vehicle_yaw is not None:

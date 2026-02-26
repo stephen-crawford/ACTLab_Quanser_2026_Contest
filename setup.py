@@ -20,9 +20,6 @@ setup(
             'config/presets/legacy_2025.yaml',
         ]),
         ('share/' + package_name + '/launch', [
-            'launch/mission_launch.py',
-            'launch/mission_with_detection_launch.py',
-            'launch/full_mission_launch.py',
             'launch/mpcc_mission_launch.py',
         ]),
         ('share/' + package_name + '/scripts', [
@@ -46,12 +43,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'mission_manager = acc_stage1_mission.mission_manager:main',
             'pose_logger = acc_stage1_mission.pose_logger:main',
-            'obstacle_detector = acc_stage1_mission.obstacle_detector:main',
             'yolo_bridge = acc_stage1_mission.yolo_bridge:main',
-            'mpcc_controller = acc_stage1_mission.mpcc_controller:main',
-            'odom_from_tf = acc_stage1_mission.odom_from_tf:main',
             'dashboard = acc_stage1_mission.dashboard:main',
             'path_overlay = acc_stage1_mission.path_overlay:main',
             'capture_data = training.capture_data:main',

@@ -15,7 +15,7 @@ All nodes are C++. No Python fallbacks.
 Usage:
     ros2 launch acc_stage1_mission mpcc_mission_launch.py
     ros2 launch acc_stage1_mission mpcc_mission_launch.py reference_velocity:=0.40
-    ros2 launch acc_stage1_mission mpcc_mission_launch.py boundary_weight:=40.0
+    ros2 launch acc_stage1_mission mpcc_mission_launch.py horizon:=15
 """
 
 from launch import LaunchDescription
@@ -27,35 +27,35 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
 
-    # Launch arguments - aligned with reference (PolyCtrl 2025)
+    # Launch arguments — tuned via full-mission simulation (Feb 2026)
     reference_velocity_arg = DeclareLaunchArgument(
         'reference_velocity',
-        default_value='0.65',
-        description='Target velocity (m/s) - ref uses 0.70'
+        default_value='0.45',
+        description='Target velocity (m/s) - lower for tighter tracking'
     )
 
     contour_weight_arg = DeclareLaunchArgument(
         'contour_weight',
-        default_value='8.0',
-        description='Weight for path contouring (lateral) error - lane keeping'
+        default_value='20.0',
+        description='Weight for path contouring (lateral) error - tighter lane keeping'
     )
 
     lag_weight_arg = DeclareLaunchArgument(
         'lag_weight',
-        default_value='12.0',
-        description='Weight for lag (progress) error - prioritize forward motion'
+        default_value='10.0',
+        description='Weight for lag (progress) error'
     )
 
     horizon_arg = DeclareLaunchArgument(
         'horizon',
-        default_value='20',
-        description='MPC prediction horizon (steps)'
+        default_value='10',
+        description='MPC prediction horizon (steps) - match reference (PolyCtrl 2025 K=10)'
     )
 
     boundary_weight_arg = DeclareLaunchArgument(
         'boundary_weight',
-        default_value='20.0',
-        description='Road boundary constraint penalty weight'
+        default_value='0.0',
+        description='Road boundary constraint penalty weight (ref has 0; disabled to avoid fighting contour cost on curves)'
     )
 
     use_direct_motor_arg = DeclareLaunchArgument(
@@ -66,8 +66,8 @@ def generate_launch_description():
 
     use_state_estimator_arg = DeclareLaunchArgument(
         'use_state_estimator',
-        default_value='true',
-        description='Use EKF state estimator (fuses TF + encoder + odom)'
+        default_value='false',
+        description='Use EKF state estimator (fuses TF + encoder + odom). Disabled: adds velocity lag not in reference.'
     )
 
     use_dashboard_arg = DeclareLaunchArgument(
@@ -87,6 +87,9 @@ def generate_launch_description():
     # =========================================================================
 
     # Odom From TF Node (C++)
+    # broadcast_tf=false: Cartographer already publishes map→odom→base_link TF.
+    # odom_from_tf only converts TF to /odom messages; it must NOT re-broadcast
+    # TF or it conflicts with Cartographer and creates disconnected TF trees.
     odom_from_tf_node = Node(
         package='acc_mpcc_controller_cpp',
         executable='odom_from_tf_node',
@@ -96,6 +99,7 @@ def generate_launch_description():
             'odom_frame': 'odom',
             'base_frame': 'base_link',
             'publish_rate': 50.0,
+            'broadcast_tf': False,
         }]
     )
 

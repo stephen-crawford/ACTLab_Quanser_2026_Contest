@@ -287,6 +287,16 @@ private:
         // Predict
         ekf_.predict(dt);
 
+        // Don't publish until we've received at least one TF update.
+        // Publishing (0,0,0) before TF is available causes the MPCC controller
+        // to think the car is at the origin, far from the actual path.
+        if (!has_tf_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "Waiting for first TF (map->base_link) before publishing state. "
+                "Is SLAM running?");
+            return;
+        }
+
         // Periodic state summary
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
             "EKF state: pos=(%.3f,%.3f) v=%.3f omega=%.3f cov_diag=(%.4f,%.4f,%.4f)",

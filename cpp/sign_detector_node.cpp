@@ -25,6 +25,10 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2/utils.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include <opencv2/opencv.hpp>
 #include <cv_bridge/cv_bridge.h>
@@ -41,9 +45,10 @@
 // ============================================================================
 struct DetectorConfig {
     // HSV ranges for red (two ranges needed since red wraps around H=0/180)
-    cv::Scalar red_lower1{0, 100, 80};
+    // S≥120 rejects antialiased white-on-blue edges (roundabout sign arrows)
+    cv::Scalar red_lower1{0, 120, 80};
     cv::Scalar red_upper1{10, 255, 255};
-    cv::Scalar red_lower2{170, 100, 80};
+    cv::Scalar red_lower2{170, 120, 80};
     cv::Scalar red_upper2{180, 255, 255};
 
     // HSV ranges for green traffic light
@@ -123,6 +128,20 @@ struct Detection {
     double distance = 0.0;
 };
 
+// Tracked object: once classified with ≥90% confidence, class is locked
+struct TrackedObject {
+    SignType locked_type = SignType::NONE;
+    double best_confidence = 0.0;
+    int bbox_center_x = 0;
+    int bbox_center_y = 0;
+    double last_seen_time = 0.0;
+    bool is_locked = false;  // True once confidence ≥ lock threshold
+
+    static constexpr double CONFIDENCE_LOCK_THRESHOLD = 0.90;
+    static constexpr double EXPIRY_S = 5.0;  // Forget after 5s unseen
+    static constexpr int SPATIAL_MATCH_PX = 60;  // Pixel distance to consider same object
+};
+
 // ============================================================================
 // Sign Detector Node
 // ============================================================================
@@ -142,6 +161,10 @@ public:
             "/camera/color_image", rclcpp::SensorDataQoS(),
             std::bind(&SignDetectorNode::image_callback, this,
                       std::placeholders::_1));
+
+        // TF listener for computing obstacle positions in map frame
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         // Periodic publisher for traffic state (even when no detections)
         publish_timer_ = this->create_wall_timer(
@@ -173,6 +196,9 @@ private:
         cv::Mat& frame = cv_ptr->image;
         if (frame.empty()) return;
 
+        // Store image dimensions for bearing computation
+        image_width_ = frame.cols;
+
         // Mask out bottom of image (vehicle hood)
         int mask_rows = static_cast<int>(frame.rows * cfg_.mask_bottom_fraction);
         if (mask_rows > 0) {
@@ -191,9 +217,81 @@ private:
         detect_orange_cones(hsv, frame, detections);
         detect_yield_signs(hsv, frame, detections);
 
-        // Process detections through state machine
+        // Apply class persistence: lock high-confidence detections
         std::lock_guard<std::mutex> lock(state_mutex_);
+        apply_class_persistence(detections);
+
+        // Process detections through state machine
         process_detections(detections);
+    }
+
+    // ---- Detection class persistence ----
+    // Once an object reaches ≥90% confidence as one class, its class is locked
+    // and subsequent detections at that spatial location cannot reclassify it.
+    void apply_class_persistence(std::vector<Detection>& detections) {
+        double now = this->now().seconds();
+
+        // Expire old tracked objects
+        tracked_objects_.erase(
+            std::remove_if(tracked_objects_.begin(), tracked_objects_.end(),
+                [now](const TrackedObject& t) {
+                    return (now - t.last_seen_time) > TrackedObject::EXPIRY_S;
+                }),
+            tracked_objects_.end());
+
+        for (auto& det : detections) {
+            if (det.type == SignType::NONE) continue;
+
+            int cx = det.bbox.x + det.bbox.width / 2;
+            int cy = det.bbox.y + det.bbox.height / 2;
+
+            // Find matching tracked object
+            TrackedObject* match = nullptr;
+            for (auto& tracked : tracked_objects_) {
+                int dx = cx - tracked.bbox_center_x;
+                int dy = cy - tracked.bbox_center_y;
+                if (dx * dx + dy * dy <
+                    TrackedObject::SPATIAL_MATCH_PX * TrackedObject::SPATIAL_MATCH_PX) {
+                    match = &tracked;
+                    break;
+                }
+            }
+
+            if (match) {
+                match->last_seen_time = now;
+                // Update position (objects move in frame as vehicle approaches)
+                match->bbox_center_x = cx;
+                match->bbox_center_y = cy;
+
+                if (match->is_locked) {
+                    // Class is locked — override detection to locked type
+                    if (det.type != match->locked_type) {
+                        det.type = match->locked_type;
+                    }
+                } else {
+                    // Not yet locked — update if this detection has higher confidence
+                    if (det.confidence > match->best_confidence) {
+                        match->best_confidence = det.confidence;
+                        match->locked_type = det.type;
+                    }
+                    // Check if we should lock
+                    if (match->best_confidence >= TrackedObject::CONFIDENCE_LOCK_THRESHOLD) {
+                        match->is_locked = true;
+                        det.type = match->locked_type;
+                    }
+                }
+            } else {
+                // New object — start tracking
+                TrackedObject t;
+                t.locked_type = det.type;
+                t.best_confidence = det.confidence;
+                t.bbox_center_x = cx;
+                t.bbox_center_y = cy;
+                t.last_seen_time = now;
+                t.is_locked = det.confidence >= TrackedObject::CONFIDENCE_LOCK_THRESHOLD;
+                tracked_objects_.push_back(t);
+            }
+        }
     }
 
     // ---- Red object detection (stop signs + red lights) ----
@@ -222,6 +320,18 @@ private:
 
             cv::Rect bbox = cv::boundingRect(cnt);
 
+            // Reject if dominant color in bounding box region is blue (roundabout sign).
+            // Blue roundabout signs have white arrows whose antialiased edges can
+            // leak into the red HSV range. Check the original HSV for blue content.
+            {
+                cv::Mat roi_hsv = hsv(bbox);
+                cv::Mat blue_in_roi;
+                cv::inRange(roi_hsv, cv::Scalar(90, 80, 80), cv::Scalar(140, 255, 255), blue_in_roi);
+                double blue_ratio = cv::countNonZero(blue_in_roi) /
+                                    static_cast<double>(bbox.area());
+                if (blue_ratio > 0.15) continue;  // Skip — likely a blue roundabout sign
+            }
+
             // Approximate polygon
             std::vector<cv::Point> approx;
             double peri = cv::arcLength(cnt, true);
@@ -241,8 +351,14 @@ private:
             if (vertices >= cfg_.stop_sign_min_vertices &&
                 vertices <= cfg_.stop_sign_max_vertices &&
                 circularity > 0.5 && aspect > 0.7 && aspect < 1.4) {
+                // Reject if significant yellow content — yield sign red border, not a stop sign
+                cv::Mat roi_hsv = hsv(bbox);
+                cv::Mat yellow_in_roi;
+                cv::inRange(roi_hsv, cfg_.yellow_lower, cfg_.yellow_upper, yellow_in_roi);
+                double yellow_ratio = cv::countNonZero(yellow_in_roi) /
+                                      static_cast<double>(bbox.area());
+                if (yellow_ratio > 0.15) continue;
                 // Octagonal/polygonal, roughly circular and square -> stop sign
-                // Stop signs have near-1.0 aspect ratio (square-ish)
                 det.type = SignType::STOP_SIGN;
                 det.distance = estimate_distance(bbox.width, cfg_.stop_sign_real_width);
                 det.confidence = std::min(1.0, area / 2000.0);
@@ -648,8 +764,14 @@ private:
             if (cone_detect_frames_ >= cfg_.detection_threshold) {
                 cone_blocking = true;
             }
+            // Store cone info for obstacle position publishing
+            cone_detected_ = true;
+            cone_distance_ = best_cone.distance;
+            cone_bbox_center_x_ = best_cone.bbox.x + best_cone.bbox.width / 2.0;
+            cone_image_width_ = image_width_;
         } else {
             cone_detect_frames_ = 0;
+            cone_detected_ = false;
         }
 
         // --- Final output ---
@@ -696,6 +818,60 @@ private:
         auto motion_msg = std_msgs::msg::Bool();
         motion_msg.data = motion_enabled_;
         motion_pub_->publish(motion_msg);
+
+        // Publish obstacle positions in map frame (for MPCC solver avoidance)
+        publish_obstacle_positions();
+    }
+
+    /**
+     * Compute cone/pedestrian position in map frame and publish to /obstacle_positions.
+     * Uses TF (map → base_link) + camera bearing angle + estimated distance.
+     */
+    void publish_obstacle_positions() {
+        if (!cone_detected_ || cone_distance_ <= 0.01) {
+            // No cone detected — publish empty obstacles
+            auto msg = std_msgs::msg::String();
+            msg.data = "{\"obstacles\": []}";
+            obstacle_pub_->publish(msg);
+            return;
+        }
+
+        // Get vehicle pose from TF
+        geometry_msgs::msg::TransformStamped tf;
+        try {
+            tf = tf_buffer_->lookupTransform("map", "base_link",
+                                              tf2::TimePointZero,
+                                              tf2::durationFromSec(0.05));
+        } catch (const tf2::TransformException&) {
+            return;  // No TF available — skip this cycle
+        }
+
+        double veh_x = tf.transform.translation.x;
+        double veh_y = tf.transform.translation.y;
+        double veh_theta = tf2::getYaw(tf.transform.rotation);
+
+        // Bearing angle from camera center
+        double image_center = cone_image_width_ / 2.0;
+        double bearing = std::atan2(image_center - cone_bbox_center_x_,
+                                     cfg_.focal_length_px);
+
+        // Position in vehicle frame (forward = +x, left = +y)
+        double fwd = cone_distance_ * std::cos(bearing);
+        double left = cone_distance_ * std::sin(bearing);
+
+        // Transform to map frame
+        double obs_x = veh_x + fwd * std::cos(veh_theta) - left * std::sin(veh_theta);
+        double obs_y = veh_y + fwd * std::sin(veh_theta) + left * std::cos(veh_theta);
+
+        // Publish with obstacle radius (0.10m for cone/pedestrian in QLabs)
+        double radius = 0.10;
+        auto msg = std_msgs::msg::String();
+        std::ostringstream obs_json;
+        obs_json << "{\"obstacles\": [{\"x\": " << obs_x
+                 << ", \"y\": " << obs_y
+                 << ", \"radius\": " << radius << "}]}";
+        msg.data = obs_json.str();
+        obstacle_pub_->publish(msg);
     }
 
     // ---- Configuration ----
@@ -707,6 +883,8 @@ private:
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr obstacle_pub_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
     rclcpp::TimerBase::SharedPtr publish_timer_;
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
     std::mutex state_mutex_;
 
@@ -741,8 +919,16 @@ private:
     // (matches reference code behavior; see yield logic comment in process_detections)
     int yield_detect_frames_ = 0;
 
+    // Detection class persistence: tracked objects with confidence locking
+    std::vector<TrackedObject> tracked_objects_;
+
     // Cone state
     int cone_detect_frames_ = 0;
+    bool cone_detected_ = false;         // Cone visible in current frame
+    double cone_distance_ = 0.0;         // Estimated distance (m)
+    double cone_bbox_center_x_ = 0.0;    // Bbox center x in image pixels
+    int cone_image_width_ = 640;         // Image width for bearing computation
+    int image_width_ = 640;              // Stored from last frame
 
     // Clear hysteresis
     int clear_frames_ = 0;

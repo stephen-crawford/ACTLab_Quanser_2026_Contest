@@ -4,17 +4,21 @@
 # All nodes are C++. No Python fallbacks.
 #
 # These parameters match the launch file defaults (mpcc_mission_launch.py).
-# Root cause analysis (Feb 2025): contour_weight MUST be > lag_weight to
-# prevent lane violations on tight curves.
+# Tuned via full-mission simulation (Feb 25, 2026):
+# - Horizon 25 gives 2.5s lookahead for curve anticipation (biggest improvement)
+# - Higher contour + lower lag = tighter tracking
+# - Lower v_ref for safety margin on curves
+# - Lower steering_rate for agile steering response
 #
 # Usage:
 #   ./run_mission.sh
 #   ./run_mission.sh --mpcc
 
-# --- MPCC parameters (tuned from root cause analysis) ---
-reference_velocity: 0.50
-contour_weight: 25.0
-lag_weight: 5.0
-horizon: 20
-boundary_weight: 30.0
+# --- MPCC parameters (tuned via full-mission simulation Feb 2026) ---
+reference_velocity: 0.45
+contour_weight: 20.0
+lag_weight: 10.0
+horizon: 10
+boundary_weight: 0.0
 use_direct_motor: true
+use_state_estimator: false

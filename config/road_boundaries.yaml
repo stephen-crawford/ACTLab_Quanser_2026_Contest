@@ -86,6 +86,46 @@ road_segments:
       - {s: 1.0, x: -0.7, y: 0.9, width_left: 0.30, width_right: 0.30}
       - {s: 1.5, x: -0.905, y: 0.800, width_left: 0.30, width_right: 0.30}
 
+  # West road: top straight (Pickup heading west toward top-left curve)
+  # Path follows nodes 20→22 along y≈4.50
+  - name: "west_road_top"
+    centerline:
+      - {s: 0.0, x: 0.0, y: 4.50, width_left: 0.30, width_right: 0.30}
+      - {s: 0.5, x: -0.5, y: 4.50, width_left: 0.30, width_right: 0.30}
+      - {s: 1.0, x: -1.0, y: 4.50, width_left: 0.30, width_right: 0.30}
+      - {s: 1.3, x: -1.30, y: 4.50, width_left: 0.30, width_right: 0.30}
+
+  # West road: top-left curve (90° arc curving south)
+  - name: "top_left_curve"
+    type: "circular"
+    center: {x: -1.30, y: 3.82}
+    radius: 0.68
+    width: 0.30
+
+  # West road: south straight (heading south along x≈-1.98)
+  # width_left is narrower (wall side)
+  - name: "west_road_south"
+    centerline:
+      - {s: 0.0, x: -1.98, y: 3.82, width_left: 0.25, width_right: 0.30}
+      - {s: 0.5, x: -1.98, y: 3.30, width_left: 0.25, width_right: 0.30}
+      - {s: 1.0, x: -1.98, y: 2.78, width_left: 0.25, width_right: 0.30}
+      - {s: 1.5, x: -1.98, y: 2.30, width_left: 0.25, width_right: 0.30}
+      - {s: 2.1, x: -1.98, y: 1.72, width_left: 0.25, width_right: 0.30}
+
+  # West road: bottom-left curve (90° arc curving east)
+  - name: "bottom_left_curve"
+    type: "circular"
+    center: {x: -1.09, y: 1.72}
+    radius: 0.89
+    width: 0.30
+
+  # West road: east straight toward dropoff (along y≈0.83)
+  - name: "west_road_to_dropoff"
+    centerline:
+      - {s: 0.0, x: -1.09, y: 0.83, width_left: 0.30, width_right: 0.30}
+      - {s: 0.2, x: -0.90, y: 0.83, width_left: 0.30, width_right: 0.30}
+      - {s: 0.34, x: -0.75, y: 0.83, width_left: 0.30, width_right: 0.30}
+
   # Road from dropoff back to hub
   - name: "road_to_hub"
     centerline:
@@ -154,6 +194,13 @@ obstacle_zones:
     type: "circle"
     center: {x: 0.15, y: 0.9}
     radius: 0.6
+    max_velocity: 0.3
+
+  # West road cone obstacle
+  - name: "west_road_cone"
+    type: "circle"
+    center: {x: -1.977, y: 2.784}
+    radius: 0.4
     max_velocity: 0.3
 
   # Hub area - watch for pedestrians/other vehicles
