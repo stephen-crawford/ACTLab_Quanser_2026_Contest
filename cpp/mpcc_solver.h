@@ -32,7 +32,7 @@ struct Config {
     double wheelbase = 0.256;
     double max_velocity = 1.2;
     double min_velocity = 0.0;
-    double max_steering = M_PI / 6.0;  // ±30° — matches reference (PolyCtrl 2025)
+    double max_steering = 0.45;  // ±25.8° — hardware servo limit (ref uses π/6=30° but hardware clips at 0.45)
 
     // Legacy rate limits (used only by AckermannModel for simulation tests)
     double max_acceleration = 1.5;

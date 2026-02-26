@@ -107,7 +107,7 @@ mpcc::Config make_deployment_config() {
     cfg.wheelbase = 0.256;
     cfg.max_velocity = 1.2;
     cfg.min_velocity = 0.0;
-    cfg.max_steering = M_PI / 6.0;  // ±30° — matches reference (PolyCtrl 2025)
+    cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.45;
@@ -159,10 +159,10 @@ void align_path_to_vehicle_heading(
 
     // Scale blend distance with heading error — larger errors need longer arcs
     // to avoid extreme curvature in the Hermite transition
-    double base_blend = 0.35;
-    double err_scale = std::abs(heading_err) / (M_PI / 2.0);  // 1.0 at 90°
-    double blend_dist = base_blend + 0.35 * std::min(err_scale, 2.0);
-    blend_dist = std::min(blend_dist, 1.0);  // cap at 1.0m
+    double base_blend = 0.50;
+    double err_scale = std::abs(heading_err) / (M_PI / 6.0);  // 1.0 at 30°
+    double blend_dist = base_blend + 1.0 * std::min(err_scale, 2.0);
+    blend_dist = std::min(blend_dist, 2.5);  // cover full solver horizon
 
     double cum = 0.0;
     int rejoin_idx = 1;
@@ -193,8 +193,8 @@ void align_path_to_vehicle_heading(
     double p1x = rx, p1y = ry;
     double m1x = rtx * tang_scale, m1y = rty * tang_scale;
 
-    double ds = 0.01;
-    int n_pts = std::max(static_cast<int>(chord / ds), 5);
+    double ds = 0.001;
+    int n_pts = std::max(static_cast<int>(chord / ds), 10);
     std::vector<double> new_x, new_y;
     new_x.reserve(n_pts + mx.size());
     new_y.reserve(n_pts + mx.size());

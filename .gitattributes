@@ -1,0 +1,7 @@
+# Fix GitHub language stats — exclude non-runtime scripts from linguist
+scripts/** linguist-vendored
+training/** linguist-vendored
+test_scspath_replication.py linguist-vendored
+cpp/test_build/plot_*.py linguist-vendored
+cpp/test_build/test_*.cpp linguist-vendored
+docs/** linguist-documentation

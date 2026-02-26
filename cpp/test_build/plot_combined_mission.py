@@ -161,7 +161,7 @@ def main():
     ax_steer = fig.add_subplot(gs[1, 1])
     ax_steer.set_title('Steering Angle')
     ax_steer.plot(t, delta, 'm-', linewidth=0.8)
-    max_steer_deg = 30.0
+    max_steer_deg = 0.45 * 180.0 / math.pi  # 25.8°
     ax_steer.axhline(y=max_steer_deg, color='red', linestyle=':', alpha=0.5)
     ax_steer.axhline(y=-max_steer_deg, color='red', linestyle=':', alpha=0.5)
     ax_steer.set_xlabel('Time (s)')

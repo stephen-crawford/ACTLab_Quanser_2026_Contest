@@ -645,7 +645,7 @@ void test_heading_cost_zero_weight_disables() {
 
     auto path_refs = make_straight_path_x(cfg.horizon);
     mpcc::VecX x0;
-    x0 << 0.0, 0.0, 0.5, 0.3, 0.0;
+    x0 << 0.0, 0.0, 0.3, 0.3, 0.0;  // 0.3 rad (17°) — within hardware servo limit
 
     auto result_no_heading = solver.solve(x0, path_refs, 0.0, 5.0, {}, {});
     solver.reset();
@@ -955,7 +955,7 @@ void test_stuck_detection_triggers() {
     // Simulate the stuck detection logic from mpcc_controller_node.cpp
     double stuck_timer = 0.0;
     double current_progress = 5.0;
-    double max_steering = M_PI / 6.0;  // ±30° matches reference
+    double max_steering = 0.45;  // hardware servo limit
     bool reset_triggered = false;
 
     // 65 iterations at 20Hz = 3.25s of saturated steering with no progress
@@ -1000,7 +1000,7 @@ void test_stuck_progress_resets_timer() {
 void test_stuck_no_trigger_without_saturation() {
     TEST("stuck: non-saturated steering does not trigger stuck");
     double stuck_timer = 0.0;
-    double max_steering = M_PI / 6.0;  // ±30° matches reference
+    double max_steering = 0.45;  // hardware servo limit
 
     // 80 iterations with moderate steering and no progress
     for (int i = 0; i < 80; i++) {

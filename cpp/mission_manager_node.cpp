@@ -752,11 +752,16 @@ private:
         // Find the rejoin point: the first path point that is >= blend_dist
         // along the path from the start.
         // Scale blend distance with heading error — larger errors need longer arcs
-        // to avoid extreme curvature in the Hermite transition
-        double base_blend = 0.35;
-        double err_scale = std::abs(heading_err) / (M_PI / 2.0);  // 1.0 at 90°
-        double blend_dist = base_blend + 0.35 * std::min(err_scale, 2.0);
-        blend_dist = std::min(blend_dist, 1.0);  // cap at 1.0m
+        // to avoid extreme curvature in the Hermite transition.
+        // IMPORTANT: blend must cover the MPCC solver's full horizon distance so
+        // the solver only sees the blended heading transition, never the raw path
+        // heading. At startup (v≈0.2, horizon=10, dt=0.1), the solver's effective
+        // lookahead is ~0.5m. With v_ref=0.45 after ramp-up, it reaches ~1.0m.
+        // Use at least 1.5m for large heading errors to provide safety margin.
+        double base_blend = 0.50;
+        double err_scale = std::abs(heading_err) / (M_PI / 6.0);  // 1.0 at 30°
+        double blend_dist = base_blend + 1.0 * std::min(err_scale, 2.0);
+        blend_dist = std::min(blend_dist, 2.5);  // cap at 2.5m
         double cum = 0.0;
         int rejoin_idx = 1;
         for (size_t i = 1; i < mx.size(); i++) {
@@ -788,9 +793,9 @@ private:
         double p1x = rx, p1y = ry;
         double m1x = rtx * tang_scale, m1y = rty * tang_scale;
 
-        // Generate Hermite points at ds=0.01 spacing
-        double ds = 0.01;
-        int n_pts = std::max(static_cast<int>(chord / ds), 5);
+        // Generate Hermite points at ds=0.001 spacing (matching path waypoint density)
+        double ds = 0.001;
+        int n_pts = std::max(static_cast<int>(chord / ds), 10);
         std::vector<double> new_x, new_y;
         new_x.reserve(n_pts + mx.size());
         new_y.reserve(n_pts + mx.size());

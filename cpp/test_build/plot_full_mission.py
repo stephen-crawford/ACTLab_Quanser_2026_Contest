@@ -303,7 +303,7 @@ def generate_diagnostics(data, output_path):
     ax = axes[0, 1]
     ax.plot(elapsed, data['v_meas'], 'g-', linewidth=0.8, label='v_meas')
     ax.plot(elapsed, data['v_cmd'], 'b--', linewidth=0.6, alpha=0.6, label='v_cmd')
-    ax.axhline(0.65, color='blue', linestyle=':', alpha=0.3, label='v_ref')
+    ax.axhline(0.45, color='blue', linestyle=':', alpha=0.3, label='v_ref')
     ax.set_xlabel('Time (s)')
     ax.set_ylabel('Velocity (m/s)')
     ax.set_title(f'Speed (avg={np.mean(data["v_meas"]):.2f} m/s)')
@@ -314,8 +314,9 @@ def generate_diagnostics(data, output_path):
     ax = axes[1, 0]
     delta_deg = data['delta_cmd'] * 180 / np.pi
     ax.plot(elapsed, delta_deg, 'm-', linewidth=0.8)
-    ax.axhline(30, color='red', linestyle='--', alpha=0.3)
-    ax.axhline(-30, color='red', linestyle='--', alpha=0.3)
+    max_steer = 0.45 * 180 / np.pi  # 25.8°
+    ax.axhline(max_steer, color='red', linestyle='--', alpha=0.3)
+    ax.axhline(-max_steer, color='red', linestyle='--', alpha=0.3)
     ax.set_xlabel('Time (s)')
     ax.set_ylabel('Steering (deg)')
     ax.set_title('Steering Angle')

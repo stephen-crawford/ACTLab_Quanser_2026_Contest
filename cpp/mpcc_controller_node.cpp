@@ -225,7 +225,7 @@ public:
         cfg.wheelbase = 0.256;
         cfg.max_velocity = 1.2;   // Raised (ref uses 2.0; qcar2_hardware PD handles speed)
         cfg.min_velocity = 0.0;   // Reference uses u_min=[0.0, ...]
-        cfg.max_steering = M_PI / 6.0;  // ±30° — matches reference (PolyCtrl 2025)
+        cfg.max_steering = 0.45;  // ±25.8° — hardware servo limit (ref uses π/6=30° but servo clips at 0.45)
         cfg.max_acceleration = 1.5;   // Reference has no explicit limit; allow fast response
         cfg.max_steering_rate = 1.5;  // Reference has no explicit limit; allow fast steering
         cfg.reference_velocity = this->get_parameter("reference_velocity").as_double();

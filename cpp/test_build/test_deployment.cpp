@@ -155,7 +155,7 @@ DeploymentResult run_deployment_sim(
     cfg.wheelbase = 0.256;
     cfg.max_velocity = 1.2;
     cfg.min_velocity = 0.0;
-    cfg.max_steering = M_PI / 6.0;
+    cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.45;
@@ -727,7 +727,7 @@ DeploymentResult run_arbitrary_path_sim(
     cfg.wheelbase = 0.256;
     cfg.max_velocity = 1.2;
     cfg.min_velocity = 0.0;
-    cfg.max_steering = M_PI / 6.0;
+    cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.65;
@@ -1060,7 +1060,7 @@ void test_velocity_robustness() {
         mpcc::Config cfg;
         cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
         cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
-        cfg.max_steering = M_PI / 6.0;
+        cfg.max_steering = 0.45;  // hardware servo limit
         cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
         cfg.reference_velocity = vr;
         cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
@@ -1168,7 +1168,7 @@ DeploymentResult run_heading_offset_sim(
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
     cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
-    cfg.max_steering = M_PI / 6.0;
+    cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.65;
     cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
@@ -1376,7 +1376,7 @@ void test_stop_and_resume() {
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
     cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
-    cfg.max_steering = M_PI / 6.0;
+    cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.65;
     cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
@@ -1502,7 +1502,7 @@ void test_stop_resume_on_mission_leg() {
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
     cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
-    cfg.max_steering = M_PI / 6.0;
+    cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.65;
     cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
@@ -1689,7 +1689,7 @@ void test_measurement_noise() {
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
     cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
-    cfg.max_steering = M_PI / 6.0;
+    cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.65;
     cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
@@ -1812,7 +1812,7 @@ void test_measurement_noise_on_mission() {
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
     cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
-    cfg.max_steering = M_PI / 6.0;
+    cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.65;
     cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
@@ -1933,7 +1933,7 @@ void test_no_startup_ramp_mission() {
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
     cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
-    cfg.max_steering = M_PI / 6.0;
+    cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.65;
     cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
@@ -2036,10 +2036,10 @@ static void align_path_to_vehicle_heading(
     double heading_err = acc::normalize_angle(path_yaw - veh_yaw);
     if (std::abs(heading_err) < 5.0 * M_PI / 180.0) return;
 
-    double base_blend = 0.35;
-    double err_scale = std::abs(heading_err) / (M_PI / 2.0);
-    double blend_dist = base_blend + 0.35 * std::min(err_scale, 2.0);
-    blend_dist = std::min(blend_dist, 1.0);
+    double base_blend = 0.50;
+    double err_scale = std::abs(heading_err) / (M_PI / 6.0);  // 1.0 at 30°
+    double blend_dist = base_blend + 1.0 * std::min(err_scale, 2.0);
+    blend_dist = std::min(blend_dist, 2.5);  // cover full solver horizon
 
     double cum = 0.0;
     int rejoin_idx = 1;
@@ -2070,8 +2070,8 @@ static void align_path_to_vehicle_heading(
     double p1x = rx, p1y = ry;
     double m1x = rtx * tang_scale, m1y = rty * tang_scale;
 
-    double ds = 0.01;
-    int n_pts = std::max(static_cast<int>(chord / ds), 5);
+    double ds = 0.001;
+    int n_pts = std::max(static_cast<int>(chord / ds), 10);
     std::vector<double> new_x, new_y;
     new_x.reserve(n_pts + mx.size());
     new_y.reserve(n_pts + mx.size());
@@ -2164,7 +2164,7 @@ CombinedLegResult run_combined_leg(
     cfg.wheelbase = 0.256;
     cfg.max_velocity = 1.2;
     cfg.min_velocity = 0.0;
-    cfg.max_steering = M_PI / 6.0;
+    cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.45;   // Slower for tighter curve tracking
