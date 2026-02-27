@@ -70,3 +70,15 @@ Scope: oversteering diagnosis + simulation prerequisites.
 2. Confirm QLabs + container communication health (ports and adapter pathing).
 3. Confirm frame/setup order (scenario spawn before node launch sequence).
 4. Only then retune contour/lag/speed; avoid changing model equations first.
+
+## Candidate Update (2026-02-27)
+- Added steering output slew limiter in `cpp/mpcc_controller_node.cpp`:
+  - New parameter: `steering_slew_rate` (default `1.0` rad/s).
+  - Applies per-cycle clamp to steering command deltas before publish.
+  - Goal: suppress abrupt steering jumps that produce practical oversteer.
+- Propagated parameter through launch/preset paths:
+  - `launch/mpcc_mission_launch.py`
+  - `cpp/launch/cpp_mission_launch.py`
+  - `config/presets/default.yaml`
+- Also aligned stale legacy launch defaults (`cpp/launch/cpp_mission_launch.py`) with active baseline:
+  - `reference_velocity=0.45`, `lag_weight=15.0`, `horizon=10`

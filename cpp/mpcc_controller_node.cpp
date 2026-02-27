@@ -203,28 +203,31 @@ public:
         // Key changes: startup phase re-enabled (3s), steering_rate_weight 3.0→1.5,
         // velocity tracking at k=0 only (matching reference R_ref structure)
         this->declare_parameter("reference_velocity", 0.45);
-        this->declare_parameter("contour_weight", 15.0);
-        this->declare_parameter("lag_weight", 10.0);
+        this->declare_parameter("contour_weight", 8.0);
+        this->declare_parameter("lag_weight", 15.0);
         this->declare_parameter("horizon", 10);
         this->declare_parameter("boundary_weight", 0.0);
         this->declare_parameter("boundary_default_width", 0.22);
         this->declare_parameter("road_boundaries_config", std::string(""));
         this->declare_parameter("use_direct_motor", true);
         this->declare_parameter("use_state_estimator", false);
-        // Startup weight overrides (reference uses different weights during first 3s)
-        this->declare_parameter("startup_contour_weight", 1.0);
-        this->declare_parameter("startup_lag_weight", 10.0);
-        this->declare_parameter("startup_velocity_weight", 5.0);
-        this->declare_parameter("startup_heading_weight", 1.0);  // Mild heading correction during startup (decays to 0)
-        this->declare_parameter("startup_steering_rate_weight", 0.05);
-        this->declare_parameter("startup_curvature_decay", -5.0);
+        this->declare_parameter("steering_slew_rate", 1.0);  // rad/s command limiter (anti-oversteer)
+        // Startup weight overrides — during first 3s, use HIGHER steering damping
+        // to prevent aggressive steering during path alignment. Previous values
+        // (sr=0.05, contour=1.0) allowed 30x more aggressive steering → oversteering.
+        this->declare_parameter("startup_contour_weight", 6.0);
+        this->declare_parameter("startup_lag_weight", 12.0);
+        this->declare_parameter("startup_velocity_weight", 15.0);
+        this->declare_parameter("startup_heading_weight", 0.5);
+        this->declare_parameter("startup_steering_rate_weight", 2.0);
+        this->declare_parameter("startup_curvature_decay", -0.4);
 
         // Initialize solver with tuned config
         mpcc::Config cfg;
         cfg.horizon = this->get_parameter("horizon").as_int();
         cfg.dt = 0.1;
         cfg.wheelbase = 0.256;
-        cfg.max_velocity = 1.2;   // Raised (ref uses 2.0; qcar2_hardware PD handles speed)
+        cfg.max_velocity = 0.55;  // Hard speed ceiling — close to v_ref to prevent solver hitting max
         cfg.min_velocity = 0.0;   // Reference uses u_min=[0.0, ...]
         cfg.max_steering = 0.45;  // ±25.8° — hardware servo limit (ref uses π/6=30° but servo clips at 0.45)
         cfg.max_acceleration = 1.5;   // Reference has no explicit limit; allow fast response
@@ -235,7 +238,7 @@ public:
         cfg.velocity_weight = 15.0;  // Track v_ref strongly (ref: R_ref[0]=17.0)
         cfg.steering_weight = 0.05;   // Reference R_ref[1]=0.05, penalizes |δ| gently
         cfg.acceleration_weight = 0.01;  // Reference R_u[0]=0.005; near-zero for fast speed changes
-        cfg.steering_rate_weight = 1.5; // Moderate damping (ref R_u[1]=1.1; was 3.0 which caused swerving)
+        cfg.steering_rate_weight = 1.1; // Match reference R_u[1]=1.1 exactly
         cfg.jerk_weight = 0.0;       // Reference has no jerk penalty
         cfg.robot_radius = 0.13;
         cfg.safety_margin = 0.10;
@@ -276,6 +279,7 @@ public:
         use_direct_motor_ = this->get_parameter("use_direct_motor").as_bool();
 
         use_state_estimator_ = this->get_parameter("use_state_estimator").as_bool();
+        steering_slew_rate_ = this->get_parameter("steering_slew_rate").as_double();
 
         // CubicSplinePath (built when path received)
         spline_path_ = std::make_unique<acc::CubicSplinePath>();
@@ -483,10 +487,21 @@ private:
             has_path_ = true;
             current_progress_ = ref_path_.find_closest_progress(state_x_, state_y_);
             solver_.reset();
-            // Reset state_delta_ to match solver's reset u_prev_ = (0.2, 0.0).
-            // Without this, state_delta_ carries over from the previous leg,
-            // creating inconsistency with the solver's fresh state.
+            // Reset state_delta_ to match solver's reset u_prev_.
             state_delta_ = 0.0;
+
+            // Reset ALL secondary state for clean leg transition.
+            // Without this, stale timers/counters from previous leg cause:
+            // - stuck_timer_: spurious solver reset at new leg start
+            // - solver_failure_count_: premature replan request
+            // - sustained_cross_track_start_: immediate CTE alert on new leg
+            // - steering_saturated_count_: stale diagnostic counter
+            // - replan_requested_: stale replan state
+            stuck_timer_ = 0.0;
+            solver_failure_count_ = 0;
+            steering_saturated_count_ = 0;
+            sustained_cross_track_start_ = 0.0;
+            replan_requested_ = false;
 
             // Build cubic spline path too (for smooth curvature)
             try {
@@ -937,27 +952,22 @@ private:
             new_progress = ref_path_.find_closest_progress(state_x_, state_y_);
             path_total_len = ref_path_.total_length;
         }
-        // Strictly monotonic: only advance, never go backward
+        // Strictly monotonic: only advance, never go backward.
+        // NEVER reset progress backward — it causes the solver to chase old references,
+        // amplifying oscillation. If the vehicle overshoots, the solver will naturally
+        // correct by continuing forward (lag weight > contour weight = progress-first).
         if (new_progress > current_progress_) {
             current_progress_ = new_progress;
-            stuck_timer_ = 0.0;  // reset stuck timer on progress
+            stuck_timer_ = 0.0;
         } else {
-            // Stuck detection: if steering is saturated and no progress for 3s,
-            // the solver is trapped in a local minimum. Reset progress to the
-            // actual closest point to break the deadlock.
-            double max_steer = config_.max_steering;
-            if (std::abs(state_delta_) > max_steer * 0.95) {
-                stuck_timer_ += config_.dt;  // Matches control loop period
-                if (stuck_timer_ > 3.0) {
-                    RCLCPP_WARN(this->get_logger(),
-                        "Stuck detected: steering saturated for %.1fs with no progress. "
-                        "Resetting progress %.3f -> %.3f",
-                        stuck_timer_, current_progress_, new_progress);
-                    current_progress_ = new_progress;
-                    solver_.reset();
-                    stuck_timer_ = 0.0;
-                }
-            } else {
+            stuck_timer_ += config_.dt;
+            if (stuck_timer_ > 5.0) {
+                RCLCPP_WARN(this->get_logger(),
+                    "No progress for %.1fs (progress=%.1f%%, closest=%.1f%%)",
+                    stuck_timer_, current_progress_ / path_total_len * 100.0,
+                    new_progress / path_total_len * 100.0);
+                // Only reset solver warm-start, NOT progress
+                solver_.reset();
                 stuck_timer_ = 0.0;
             }
         }
@@ -978,6 +988,11 @@ private:
         // Compute startup elapsed time
         double elapsed = (this->now() - start_time_).seconds();
         config_.startup_elapsed_s = elapsed;
+        // Enable diagnostics extraction always in deployment
+        config_.diagnostics_enabled = true;
+        // Write per-stage data adaptively (every 10th cycle or when CTE is high)
+        config_.per_stage_logging = (log_cycle_counter_ % 10 == 0) ||
+                                     (std::abs(compute_cross_track_error()) > 0.15);
         solver_.config = config_;
 
         // Get path references — prefer spline (smooth curvature) over piecewise-linear
@@ -1071,6 +1086,16 @@ private:
         v_cmd = std::clamp(v_cmd, config_.min_velocity, config_.max_velocity);
         delta_cmd = std::clamp(delta_cmd, -config_.max_steering, config_.max_steering);
 
+        // Apply a first-order steering slew-rate limit to prevent aggressive
+        // command jumps that manifest as oversteer in deployment.
+        if (steering_slew_rate_ > 0.0) {
+            double max_step = steering_slew_rate_ * config_.dt;
+            double lo = state_delta_ - max_step;
+            double hi = state_delta_ + max_step;
+            delta_cmd = std::clamp(delta_cmd, lo, hi);
+            delta_cmd = std::clamp(delta_cmd, -config_.max_steering, config_.max_steering);
+        }
+
         // Publish MotorCommands directly (bypass nav2_qcar_command_convert)
         if (use_direct_motor_ && motor_pub_) {
             qcar2_interfaces::msg::MotorCommands motor_cmd;
@@ -1129,8 +1154,9 @@ private:
             result.solve_time_us, state_x_, state_y_);
 
         // Persistent CSV log
+        std::string state_src = using_estimator ? "estimator" : "tf+encoder";
         log_cycle(v_cmd, delta_cmd, progress_pct, result.solve_time_us,
-                  cross_track, heading_err, n_obs);
+                  cross_track, heading_err, n_obs, result, state_src);
 
         // Check if dynamic replanning is needed
         check_replan_needed(cross_track, progress_pct);
@@ -1154,13 +1180,26 @@ private:
         }
 
         mpcc_csv_path_ = log_dir + "/mpcc_" + ts.str() + ".csv";
+        mpcc_traj_csv_path_ = log_dir + "/mpcc_trajectory_" + ts.str() + ".csv";
         mpcc_event_path_ = log_dir + "/mpcc_events_" + ts.str() + ".log";
 
         {
             std::ofstream f(mpcc_csv_path_);
             f << "elapsed_s,x,y,theta,v_meas,v_cmd,delta_cmd,progress_pct,"
                  "solve_time_us,cross_track_err,heading_err,n_obstacles,"
-                 "motion_enabled,traffic_stop\n";
+                 "motion_enabled,traffic_stop,"
+                 "acados_status,sqp_iter,kkt_norm,qp_status,"
+                 "res_eq,res_ineq,res_comp,res_stat,"
+                 "cost,acados_time_ms,"
+                 "warmstart,warmstart_shifts,startup_progress,"
+                 "eff_contour_w,eff_lag_w,eff_vel_w,eff_sr_w,eff_progress_w,eff_v_ref_k0,"
+                 "obs_x,obs_y,obs_r,obs_dist,"
+                 "state_source,tf_age_ms,steering_sat_count\n";
+        }
+        {
+            std::ofstream f(mpcc_traj_csv_path_);
+            f << "elapsed_s,stage,x,y,psi,theta_a,v,delta,v_theta,"
+                 "ref_x,ref_y,ref_v,ref_curv\n";
         }
         {
             std::ofstream f(mpcc_event_path_);
@@ -1176,18 +1215,28 @@ private:
               << " direct_motor=" << (use_direct_motor_ ? "true" : "false") << "\n\n";
         }
         log_start_time_ = this->now().seconds();
-        RCLCPP_INFO(this->get_logger(), "MPCC log: %s", mpcc_csv_path_.c_str());
+        RCLCPP_INFO(this->get_logger(), "=== MPCC LOGS ===");
+        RCLCPP_INFO(this->get_logger(), "  CSV:        %s", mpcc_csv_path_.c_str());
+        RCLCPP_INFO(this->get_logger(), "  Trajectory: %s", mpcc_traj_csv_path_.c_str());
+        RCLCPP_INFO(this->get_logger(), "  Events:     %s", mpcc_event_path_.c_str());
+        RCLCPP_INFO(this->get_logger(), "===============");
     }
 
     void log_cycle(double v_cmd, double delta_cmd, double progress_pct,
                    double solve_time_us, double cross_track, double heading_err,
-                   int n_obstacles) {
+                   int n_obstacles, const mpcc::Result& result,
+                   const std::string& state_source) {
         // Log every control cycle for debugging (10Hz at dt=0.1s)
         log_cycle_counter_++;
 
         double elapsed = this->now().seconds() - log_start_time_;
         double v_meas = has_joint_velocity_ ? joint_velocity_ : state_v_;
         bool traffic_stop = parse_traffic_should_stop();
+        double tf_age_ms = (last_pose_time_ > 0)
+            ? (this->now().seconds() - last_pose_time_) * 1000.0
+            : -1.0;
+
+        const auto& d = result.diag;
 
         try {
             std::ofstream f(mpcc_csv_path_, std::ios::app);
@@ -1200,8 +1249,58 @@ private:
               << std::setprecision(4) << cross_track << "," << heading_err << ","
               << n_obstacles << ","
               << (motion_enabled_ ? 1 : 0) << ","
-              << (traffic_stop ? 1 : 0) << "\n";
+              << (traffic_stop ? 1 : 0) << ","
+              // Solver diagnostics
+              << d.acados_status << "," << d.sqp_iter << ","
+              << std::setprecision(6) << d.kkt_norm_inf << "," << d.qp_status << ","
+              << std::setprecision(6) << d.res_eq << "," << d.res_ineq << ","
+              << d.res_comp << "," << d.res_stat << ","
+              << std::setprecision(2) << result.cost << ","
+              << std::setprecision(3) << d.acados_time_tot_ms << ","
+              << (d.warmstart_used ? 1 : 0) << "," << d.warmstart_shift_count << ","
+              << std::setprecision(3) << d.startup_progress << ","
+              // Effective weights
+              << std::setprecision(2) << d.eff_contour_w << "," << d.eff_lag_w << ","
+              << d.eff_vel_w << "," << d.eff_sr_w << "," << d.eff_progress_w << ","
+              << std::setprecision(4) << d.eff_v_ref_k0 << ","
+              // Obstacle data
+              << std::setprecision(3) << d.obs_x << "," << d.obs_y << ","
+              << std::setprecision(4) << d.obs_r << ","
+              << std::setprecision(3) << d.obs_dist << ","
+              // State source and TF age
+              << state_source << ","
+              << std::setprecision(1) << tf_age_ms << ","
+              << steering_saturated_count_ << "\n";
         } catch (...) {}
+
+        // Write per-stage trajectory adaptively: every 10th cycle or high CTE
+        bool write_traj = (log_cycle_counter_ % 10 == 0) ||
+                           (std::abs(cross_track) > 0.15);
+        if (write_traj && !d.stage_x.empty()) {
+            try {
+                std::ofstream f(mpcc_traj_csv_path_, std::ios::app);
+                int N = config_.horizon;
+                for (int k = 0; k <= N; k++) {
+                    f << std::fixed << std::setprecision(3) << elapsed << ","
+                      << k << ","
+                      << std::setprecision(4) << d.stage_x[k] << "," << d.stage_y[k] << ","
+                      << d.stage_psi[k] << "," << d.stage_theta_a[k] << ",";
+                    if (k < N) {
+                        f << d.stage_v[k] << "," << d.stage_delta[k] << "," << d.stage_v_theta[k];
+                    } else {
+                        f << ",,";
+                    }
+                    f << ",";
+                    if (k < (int)d.ref_x.size()) {
+                        f << d.ref_x[k] << "," << d.ref_y[k] << ","
+                          << d.ref_v[k] << "," << d.ref_curv[k];
+                    } else {
+                        f << ",,,";
+                    }
+                    f << "\n";
+                }
+            } catch (...) {}
+        }
     }
 
     void log_event(const std::string& event) {
@@ -1382,6 +1481,7 @@ private:
 
     // Direct motor mode
     bool use_direct_motor_ = true;
+    double steering_slew_rate_ = 1.0;  // rad/s
 
     // State estimator
     bool use_state_estimator_ = false;
@@ -1401,6 +1501,7 @@ private:
 
     // File logging
     std::string mpcc_csv_path_;
+    std::string mpcc_traj_csv_path_;
     std::string mpcc_event_path_;
     double log_start_time_ = 0.0;
     int log_cycle_counter_ = 0;

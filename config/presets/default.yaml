@@ -3,22 +3,18 @@
 # Full C++ stack — the current default when launching with `./run_mission.sh`.
 # All nodes are C++. No Python fallbacks.
 #
-# These parameters match the launch file defaults (mpcc_mission_launch.py).
-# Tuned via full-mission simulation (Feb 25, 2026):
-# - Horizon 25 gives 2.5s lookahead for curve anticipation (biggest improvement)
-# - Higher contour + lower lag = tighter tracking
-# - Lower v_ref for safety margin on curves
-# - Lower steering_rate for agile steering response
-#
 # Usage:
 #   ./run_mission.sh
 #   ./run_mission.sh --mpcc
 
-# --- MPCC parameters (tuned via full-mission simulation Feb 2026) ---
+# --- MPCC parameters (deployment-tuned Feb 2026) ---
+# contour=8: intermediate between 4 (too weak, CTE 0.673m) and 15 (too aggressive, swerving)
+# lag=15: strong progress to prevent circling
 reference_velocity: 0.45
-contour_weight: 15.0
-lag_weight: 10.0
+contour_weight: 8.0
+lag_weight: 15.0
 horizon: 10
 boundary_weight: 0.0
 use_direct_motor: true
 use_state_estimator: false
+steering_slew_rate: 1.0

@@ -19,7 +19,7 @@ def generate_launch_description():
     # Launch arguments — must match mpcc_mission_launch.py defaults
     reference_velocity_arg = DeclareLaunchArgument(
         'reference_velocity',
-        default_value='0.50',
+        default_value='0.45',
         description='Target velocity (m/s)'
     )
 
@@ -31,13 +31,13 @@ def generate_launch_description():
 
     lag_weight_arg = DeclareLaunchArgument(
         'lag_weight',
-        default_value='10.0',
+        default_value='15.0',
         description='Weight for lag (progress) error'
     )
 
     horizon_arg = DeclareLaunchArgument(
         'horizon',
-        default_value='25',
+        default_value='10',
         description='MPC prediction horizon (steps)'
     )
 
@@ -45,6 +45,18 @@ def generate_launch_description():
         'boundary_weight',
         default_value='0.0',
         description='Road boundary constraint penalty weight (ref has 0)'
+    )
+
+    use_state_estimator_arg = DeclareLaunchArgument(
+        'use_state_estimator',
+        default_value='false',
+        description='Use EKF state estimator for controller state input'
+    )
+
+    steering_slew_rate_arg = DeclareLaunchArgument(
+        'steering_slew_rate',
+        default_value='1.0',
+        description='Maximum steering command slew rate (rad/s) to reduce oversteer from abrupt command jumps'
     )
 
     # Odom From TF Node (C++)
@@ -72,6 +84,8 @@ def generate_launch_description():
             'lag_weight': LaunchConfiguration('lag_weight'),
             'horizon': LaunchConfiguration('horizon'),
             'boundary_weight': LaunchConfiguration('boundary_weight'),
+            'use_state_estimator': LaunchConfiguration('use_state_estimator'),
+            'steering_slew_rate': LaunchConfiguration('steering_slew_rate'),
         }],
     )
 
@@ -100,6 +114,8 @@ def generate_launch_description():
         lag_weight_arg,
         horizon_arg,
         boundary_weight_arg,
+        use_state_estimator_arg,
+        steering_slew_rate_arg,
         odom_from_tf_node,
         mpcc_controller_node,
         sign_detector_node,

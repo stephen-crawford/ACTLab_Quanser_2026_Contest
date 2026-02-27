@@ -36,14 +36,14 @@ def generate_launch_description():
 
     contour_weight_arg = DeclareLaunchArgument(
         'contour_weight',
-        default_value='15.0',
-        description='Weight for path contouring (lateral) error - tighter lane keeping'
+        default_value='8.0',
+        description='Weight for path contouring (lateral) error. Intermediate: 4 too weak, 15 too aggressive.'
     )
 
     lag_weight_arg = DeclareLaunchArgument(
         'lag_weight',
-        default_value='10.0',
-        description='Weight for lag (progress) error'
+        default_value='15.0',
+        description='Weight for lag (progress) error. Higher than contour for progress-first tracking.'
     )
 
     horizon_arg = DeclareLaunchArgument(
@@ -68,6 +68,12 @@ def generate_launch_description():
         'use_state_estimator',
         default_value='false',
         description='Use EKF state estimator (fuses TF + encoder + odom). Disabled: adds velocity lag not in reference.'
+    )
+
+    steering_slew_rate_arg = DeclareLaunchArgument(
+        'steering_slew_rate',
+        default_value='1.0',
+        description='Maximum steering command slew rate (rad/s) to reduce oversteer from abrupt command jumps'
     )
 
     use_dashboard_arg = DeclareLaunchArgument(
@@ -116,6 +122,8 @@ def generate_launch_description():
             'horizon': LaunchConfiguration('horizon'),
             'boundary_weight': LaunchConfiguration('boundary_weight'),
             'use_direct_motor': LaunchConfiguration('use_direct_motor'),
+            'use_state_estimator': LaunchConfiguration('use_state_estimator'),
+            'steering_slew_rate': LaunchConfiguration('steering_slew_rate'),
         }],
     )
 
@@ -189,6 +197,7 @@ def generate_launch_description():
         boundary_weight_arg,
         use_direct_motor_arg,
         use_state_estimator_arg,
+        steering_slew_rate_arg,
         use_dashboard_arg,
         use_overlay_arg,
         odom_from_tf_node,
