@@ -1369,7 +1369,15 @@ private:
         double ct_abs = std::abs(cross_track);
 
         // Trigger 1: Sustained cross-track violation
-        if (ct_abs > REPLAN_CROSS_TRACK_THRESHOLD) {
+        //
+        // Guard rails to avoid "replan thrash" near waypoints:
+        // - do not trigger near end-of-leg where local route tangents can flip
+        // - require low speed + stagnation, otherwise let MPCC recover naturally
+        bool near_goal = progress_pct > REPLAN_NEAR_GOAL_PROGRESS_PCT;
+        bool can_replan_for_cte = !near_goal &&
+                                  (state_v_ < REPLAN_MAX_SPEED_FOR_CTE) &&
+                                  (stuck_timer_ > REPLAN_MIN_STUCK_TIME_FOR_CTE);
+        if (ct_abs > REPLAN_CROSS_TRACK_THRESHOLD && can_replan_for_cte) {
             if (sustained_cross_track_start_ <= 0.0) {
                 sustained_cross_track_start_ = now_s;
             } else if (!replan_requested_ &&
@@ -1509,10 +1517,13 @@ private:
     bool replan_requested_ = false;
     double last_replan_request_time_ = 0.0;
     int solver_failure_count_ = 0;
-    static constexpr double REPLAN_CROSS_TRACK_THRESHOLD = 0.40;  // meters
-    static constexpr double REPLAN_SUSTAINED_DURATION = 1.0;       // seconds
+    static constexpr double REPLAN_CROSS_TRACK_THRESHOLD = 0.60;   // meters
+    static constexpr double REPLAN_SUSTAINED_DURATION = 2.5;       // seconds
     static constexpr double REPLAN_COOLDOWN_S = 5.0;               // min between requests
     static constexpr int REPLAN_SOLVER_FAILURE_THRESHOLD = 20;     // 1s at 20Hz
+    static constexpr double REPLAN_NEAR_GOAL_PROGRESS_PCT = 85.0;  // disable CTE replans near goal
+    static constexpr double REPLAN_MAX_SPEED_FOR_CTE = 0.25;       // m/s
+    static constexpr double REPLAN_MIN_STUCK_TIME_FOR_CTE = 2.0;   // s
 
     bool mission_hold_ = false;
     std::string traffic_state_json_;
