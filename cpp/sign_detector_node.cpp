@@ -864,12 +864,15 @@ private:
         double obs_y = veh_y + fwd * std::sin(veh_theta) + left * std::cos(veh_theta);
 
         // Publish with obstacle radius (0.10m for cone/pedestrian in QLabs)
+        // Include explicit frame metadata to avoid downstream double-transform.
         double radius = 0.10;
         auto msg = std_msgs::msg::String();
         std::ostringstream obs_json;
         obs_json << "{\"obstacles\": [{\"x\": " << obs_x
                  << ", \"y\": " << obs_y
-                 << ", \"radius\": " << radius << "}]}";
+                 << ", \"radius\": " << radius
+                 << ", \"obj_class\": \"cone\""
+                 << ", \"frame\": \"map\"}]}";
         msg.data = obs_json.str();
         obstacle_pub_->publish(msg);
     }

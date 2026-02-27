@@ -601,10 +601,15 @@ class YoloBridge(Node):
             if distance is None:
                 continue
 
+            map_pos = self._det_to_map_position(det)
+            if map_pos is None:
+                continue
+
             obs = ObstaclePosition()
             obs.obj_class = obj_class
-            obs.x = distance  # Forward distance
-            obs.y = 0.0
+            obs.x = map_pos[0]
+            obs.y = map_pos[1]
+            obs.frame = "map"
 
             if obj_class == 'person':
                 obs.radius = 0.3
@@ -612,16 +617,6 @@ class YoloBridge(Node):
                 obs.radius = 0.5
             else:
                 obs.radius = 0.15
-
-            # Estimate lateral offset from bbox if available
-            if bbox is not None and self._latest_frame is not None:
-                x, y, w, h = bbox
-                with self._frame_lock:
-                    if self._latest_frame is not None:
-                        img_w = self._latest_frame.shape[1]
-                        bbox_center_x = x + w / 2
-                        lateral_offset = (bbox_center_x - img_w / 2) / (img_w / 2)
-                        obs.y = lateral_offset * distance * 0.5
 
             obstacles.add_obstacle(obs)
 

@@ -66,6 +66,7 @@ class ObstaclePosition:
     vx: float = 0.0
     vy: float = 0.0
     obj_class: str = "unknown"
+    frame: str = "map"
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""

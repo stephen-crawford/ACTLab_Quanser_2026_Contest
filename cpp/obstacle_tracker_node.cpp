@@ -196,7 +196,7 @@ public:
 private:
     // Parse obstacle positions JSON
     void on_obstacle_positions(const std::string& json) {
-        // Parse JSON: {"obstacles": [{"x":..,"y":..,"radius":..,"obj_class":..}, ...]}
+        // Parse JSON: {"obstacles": [{"x":..,"y":..,"radius":..,"obj_class":..,"frame":"map|base_link"}, ...]}
         std::vector<std::tuple<double, double, std::string>> detections;
 
         size_t pos = json.find("\"obstacles\"");
@@ -216,13 +216,19 @@ private:
             double x = parse_json_double(obj, "\"x\"");
             double y_val = parse_json_double(obj, "\"y\"");
             std::string cls = parse_json_string(obj, "\"obj_class\"");
+            std::string frame = parse_json_string(obj, "\"frame\"");
             if (cls.empty()) cls = "unknown";
 
-            // Transform from vehicle frame to map frame if needed
-            // Detection positions are in vehicle frame: x=forward, y=lateral
-            double map_x, map_y;
-            if (vehicle_to_map(x, y_val, map_x, map_y)) {
-                detections.emplace_back(map_x, map_y, cls);
+            // Frame handling:
+            // - frame=="map": coordinates already in map frame.
+            // - otherwise (legacy/default): interpret as vehicle frame (x=fwd, y=left)
+            if (frame == "map" || frame == "world") {
+                detections.emplace_back(x, y_val, cls);
+            } else {
+                double map_x, map_y;
+                if (vehicle_to_map(x, y_val, map_x, map_y)) {
+                    detections.emplace_back(map_x, map_y, cls);
+                }
             }
 
             search = obj_end + 1;

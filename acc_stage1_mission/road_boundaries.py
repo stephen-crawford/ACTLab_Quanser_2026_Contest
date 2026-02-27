@@ -82,8 +82,9 @@ class RoadSegment:
         theta = self.transform_heading
         cos_h = np.cos(theta)
         sin_h = np.sin(theta)
-        x_map = cos_h * dx + sin_h * dy
-        y_map = -sin_h * dx + cos_h * dy
+        # R(+theta): must match C++ coordinate_transform.h and mission path transform
+        x_map = cos_h * dx - sin_h * dy
+        y_map = sin_h * dx + cos_h * dy
 
         return np.array([x_map, y_map])
 
@@ -212,8 +213,8 @@ class TrafficControl:
         cos_h = np.cos(theta)
         sin_h = np.sin(theta)
         self.position = np.array([
-            cos_h * dx + sin_h * dy,
-            -sin_h * dx + cos_h * dy
+            cos_h * dx - sin_h * dy,
+            sin_h * dx + cos_h * dy
         ])
 
         self.stop_line_distance = control_data.get('stop_line_distance', 0.2)
@@ -244,8 +245,8 @@ class ObstacleZone:
         cos_h = np.cos(theta)
         sin_h = np.sin(theta)
         self.center = np.array([
-            cos_h * dx + sin_h * dy,
-            -sin_h * dx + cos_h * dy
+            cos_h * dx - sin_h * dy,
+            sin_h * dx + cos_h * dy
         ])
 
         self.max_velocity = zone_data.get('max_velocity', 0.4)
