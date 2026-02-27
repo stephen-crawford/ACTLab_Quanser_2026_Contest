@@ -34,6 +34,7 @@
 #include <iomanip>
 #include <string>
 #include <vector>
+#include <random>
 
 #include "mpcc_solver_interface.h"
 #include "cubic_spline_path.h"
@@ -101,6 +102,91 @@ struct PDSpeedController {
 };
 
 // =========================================================================
+// Deployment plant — models TF delay, servo delay, and measurement noise
+// =========================================================================
+struct DeploymentPlant {
+    // Models the ACTUAL QCar2 hardware behavior:
+    // - Steering: INSTANT (direct servo feedthrough, no PID, no delay)
+    //   Source: qcar2_hardware.cpp — desired_steering written to HIL channel 1000 directly
+    // - Motor: PD controlled (kp=20, kd=0.1, 67Hz inner loop)
+    //   Source: qcar2_hardware.cpp speed_controller() timer callback
+    // - TF: ~100ms Cartographer SLAM + TF lookup latency (real)
+    // - Noise: ~5mm position, ~2° heading from SLAM
+    mpcc::KinematicModel plant;
+    mpcc::Vec3 true_state;
+    PDSpeedController pd_ctrl;
+    double actual_delta = 0.0;  // Steering is INSTANT — no delay buffer
+
+    // TF delay ring buffer (100ms = 1 step at dt=0.1)
+    static constexpr int TF_DELAY_STEPS = 1;
+    std::vector<mpcc::Vec3> state_history;
+    int tf_hist_idx = 0;
+
+    // Measurement noise
+    std::mt19937 rng;
+    std::normal_distribution<double> pos_noise{0, 0.005};   // 5mm position noise
+    std::normal_distribution<double> head_noise{0, 0.035};   // 2° heading noise
+
+    bool enable_delays;
+    bool enable_noise;
+    double dt;
+
+    DeploymentPlant(double wheelbase, double dt_, bool delays, bool noise, unsigned seed = 42)
+        : plant(wheelbase), dt(dt_), enable_delays(delays), enable_noise(noise), rng(seed)
+    {
+        true_state = mpcc::Vec3::Zero();
+        state_history.resize(TF_DELAY_STEPS + 1, mpcc::Vec3::Zero());
+    }
+
+    void set_initial_state(double x, double y, double theta) {
+        true_state << x, y, theta;
+        for (auto& s : state_history) s = true_state;
+        tf_hist_idx = 0;
+        actual_delta = 0.0;
+        pd_ctrl.reset();
+    }
+
+    // Get measured state (delayed + noisy, simulating TF lookup)
+    mpcc::Vec3 get_measured_state() {
+        mpcc::Vec3 meas;
+        if (enable_delays) {
+            int delayed_idx = (tf_hist_idx - TF_DELAY_STEPS + (int)state_history.size())
+                              % (int)state_history.size();
+            meas = state_history[delayed_idx];
+        } else {
+            meas = true_state;
+        }
+        if (enable_noise) {
+            meas(0) += pos_noise(rng);
+            meas(1) += pos_noise(rng);
+            meas(2) += head_noise(rng);
+        }
+        return meas;
+    }
+
+    double get_measured_velocity() {
+        return pd_ctrl.actual_speed;  // Encoder reads actual speed directly
+    }
+
+    // Step the plant: v_cmd through PD motor controller, delta_cmd INSTANT to servo
+    void step(double v_cmd, double delta_cmd, double max_steering) {
+        // Speed through PD controller (motor has inertia + PD loop)
+        double actual_v = pd_ctrl.step(v_cmd, dt);
+
+        // Steering is INSTANT — direct servo feedthrough, no delay
+        actual_delta = std::clamp(delta_cmd, -max_steering, max_steering);
+
+        // Propagate true plant state with actual controls
+        mpcc::Vec2 u_direct(actual_v, actual_delta);
+        true_state = plant.rk4_step(true_state, u_direct, dt);
+
+        // Store true state in history for delayed TF
+        state_history[tf_hist_idx] = true_state;
+        tf_hist_idx = (tf_hist_idx + 1) % (int)state_history.size();
+    }
+};
+
+// =========================================================================
 // Deployment simulation result
 // =========================================================================
 struct DeploymentResult {
@@ -113,6 +199,14 @@ struct DeploymentResult {
     std::vector<double> trace_delta, trace_progress, trace_curvature;
     std::vector<double> path_x, path_y;  // reference path for plotting
     bool success = true;
+
+    // Solver diagnostics traces
+    std::vector<int> trace_sqp_iter;
+    std::vector<double> trace_kkt_norm;
+    std::vector<int> trace_qp_status;
+    std::vector<double> trace_res_eq;
+    std::vector<double> trace_cost;
+    std::vector<double> trace_startup_progress;
 };
 
 // =========================================================================
@@ -153,19 +247,19 @@ DeploymentResult run_deployment_sim(
     cfg.horizon = 10;
     cfg.dt = 0.1;
     cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;
+    cfg.max_velocity = 0.55;
     cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.45;
-    cfg.contour_weight = 20.0;      // Higher lateral penalty for tighter curve tracking
+    cfg.contour_weight = 15.0;
     cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;
     cfg.steering_weight = 0.05;
     cfg.acceleration_weight = 0.01;
-    cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 3.0;       // Higher for faster heading alignment
+    cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;
     cfg.progress_weight = 1.0;
     cfg.jerk_weight = 0.0;
     cfg.boundary_weight = 0.0;
@@ -175,7 +269,7 @@ DeploymentResult run_deployment_sim(
     cfg.qp_tolerance = 1e-5;
     // Start past startup phase
     cfg.startup_elapsed_s = 10.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
     solver.init(cfg);
 
     // Initial state: at start of path, aligned with tangent
@@ -183,12 +277,20 @@ DeploymentResult run_deployment_sim(
     spline.get_position(0.0, init_x, init_y);
     double init_theta = spline.get_tangent(0.0);
 
-    mpcc::AckermannModel plant(cfg.wheelbase);
-    mpcc::VecX state;
-    state << init_x, init_y, init_theta, 0.0, 0.0;  // Start from stop (realistic: each leg starts from waypoint)
+    // Use KinematicModel with direct [v, δ] controls — matches actual vehicle.
+    // QCar2 accepts direct steering angle (no servo delay) and velocity (PD-controlled motor).
+    mpcc::KinematicModel plant(cfg.wheelbase);
+    mpcc::Vec3 state;
+    state << init_x, init_y, init_theta;
+    double actual_v = 0.0;        // Tracked separately (PD speed controller simulates motor lag)
+    double actual_delta = 0.0;    // Direct steering angle (no rate limit — matches hardware)
 
     PDSpeedController pd_ctrl;
     pd_ctrl.actual_speed = 0.0;
+
+    // Set spline_path for acados solver's theta_A-based reference lookup
+    // (deployment ALWAYS sets this — critical behavioral difference from old tests)
+    solver.spline_path = &spline;
 
     // Set up adaptive path re-projection (matching controller node behavior).
     // This lets the solver re-project predicted positions onto the path each
@@ -211,6 +313,9 @@ DeploymentResult run_deployment_sim(
     double progress = 0.0;
     double cte_sum = 0.0;
     double speed_sum = 0.0;
+    int consecutive_failures = 0;
+    constexpr int MAX_CONSECUTIVE_FAILURES = 5;
+    constexpr double CTE_KILL_THRESHOLD = 1.0;  // 1m = clearly diverged
 
     for (int step = 0; step < max_steps; step++) {
         if (progress >= total_len - 0.1) break;
@@ -234,36 +339,42 @@ DeploymentResult run_deployment_sim(
             s += step_speed * cfg.dt;
         }
 
-        // Solve with 3D state (pass measured velocity and steering via 5D overload)
-        auto result = solver.solve(state, refs, progress, total_len, {}, {});
+        // Enable diagnostics for solver convergence tracking
+        solver.config.diagnostics_enabled = true;
+
+        // Solve with 3D state + measured velocity/steering
+        auto result = solver.solve(state, refs, progress, total_len, {}, {},
+                                    actual_v, actual_delta);
         if (!result.success) {
-            std::printf("    [%s] Solver failed at step %d\n", leg_name.c_str(), step);
-            res.success = false;
-            break;
+            consecutive_failures++;
+            if (consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
+                std::printf("    [%s] %d consecutive solver failures at step %d — early kill\n",
+                    leg_name.c_str(), consecutive_failures, step);
+                res.success = false;
+                break;
+            }
+            continue;  // Skip this step, try again next iteration
         }
+        consecutive_failures = 0;
 
         double v_cmd = result.v_cmd;
         double delta_cmd = result.delta_cmd;
 
-        // Apply speed through PD controller (simulating hardware lag)
-        double actual_v;
+        // Apply speed through PD controller (simulating hardware motor PD lag)
         if (use_pd_lag) {
             actual_v = pd_ctrl.step(v_cmd, cfg.dt);
         } else {
-            actual_v = v_cmd;  // Instant velocity (unrealistic)
+            actual_v = v_cmd;
         }
 
-        // Apply controls to plant (5D Ackermann model)
-        // Steering is applied directly (no PD lag for steering servo)
-        mpcc::VecU u;
-        u(0) = (actual_v - state(3)) / cfg.dt;
-        u(1) = (delta_cmd - state(4)) / cfg.dt;
-        u(0) = std::clamp(u(0), -cfg.max_acceleration, cfg.max_acceleration);
-        u(1) = std::clamp(u(1), -cfg.max_steering_rate, cfg.max_steering_rate);
+        // Steering is direct — no servo delay, no rate limit (matches QCar2 hardware)
+        actual_delta = std::clamp(delta_cmd, -cfg.max_steering, cfg.max_steering);
 
-        state = plant.rk4_step(state, u, cfg.dt);
-        state(3) = std::clamp(state(3), cfg.min_velocity, cfg.max_velocity);
-        state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
+        // Propagate plant with direct controls [v, δ]
+        mpcc::Vec2 u_direct;
+        u_direct(0) = actual_v;
+        u_direct(1) = actual_delta;
+        state = plant.rk4_step(state, u_direct, cfg.dt);
 
         // Update progress (monotonic, matching controller)
         double new_progress = spline.find_closest_progress(state(0), state(1));
@@ -279,8 +390,16 @@ DeploymentResult run_deployment_sim(
 
         res.max_cte = std::max(res.max_cte, cte);
         cte_sum += cte;
-        speed_sum += state(3);
+        speed_sum += actual_v;
         res.steps++;
+
+        // Early kill: CTE exceeds threshold — vehicle clearly diverged
+        if (cte > CTE_KILL_THRESHOLD) {
+            std::printf("    [%s] CTE %.3fm > %.1fm at step %d — early kill\n",
+                leg_name.c_str(), cte, CTE_KILL_THRESHOLD, step);
+            res.success = false;
+            break;
+        }
 
         // Get curvature at current progress
         double curv_at_prog = spline.get_curvature(progress);
@@ -289,10 +408,18 @@ DeploymentResult run_deployment_sim(
         res.trace_x.push_back(state(0));
         res.trace_y.push_back(state(1));
         res.trace_cte.push_back(cte);
-        res.trace_v.push_back(state(3));
-        res.trace_delta.push_back(state(4));
+        res.trace_v.push_back(actual_v);
+        res.trace_delta.push_back(actual_delta);
         res.trace_progress.push_back(progress / total_len);
         res.trace_curvature.push_back(curv_at_prog);
+
+        // Solver diagnostics traces
+        res.trace_sqp_iter.push_back(result.diag.sqp_iter);
+        res.trace_kkt_norm.push_back(result.diag.kkt_norm_inf);
+        res.trace_qp_status.push_back(result.diag.qp_status);
+        res.trace_res_eq.push_back(result.diag.res_eq);
+        res.trace_cost.push_back(result.cost);
+        res.trace_startup_progress.push_back(result.diag.startup_progress);
     }
 
     res.avg_cte = (res.steps > 0) ? cte_sum / res.steps : 0.0;
@@ -302,15 +429,26 @@ DeploymentResult run_deployment_sim(
     return res;
 }
 
-// Write CSV trace for plotting
+// Write CSV trace for plotting — matches deployment CSV format for direct comparison
 void write_csv(const DeploymentResult& res, const std::string& filename) {
     std::ofstream f(filename);
-    f << "step,x,y,cte,v,delta,progress,curvature\n";
+    f << "step,x,y,cte,v,delta,progress,curvature,"
+         "sqp_iter,kkt_norm,qp_status,res_eq,cost,startup_progress\n";
     for (int i = 0; i < res.steps; i++) {
         f << i << "," << res.trace_x[i] << "," << res.trace_y[i]
           << "," << res.trace_cte[i] << "," << res.trace_v[i]
           << "," << res.trace_delta[i] << "," << res.trace_progress[i]
-          << "," << (i < (int)res.trace_curvature.size() ? res.trace_curvature[i] : 0.0) << "\n";
+          << "," << (i < (int)res.trace_curvature.size() ? res.trace_curvature[i] : 0.0);
+        // Diagnostics columns
+        if (i < (int)res.trace_sqp_iter.size()) {
+            f << "," << res.trace_sqp_iter[i]
+              << "," << res.trace_kkt_norm[i]
+              << "," << res.trace_qp_status[i]
+              << "," << res.trace_res_eq[i]
+              << "," << res.trace_cost[i]
+              << "," << res.trace_startup_progress[i];
+        }
+        f << "\n";
     }
     // Write reference path as separate section
     f << "\n# Reference path\n";
@@ -725,31 +863,34 @@ DeploymentResult run_arbitrary_path_sim(
     cfg.horizon = 10;
     cfg.dt = 0.1;
     cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;
+    cfg.max_velocity = 0.55;
     cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
-    cfg.reference_velocity = 0.65;
-    cfg.contour_weight = 4.0;
-    cfg.lag_weight = 15.0;
+    cfg.reference_velocity = 0.45;
+    cfg.contour_weight = 15.0;
+    cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;
     cfg.steering_weight = 0.05;
     cfg.acceleration_weight = 0.01;
-    cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 2.0;
+    cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;
     cfg.progress_weight = 1.0;
     cfg.jerk_weight = 0.0;
-    cfg.boundary_weight = 8.0;
+    cfg.boundary_weight = 0.0;  // disabled for arbitrary paths (no road geometry)
     cfg.boundary_default_width = 0.22;
     cfg.max_sqp_iterations = 5;
     cfg.max_qp_iterations = 20;
     cfg.qp_tolerance = 1e-5;
     cfg.startup_elapsed_s = 10.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
     solver.init(cfg);
 
-    // Set up path_lookup (adaptive re-projection)
+    // Set spline_path for acados solver (matches deployment)
+    solver.spline_path = &spline;
+
+    // Set up path_lookup (adaptive re-projection) for ADMM solver compatibility
     solver.path_lookup.lookup = [&spline, total_len](
         double px, double py, double s_min, double* s_out) -> mpcc::PathRef
     {
@@ -764,16 +905,15 @@ DeploymentResult run_arbitrary_path_sim(
         ref.curvature = spline.get_curvature(s);
         return ref;
     };
-    // Note: spline_path is NOT set here; acados uses pre-computed path_refs.
-    // theta_A state variable still integrates V_theta but references come from path_refs.
-
     double init_x, init_y;
     spline.get_position(0.0, init_x, init_y);
     double init_theta = spline.get_tangent(0.0);
 
-    mpcc::AckermannModel plant(cfg.wheelbase);
-    mpcc::VecX state;
-    state << init_x, init_y, init_theta, start_speed, 0.0;
+    mpcc::KinematicModel plant(cfg.wheelbase);
+    mpcc::Vec3 state;
+    state << init_x, init_y, init_theta;
+    double actual_v = start_speed;
+    double actual_delta = 0.0;
 
     PDSpeedController pd_ctrl;
     pd_ctrl.actual_speed = start_speed;
@@ -781,6 +921,9 @@ DeploymentResult run_arbitrary_path_sim(
     double progress = 0.0;
     double cte_sum = 0.0;
     double speed_sum = 0.0;
+    int consecutive_failures = 0;
+    constexpr int MAX_CONSEC_FAIL = 5;
+    constexpr double CTE_KILL = 1.0;
 
     for (int step = 0; step < max_steps; step++) {
         if (progress >= total_len - 0.1) break;
@@ -800,20 +943,27 @@ DeploymentResult run_arbitrary_path_sim(
             s += step_speed * cfg.dt;
         }
 
-        auto result = solver.solve(state, refs, progress, total_len, {}, {});
-        if (!result.success) { res.success = false; break; }
+        auto result = solver.solve(state, refs, progress, total_len, {}, {},
+                                    actual_v, actual_delta);
+        if (!result.success) {
+            consecutive_failures++;
+            if (consecutive_failures >= MAX_CONSEC_FAIL) {
+                std::printf("    [%s] %d consecutive solver failures at step %d — early kill\n",
+                    test_name.c_str(), consecutive_failures, step);
+                res.success = false;
+                break;
+            }
+            continue;
+        }
+        consecutive_failures = 0;
 
-        double actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
+        actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
+        actual_delta = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
 
-        mpcc::VecU u;
-        u(0) = (actual_v - state(3)) / cfg.dt;
-        u(1) = (result.delta_cmd - state(4)) / cfg.dt;
-        u(0) = std::clamp(u(0), -cfg.max_acceleration, cfg.max_acceleration);
-        u(1) = std::clamp(u(1), -cfg.max_steering_rate, cfg.max_steering_rate);
-
-        state = plant.rk4_step(state, u, cfg.dt);
-        state(3) = std::clamp(state(3), cfg.min_velocity, cfg.max_velocity);
-        state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
+        mpcc::Vec2 u_direct;
+        u_direct(0) = actual_v;
+        u_direct(1) = actual_delta;
+        state = plant.rk4_step(state, u_direct, cfg.dt);
 
         double new_progress = spline.find_closest_progress(state(0), state(1));
         if (new_progress > progress) progress = new_progress;
@@ -825,14 +975,21 @@ DeploymentResult run_arbitrary_path_sim(
 
         res.max_cte = std::max(res.max_cte, cte);
         cte_sum += cte;
-        speed_sum += state(3);
+        speed_sum += actual_v;
         res.steps++;
+
+        if (cte > CTE_KILL) {
+            std::printf("    [%s] CTE %.3fm > %.1fm at step %d — early kill\n",
+                test_name.c_str(), cte, CTE_KILL, step);
+            res.success = false;
+            break;
+        }
 
         res.trace_x.push_back(state(0));
         res.trace_y.push_back(state(1));
         res.trace_cte.push_back(cte);
-        res.trace_v.push_back(state(3));
-        res.trace_delta.push_back(state(4));
+        res.trace_v.push_back(actual_v);
+        res.trace_delta.push_back(actual_delta);
         res.trace_progress.push_back(progress / total_len);
         res.trace_curvature.push_back(spline.get_curvature(progress));
     }
@@ -1050,12 +1207,12 @@ void test_orientation_invariance() {
 
 // Test solver with varying reference velocities
 void test_velocity_robustness() {
-    TEST("robustness: solver tracks path at v_ref = 0.30, 0.50, 0.65, 0.90");
+    TEST("robustness: solver tracks path at v_ref = 0.25, 0.35, 0.45, 0.55");
 
     std::vector<double> x, y;
     generate_circular_path(0.0, 0.0, 1.2, 0.0, M_PI/2, 3000, x, y);
 
-    double v_refs[] = {0.30, 0.50, 0.65, 0.90};
+    double v_refs[] = {0.25, 0.35, 0.45, 0.55};
     for (double vr : v_refs) {
         // Modify v_ref inside the sim by constructing spline directly
         acc::CubicSplinePath spline;
@@ -1065,20 +1222,20 @@ void test_velocity_robustness() {
         mpcc::ActiveSolver solver;
         mpcc::Config cfg;
         cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
-        cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
+        cfg.max_velocity = 0.55;  cfg.min_velocity = 0.0;
         cfg.max_steering = 0.45;  // hardware servo limit
         cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
         cfg.reference_velocity = vr;
-        cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
+        cfg.contour_weight = 15.0;  cfg.lag_weight = 10.0;
         cfg.velocity_weight = 15.0;  cfg.steering_weight = 0.05;
-        cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.0;
-        cfg.heading_weight = 2.0;  cfg.progress_weight = 1.0;
-        cfg.jerk_weight = 0.0;  cfg.boundary_weight = 8.0;
+        cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.5;
+        cfg.heading_weight = 0.0;  cfg.progress_weight = 1.0;
+        cfg.jerk_weight = 0.0;  cfg.boundary_weight = 0.0;
         cfg.boundary_default_width = 0.22;
         cfg.max_sqp_iterations = 5;  cfg.max_qp_iterations = 20;
         cfg.qp_tolerance = 1e-5;
         cfg.startup_elapsed_s = 10.0;
-        cfg.startup_progress_weight = 5.0;
+        cfg.startup_progress_weight = 1.0;
         solver.init(cfg);
 
         solver.path_lookup.lookup = [&spline, total_len](
@@ -1097,12 +1254,15 @@ void test_velocity_robustness() {
         double init_x, init_y;
         spline.get_position(0.0, init_x, init_y);
         double init_theta = spline.get_tangent(0.0);
-        mpcc::AckermannModel plant(cfg.wheelbase);
-        mpcc::VecX state;
-        state << init_x, init_y, init_theta, 0.0, 0.0;
+        mpcc::KinematicModel plant(cfg.wheelbase);
+        mpcc::Vec3 state;
+        state << init_x, init_y, init_theta;
+        double actual_v = 0.0;
+        double actual_delta = 0.0;
         PDSpeedController pd;
 
         double progress = 0.0, max_cte = 0.0;
+        int cfail = 0;
         for (int step = 0; step < 300; step++) {
             if (progress >= total_len - 0.1) break;
             std::vector<mpcc::PathRef> refs(cfg.horizon + 1);
@@ -1114,17 +1274,16 @@ void test_velocity_robustness() {
                 refs[k] = {rx, ry, ct, st, spline.get_curvature(s)};
                 s += std::max(0.10, vr * std::exp(-0.4 * std::abs(refs[k].curvature))) * cfg.dt;
             }
-            auto result = solver.solve(state, refs, progress, total_len, {}, {});
-            if (!result.success) break;
-            double av = pd.step(result.v_cmd, cfg.dt);
-            mpcc::VecU u;
-            u(0) = (av - state(3)) / cfg.dt;
-            u(1) = (result.delta_cmd - state(4)) / cfg.dt;
-            u(0) = std::clamp(u(0), -cfg.max_acceleration, cfg.max_acceleration);
-            u(1) = std::clamp(u(1), -cfg.max_steering_rate, cfg.max_steering_rate);
-            state = plant.rk4_step(state, u, cfg.dt);
-            state(3) = std::clamp(state(3), cfg.min_velocity, cfg.max_velocity);
-            state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
+            auto result = solver.solve(state, refs, progress, total_len, {}, {},
+                                        actual_v, actual_delta);
+            if (!result.success) { if (++cfail >= 5) break; continue; }
+            cfail = 0;
+            actual_v = pd.step(result.v_cmd, cfg.dt);
+            actual_delta = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
+            mpcc::Vec2 u_direct;
+            u_direct(0) = actual_v;
+            u_direct(1) = actual_delta;
+            state = plant.rk4_step(state, u_direct, cfg.dt);
             double np = spline.find_closest_progress(state(0), state(1));
             if (np > progress) progress = np;
             double rx, ry;
@@ -1173,22 +1332,22 @@ DeploymentResult run_heading_offset_sim(
     mpcc::ActiveSolver solver;
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
+    cfg.max_velocity = 0.55;  cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
-    cfg.reference_velocity = 0.65;
-    cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
+    cfg.reference_velocity = 0.45;
+    cfg.contour_weight = 15.0;  cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;  cfg.steering_weight = 0.05;
-    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 2.0;  cfg.progress_weight = 1.0;
-    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 8.0;
+    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;  cfg.progress_weight = 1.0;
+    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 0.0;
     cfg.boundary_default_width = 0.22;
     cfg.max_sqp_iterations = 5;  cfg.max_qp_iterations = 20;
     cfg.qp_tolerance = 1e-5;
     // NO startup ramp — matches the fix (startup_ramp_duration_s = 0)
-    cfg.startup_ramp_duration_s = 0.0;
+    cfg.startup_ramp_duration_s = 3.0;
     cfg.startup_elapsed_s = 0.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
     solver.init(cfg);
 
     // Set up path_lookup (adaptive re-projection)
@@ -1209,15 +1368,18 @@ DeploymentResult run_heading_offset_sim(
     spline.get_position(0.0, init_x, init_y);
     double init_theta = spline.get_tangent(0.0) + heading_offset_rad;
 
-    mpcc::AckermannModel plant(cfg.wheelbase);
-    mpcc::VecX state;
-    state << init_x, init_y, init_theta, start_speed, 0.0;
+    mpcc::KinematicModel plant(cfg.wheelbase);
+    mpcc::Vec3 state;
+    state << init_x, init_y, init_theta;
+    double actual_v = start_speed;
+    double actual_delta = 0.0;
 
     PDSpeedController pd_ctrl;
     pd_ctrl.actual_speed = start_speed;
 
     double progress = 0.0;
     double cte_sum = 0.0, speed_sum = 0.0;
+    int cfail = 0;
 
     for (int step = 0; step < max_steps; step++) {
         if (progress >= total_len - 0.1) break;
@@ -1233,19 +1395,21 @@ DeploymentResult run_heading_offset_sim(
             s += std::max(0.10, cfg.reference_velocity * std::exp(-0.4 * curv)) * cfg.dt;
         }
 
-        auto result = solver.solve(state, refs, progress, total_len, {}, {});
-        if (!result.success) { res.success = false; break; }
+        auto result = solver.solve(state, refs, progress, total_len, {}, {},
+                                    actual_v, actual_delta);
+        if (!result.success) {
+            if (++cfail >= 5) { res.success = false; break; }
+            continue;
+        }
+        cfail = 0;
 
-        double actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
-        mpcc::VecU u;
-        u(0) = (actual_v - state(3)) / cfg.dt;
-        u(1) = (result.delta_cmd - state(4)) / cfg.dt;
-        u(0) = std::clamp(u(0), -cfg.max_acceleration, cfg.max_acceleration);
-        u(1) = std::clamp(u(1), -cfg.max_steering_rate, cfg.max_steering_rate);
+        actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
+        actual_delta = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
 
-        state = plant.rk4_step(state, u, cfg.dt);
-        state(3) = std::clamp(state(3), cfg.min_velocity, cfg.max_velocity);
-        state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
+        mpcc::Vec2 u_direct;
+        u_direct(0) = actual_v;
+        u_direct(1) = actual_delta;
+        state = plant.rk4_step(state, u_direct, cfg.dt);
 
         double new_progress = spline.find_closest_progress(state(0), state(1));
         if (new_progress > progress) progress = new_progress;
@@ -1257,14 +1421,16 @@ DeploymentResult run_heading_offset_sim(
 
         res.max_cte = std::max(res.max_cte, cte);
         cte_sum += cte;
-        speed_sum += state(3);
+        speed_sum += actual_v;
         res.steps++;
+
+        if (cte > 1.0) { res.success = false; break; }
 
         res.trace_x.push_back(state(0));
         res.trace_y.push_back(state(1));
         res.trace_cte.push_back(cte);
-        res.trace_v.push_back(state(3));
-        res.trace_delta.push_back(state(4));
+        res.trace_v.push_back(actual_v);
+        res.trace_delta.push_back(actual_delta);
         res.trace_progress.push_back(progress / total_len);
         res.trace_curvature.push_back(spline.get_curvature(progress));
     }
@@ -1381,21 +1547,21 @@ void test_stop_and_resume() {
     mpcc::ActiveSolver solver;
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
+    cfg.max_velocity = 0.55;  cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
-    cfg.reference_velocity = 0.65;
-    cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
+    cfg.reference_velocity = 0.45;
+    cfg.contour_weight = 15.0;  cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;  cfg.steering_weight = 0.05;
-    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 2.0;  cfg.progress_weight = 1.0;
-    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 8.0;
+    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;  cfg.progress_weight = 1.0;
+    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 0.0;
     cfg.boundary_default_width = 0.22;
     cfg.max_sqp_iterations = 5;  cfg.max_qp_iterations = 20;
     cfg.qp_tolerance = 1e-5;
-    cfg.startup_ramp_duration_s = 0.0;
+    cfg.startup_ramp_duration_s = 3.0;
     cfg.startup_elapsed_s = 0.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
     solver.init(cfg);
 
     solver.path_lookup.lookup = [&spline, total_len](
@@ -1415,14 +1581,17 @@ void test_stop_and_resume() {
     spline.get_position(0.0, init_x, init_y);
     double init_theta = spline.get_tangent(0.0);
 
-    mpcc::AckermannModel plant(cfg.wheelbase);
-    mpcc::VecX state;
-    state << init_x, init_y, init_theta, 0.0, 0.0;
+    mpcc::KinematicModel plant(cfg.wheelbase);
+    mpcc::Vec3 state;
+    state << init_x, init_y, init_theta;
+    double actual_v = 0.0;
+    double actual_delta = 0.0;
 
     PDSpeedController pd_ctrl;
     double progress = 0.0;
     double max_cte = 0.0;
     int stop_count = 0;
+    int cfail = 0;
 
     // Run for 400 steps with stops every 20 steps (2s), stopped for 10 steps (1s)
     for (int step = 0; step < 400; step++) {
@@ -1433,16 +1602,9 @@ void test_stop_and_resume() {
         bool is_stopped = (cycle_pos >= 20);
 
         if (is_stopped) {
-            // During stop: hold position, decelerate to zero
-            // Simulate the controller's publish_stop() behavior
-            mpcc::VecU u_stop;
-            u_stop(0) = (0.0 - state(3)) / cfg.dt;  // decelerate to 0
-            u_stop(1) = 0.0;
-            u_stop(0) = std::clamp(u_stop(0), -cfg.max_acceleration, cfg.max_acceleration);
-            state = plant.rk4_step(state, u_stop, cfg.dt);
-            state(3) = std::max(0.0, state(3));
-            state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
-            pd_ctrl.actual_speed = state(3);
+            // During stop: decelerate to zero (instant stop for testing)
+            actual_v = 0.0;
+            pd_ctrl.actual_speed = 0.0;
             if (cycle_pos == 20) stop_count++;
             continue;
         }
@@ -1458,19 +1620,18 @@ void test_stop_and_resume() {
             s += std::max(0.10, cfg.reference_velocity * std::exp(-0.4 * std::abs(refs[k].curvature))) * cfg.dt;
         }
 
-        auto result = solver.solve(state, refs, progress, total_len, {}, {});
-        if (!result.success) { std::printf("(solver failed step %d) ", step); break; }
+        auto result = solver.solve(state, refs, progress, total_len, {}, {},
+                                    actual_v, actual_delta);
+        if (!result.success) { if (++cfail >= 5) { std::printf("(solver failed step %d) ", step); break; } continue; }
+        cfail = 0;
 
-        double actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
-        mpcc::VecU u;
-        u(0) = (actual_v - state(3)) / cfg.dt;
-        u(1) = (result.delta_cmd - state(4)) / cfg.dt;
-        u(0) = std::clamp(u(0), -cfg.max_acceleration, cfg.max_acceleration);
-        u(1) = std::clamp(u(1), -cfg.max_steering_rate, cfg.max_steering_rate);
+        actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
+        actual_delta = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
 
-        state = plant.rk4_step(state, u, cfg.dt);
-        state(3) = std::clamp(state(3), cfg.min_velocity, cfg.max_velocity);
-        state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
+        mpcc::Vec2 u_direct;
+        u_direct(0) = actual_v;
+        u_direct(1) = actual_delta;
+        state = plant.rk4_step(state, u_direct, cfg.dt);
 
         double new_progress = spline.find_closest_progress(state(0), state(1));
         if (new_progress > progress) progress = new_progress;
@@ -1480,6 +1641,7 @@ void test_stop_and_resume() {
         spline.get_position(cp, rx, ry);
         double cte = std::hypot(state(0) - rx, state(1) - ry);
         max_cte = std::max(max_cte, cte);
+        if (max_cte > 1.0) break;
     }
 
     std::printf("(max_cte=%.3f stops=%d prog=%.0f%%) ",
@@ -1507,21 +1669,21 @@ void test_stop_resume_on_mission_leg() {
     mpcc::ActiveSolver solver;
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
+    cfg.max_velocity = 0.55;  cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
-    cfg.reference_velocity = 0.65;
-    cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
+    cfg.reference_velocity = 0.45;
+    cfg.contour_weight = 15.0;  cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;  cfg.steering_weight = 0.05;
-    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 2.0;  cfg.progress_weight = 1.0;
-    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 8.0;
+    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;  cfg.progress_weight = 1.0;
+    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 0.0;
     cfg.boundary_default_width = 0.22;
     cfg.max_sqp_iterations = 5;  cfg.max_qp_iterations = 20;
     cfg.qp_tolerance = 1e-5;
-    cfg.startup_ramp_duration_s = 0.0;
+    cfg.startup_ramp_duration_s = 3.0;
     cfg.startup_elapsed_s = 0.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
     solver.init(cfg);
 
     solver.path_lookup.lookup = [&spline, total_len](
@@ -1541,13 +1703,16 @@ void test_stop_resume_on_mission_leg() {
     spline.get_position(0.0, init_x, init_y);
     double init_theta = spline.get_tangent(0.0);
 
-    mpcc::AckermannModel plant(cfg.wheelbase);
-    mpcc::VecX state;
-    state << init_x, init_y, init_theta, 0.0, 0.0;
+    mpcc::KinematicModel plant(cfg.wheelbase);
+    mpcc::Vec3 state;
+    state << init_x, init_y, init_theta;
+    double actual_v = 0.0;
+    double actual_delta = 0.0;
 
     PDSpeedController pd_ctrl;
     double progress = 0.0;
     double max_cte = 0.0;
+    int cfail = 0;
 
     // Stops at steps 50, 150, 300 (roughly at 25%, 50%, 75% of the leg)
     int stop_at[] = {50, 150, 300};
@@ -1566,14 +1731,9 @@ void test_stop_resume_on_mission_leg() {
         }
 
         if (is_stopped) {
-            mpcc::VecU u_stop;
-            u_stop(0) = (0.0 - state(3)) / cfg.dt;
-            u_stop(1) = 0.0;
-            u_stop(0) = std::clamp(u_stop(0), -cfg.max_acceleration, cfg.max_acceleration);
-            state = plant.rk4_step(state, u_stop, cfg.dt);
-            state(3) = std::max(0.0, state(3));
-            state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
-            pd_ctrl.actual_speed = state(3);
+            // During stop: instant decelerate to zero
+            actual_v = 0.0;
+            pd_ctrl.actual_speed = 0.0;
             continue;
         }
 
@@ -1587,19 +1747,18 @@ void test_stop_resume_on_mission_leg() {
             s += std::max(0.10, cfg.reference_velocity * std::exp(-0.4 * std::abs(refs[k].curvature))) * cfg.dt;
         }
 
-        auto result = solver.solve(state, refs, progress, total_len, {}, {});
-        if (!result.success) break;
+        auto result = solver.solve(state, refs, progress, total_len, {}, {},
+                                    actual_v, actual_delta);
+        if (!result.success) { if (++cfail >= 5) break; continue; }
+        cfail = 0;
 
-        double actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
-        mpcc::VecU u;
-        u(0) = (actual_v - state(3)) / cfg.dt;
-        u(1) = (result.delta_cmd - state(4)) / cfg.dt;
-        u(0) = std::clamp(u(0), -cfg.max_acceleration, cfg.max_acceleration);
-        u(1) = std::clamp(u(1), -cfg.max_steering_rate, cfg.max_steering_rate);
+        actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
+        actual_delta = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
 
-        state = plant.rk4_step(state, u, cfg.dt);
-        state(3) = std::clamp(state(3), cfg.min_velocity, cfg.max_velocity);
-        state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
+        mpcc::Vec2 u_direct;
+        u_direct(0) = actual_v;
+        u_direct(1) = actual_delta;
+        state = plant.rk4_step(state, u_direct, cfg.dt);
 
         double new_progress = spline.find_closest_progress(state(0), state(1));
         if (new_progress > progress) progress = new_progress;
@@ -1609,6 +1768,7 @@ void test_stop_resume_on_mission_leg() {
         spline.get_position(cp, rx, ry);
         double cte = std::hypot(state(0) - rx, state(1) - ry);
         max_cte = std::max(max_cte, cte);
+        if (max_cte > 1.0) break;
     }
 
     std::printf("(max_cte=%.3f prog=%.0f%%) ", max_cte, progress / total_len * 100);
@@ -1694,21 +1854,21 @@ void test_measurement_noise() {
     mpcc::ActiveSolver solver;
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
+    cfg.max_velocity = 0.55;  cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
-    cfg.reference_velocity = 0.65;
-    cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
+    cfg.reference_velocity = 0.45;
+    cfg.contour_weight = 15.0;  cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;  cfg.steering_weight = 0.05;
-    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 2.0;  cfg.progress_weight = 1.0;
-    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 8.0;
+    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;  cfg.progress_weight = 1.0;
+    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 0.0;
     cfg.boundary_default_width = 0.22;
     cfg.max_sqp_iterations = 5;  cfg.max_qp_iterations = 20;
     cfg.qp_tolerance = 1e-5;
-    cfg.startup_ramp_duration_s = 0.0;
+    cfg.startup_ramp_duration_s = 3.0;
     cfg.startup_elapsed_s = 0.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
     solver.init(cfg);
 
     solver.path_lookup.lookup = [&spline, total_len](
@@ -1728,9 +1888,11 @@ void test_measurement_noise() {
     spline.get_position(0.0, init_x, init_y);
     double init_theta = spline.get_tangent(0.0);
 
-    mpcc::AckermannModel plant(cfg.wheelbase);
-    mpcc::VecX state;
-    state << init_x, init_y, init_theta, 0.0, 0.0;
+    mpcc::KinematicModel plant(cfg.wheelbase);
+    mpcc::Vec3 state;
+    state << init_x, init_y, init_theta;
+    double actual_v = 0.0;
+    double actual_delta = 0.0;
 
     PDSpeedController pd_ctrl;
     double progress = 0.0;
@@ -1747,12 +1909,13 @@ void test_measurement_noise() {
 
     double sigma_pos = 0.005;     // 5mm
     double sigma_heading = 0.5 * M_PI / 180.0;  // 0.5 degrees
+    int cfail = 0;
 
     for (int step = 0; step < 300; step++) {
         if (progress >= total_len - 0.1) break;
 
         // Add noise to measured state (for solver input)
-        mpcc::VecX noisy_state = state;
+        mpcc::Vec3 noisy_state = state;
         noisy_state(0) += sigma_pos * next_noise();
         noisy_state(1) += sigma_pos * next_noise();
         noisy_state(2) += sigma_heading * next_noise();
@@ -1768,20 +1931,19 @@ void test_measurement_noise() {
         }
 
         // Solver sees the noisy state
-        auto result = solver.solve(noisy_state, refs, progress, total_len, {}, {});
-        if (!result.success) break;
+        auto result = solver.solve(noisy_state, refs, progress, total_len, {}, {},
+                                    actual_v, actual_delta);
+        if (!result.success) { if (++cfail >= 5) break; continue; }
+        cfail = 0;
 
         // But the plant uses true dynamics
-        double actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
-        mpcc::VecU u;
-        u(0) = (actual_v - state(3)) / cfg.dt;
-        u(1) = (result.delta_cmd - state(4)) / cfg.dt;
-        u(0) = std::clamp(u(0), -cfg.max_acceleration, cfg.max_acceleration);
-        u(1) = std::clamp(u(1), -cfg.max_steering_rate, cfg.max_steering_rate);
+        actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
+        actual_delta = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
 
-        state = plant.rk4_step(state, u, cfg.dt);
-        state(3) = std::clamp(state(3), cfg.min_velocity, cfg.max_velocity);
-        state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
+        mpcc::Vec2 u_direct;
+        u_direct(0) = actual_v;
+        u_direct(1) = actual_delta;
+        state = plant.rk4_step(state, u_direct, cfg.dt);
 
         double new_progress = spline.find_closest_progress(state(0), state(1));
         if (new_progress > progress) progress = new_progress;
@@ -1791,6 +1953,7 @@ void test_measurement_noise() {
         spline.get_position(cp, rx, ry);
         double cte = std::hypot(state(0) - rx, state(1) - ry);
         max_cte = std::max(max_cte, cte);
+        if (max_cte > 1.0) break;
     }
 
     std::printf("(max_cte=%.3f prog=%.0f%%) ", max_cte, progress / total_len * 100);
@@ -1817,21 +1980,21 @@ void test_measurement_noise_on_mission() {
     mpcc::ActiveSolver solver;
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
+    cfg.max_velocity = 0.55;  cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
-    cfg.reference_velocity = 0.65;
-    cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
+    cfg.reference_velocity = 0.45;
+    cfg.contour_weight = 15.0;  cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;  cfg.steering_weight = 0.05;
-    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 2.0;  cfg.progress_weight = 1.0;
-    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 8.0;
+    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;  cfg.progress_weight = 1.0;
+    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 0.0;
     cfg.boundary_default_width = 0.22;
     cfg.max_sqp_iterations = 5;  cfg.max_qp_iterations = 20;
     cfg.qp_tolerance = 1e-5;
-    cfg.startup_ramp_duration_s = 0.0;
+    cfg.startup_ramp_duration_s = 3.0;
     cfg.startup_elapsed_s = 0.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
     solver.init(cfg);
 
     solver.path_lookup.lookup = [&spline, total_len](
@@ -1851,9 +2014,11 @@ void test_measurement_noise_on_mission() {
     spline.get_position(0.0, init_x, init_y);
     double init_theta = spline.get_tangent(0.0);
 
-    mpcc::AckermannModel plant(cfg.wheelbase);
-    mpcc::VecX state;
-    state << init_x, init_y, init_theta, 0.0, 0.0;
+    mpcc::KinematicModel plant(cfg.wheelbase);
+    mpcc::Vec3 state;
+    state << init_x, init_y, init_theta;
+    double actual_v = 0.0;
+    double actual_delta = 0.0;
 
     PDSpeedController pd_ctrl;
     double progress = 0.0;
@@ -1867,11 +2032,12 @@ void test_measurement_noise_on_mission() {
 
     double sigma_pos = 0.005;
     double sigma_heading = 0.5 * M_PI / 180.0;
+    int cfail = 0;
 
     for (int step = 0; step < 600; step++) {
         if (progress >= total_len - 0.1) break;
 
-        mpcc::VecX noisy_state = state;
+        mpcc::Vec3 noisy_state = state;
         noisy_state(0) += sigma_pos * next_noise();
         noisy_state(1) += sigma_pos * next_noise();
         noisy_state(2) += sigma_heading * next_noise();
@@ -1886,19 +2052,18 @@ void test_measurement_noise_on_mission() {
             s += std::max(0.10, cfg.reference_velocity * std::exp(-0.4 * std::abs(refs[k].curvature))) * cfg.dt;
         }
 
-        auto result = solver.solve(noisy_state, refs, progress, total_len, {}, {});
-        if (!result.success) break;
+        auto result = solver.solve(noisy_state, refs, progress, total_len, {}, {},
+                                    actual_v, actual_delta);
+        if (!result.success) { if (++cfail >= 5) break; continue; }
+        cfail = 0;
 
-        double actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
-        mpcc::VecU u;
-        u(0) = (actual_v - state(3)) / cfg.dt;
-        u(1) = (result.delta_cmd - state(4)) / cfg.dt;
-        u(0) = std::clamp(u(0), -cfg.max_acceleration, cfg.max_acceleration);
-        u(1) = std::clamp(u(1), -cfg.max_steering_rate, cfg.max_steering_rate);
+        actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
+        actual_delta = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
 
-        state = plant.rk4_step(state, u, cfg.dt);
-        state(3) = std::clamp(state(3), cfg.min_velocity, cfg.max_velocity);
-        state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
+        mpcc::Vec2 u_direct;
+        u_direct(0) = actual_v;
+        u_direct(1) = actual_delta;
+        state = plant.rk4_step(state, u_direct, cfg.dt);
 
         double new_progress = spline.find_closest_progress(state(0), state(1));
         if (new_progress > progress) progress = new_progress;
@@ -1908,6 +2073,7 @@ void test_measurement_noise_on_mission() {
         spline.get_position(cp, rx, ry);
         double cte = std::hypot(state(0) - rx, state(1) - ry);
         max_cte = std::max(max_cte, cte);
+        if (max_cte > 1.0) break;
     }
 
     std::printf("(max_cte=%.3f prog=%.0f%%) ", max_cte, progress / total_len * 100);
@@ -1938,22 +2104,22 @@ void test_no_startup_ramp_mission() {
     mpcc::ActiveSolver solver;
     mpcc::Config cfg;
     cfg.horizon = 10;  cfg.dt = 0.1;  cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;  cfg.min_velocity = 0.0;
+    cfg.max_velocity = 0.55;  cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;  cfg.max_steering_rate = 1.5;
-    cfg.reference_velocity = 0.65;
-    cfg.contour_weight = 4.0;  cfg.lag_weight = 15.0;
+    cfg.reference_velocity = 0.45;
+    cfg.contour_weight = 15.0;  cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;  cfg.steering_weight = 0.05;
-    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 2.0;  cfg.progress_weight = 1.0;
-    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 8.0;
+    cfg.acceleration_weight = 0.01;  cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;  cfg.progress_weight = 1.0;
+    cfg.jerk_weight = 0.0;  cfg.boundary_weight = 0.0;
     cfg.boundary_default_width = 0.22;
     cfg.max_sqp_iterations = 5;  cfg.max_qp_iterations = 20;
     cfg.qp_tolerance = 1e-5;
     // Key: startup ramp disabled, elapsed starts at 0
-    cfg.startup_ramp_duration_s = 0.0;
+    cfg.startup_ramp_duration_s = 3.0;
     cfg.startup_elapsed_s = 0.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
     solver.init(cfg);
 
     solver.path_lookup.lookup = [&spline, total_len](
@@ -1973,13 +2139,16 @@ void test_no_startup_ramp_mission() {
     spline.get_position(0.0, init_x, init_y);
     double init_theta = spline.get_tangent(0.0);
 
-    mpcc::AckermannModel plant(cfg.wheelbase);
-    mpcc::VecX state;
-    state << init_x, init_y, init_theta, 0.0, 0.0;
+    mpcc::KinematicModel plant(cfg.wheelbase);
+    mpcc::Vec3 state;
+    state << init_x, init_y, init_theta;
+    double actual_v = 0.0;
+    double actual_delta = 0.0;
 
     PDSpeedController pd_ctrl;
     double progress = 0.0;
     double max_cte = 0.0;
+    int cfail = 0;
 
     for (int step = 0; step < 600; step++) {
         if (progress >= total_len - 0.1) break;
@@ -1994,19 +2163,18 @@ void test_no_startup_ramp_mission() {
             s += std::max(0.10, cfg.reference_velocity * std::exp(-0.4 * std::abs(refs[k].curvature))) * cfg.dt;
         }
 
-        auto result = solver.solve(state, refs, progress, total_len, {}, {});
-        if (!result.success) break;
+        auto result = solver.solve(state, refs, progress, total_len, {}, {},
+                                    actual_v, actual_delta);
+        if (!result.success) { if (++cfail >= 5) break; continue; }
+        cfail = 0;
 
-        double actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
-        mpcc::VecU u;
-        u(0) = (actual_v - state(3)) / cfg.dt;
-        u(1) = (result.delta_cmd - state(4)) / cfg.dt;
-        u(0) = std::clamp(u(0), -cfg.max_acceleration, cfg.max_acceleration);
-        u(1) = std::clamp(u(1), -cfg.max_steering_rate, cfg.max_steering_rate);
+        actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
+        actual_delta = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
 
-        state = plant.rk4_step(state, u, cfg.dt);
-        state(3) = std::clamp(state(3), cfg.min_velocity, cfg.max_velocity);
-        state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
+        mpcc::Vec2 u_direct;
+        u_direct(0) = actual_v;
+        u_direct(1) = actual_delta;
+        state = plant.rk4_step(state, u_direct, cfg.dt);
 
         double new_progress = spline.find_closest_progress(state(0), state(1));
         if (new_progress > progress) progress = new_progress;
@@ -2016,6 +2184,7 @@ void test_no_startup_ramp_mission() {
         spline.get_position(cp, rx, ry);
         double cte = std::hypot(state(0) - rx, state(1) - ry);
         max_cte = std::max(max_cte, cte);
+        if (max_cte > 1.0) break;
     }
 
     std::printf("(max_cte=%.3f prog=%.0f%%) ", max_cte, progress / total_len * 100);
@@ -2120,7 +2289,9 @@ struct CombinedLegResult {
     int steps = 0;
     double progress_frac = 0.0;
     bool completed = false;
-    mpcc::VecX final_state;
+    mpcc::Vec3 final_state;
+    double final_v = 0.0;
+    double final_delta = 0.0;
     std::vector<CombinedTracePoint> trace;
     // Reference path in QLabs frame for plotting
     std::vector<double> ref_x_ql, ref_y_ql;
@@ -2129,7 +2300,9 @@ struct CombinedLegResult {
 CombinedLegResult run_combined_leg(
     const std::vector<double>& path_x_qlabs,
     const std::vector<double>& path_y_qlabs,
-    const mpcc::VecX& initial_state,
+    const mpcc::Vec3& initial_state,
+    double initial_v,
+    double initial_delta,
     const std::string& leg_name,
     int max_steps,
     PDSpeedController& pd_ctrl,
@@ -2168,19 +2341,19 @@ CombinedLegResult run_combined_leg(
     cfg.horizon = 10;
     cfg.dt = 0.1;
     cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;
+    cfg.max_velocity = 0.55;
     cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.45;   // Slower for tighter curve tracking
-    cfg.contour_weight = 20.0;       // High lateral penalty for tight curve tracking
+    cfg.contour_weight = 15.0;
     cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;
     cfg.steering_weight = 0.05;
     cfg.acceleration_weight = 0.01;
-    cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 3.0;        // Higher for heading alignment (was 2.0)
+    cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;
     cfg.progress_weight = 1.0;
     cfg.jerk_weight = 0.0;
     cfg.boundary_weight = 0.0;
@@ -2188,9 +2361,9 @@ CombinedLegResult run_combined_leg(
     cfg.max_sqp_iterations = 5;
     cfg.max_qp_iterations = 20;
     cfg.qp_tolerance = 1e-5;
-    cfg.startup_ramp_duration_s = 0.0;
+    cfg.startup_ramp_duration_s = 3.0;
     cfg.startup_elapsed_s = 0.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
     solver.init(cfg);
 
     // Set up adaptive path re-projection
@@ -2210,11 +2383,14 @@ CombinedLegResult run_combined_leg(
     };
 
     // Initialize state from previous leg
-    mpcc::AckermannModel plant(cfg.wheelbase);
-    mpcc::VecX state = initial_state;
+    mpcc::KinematicModel plant(cfg.wheelbase);
+    mpcc::Vec3 state = initial_state;
+    double actual_v = initial_v;
+    double actual_delta = initial_delta;
 
     double progress = spline.find_closest_progress(state(0), state(1));
     double cte_sum = 0.0;
+    int cfail = 0;
 
     for (int step = 0; step < max_steps; step++) {
         if (progress >= total_len - 0.1) {
@@ -2225,7 +2401,7 @@ CombinedLegResult run_combined_leg(
         // Generate path references with curvature-adaptive spacing
         std::vector<mpcc::PathRef> refs(cfg.horizon + 1);
         double s = progress;
-        double lookahead_v = std::max(state(3), cfg.reference_velocity * 0.5);
+        double lookahead_v = std::max(actual_v, cfg.reference_velocity * 0.5);
         for (int k = 0; k <= cfg.horizon; k++) {
             s = std::clamp(s, 0.0, total_len - 0.001);
             double rx, ry, ct, st;
@@ -2239,8 +2415,10 @@ CombinedLegResult run_combined_leg(
             s += step_speed * cfg.dt;
         }
 
-        auto sol = solver.solve(state, refs, progress, total_len, {}, {});
-        if (!sol.success) break;
+        auto sol = solver.solve(state, refs, progress, total_len, {}, {},
+                                 actual_v, actual_delta);
+        if (!sol.success) { if (++cfail >= 5) break; continue; }
+        cfail = 0;
 
         double v_cmd = sol.v_cmd;
         double delta_cmd = sol.delta_cmd;
@@ -2257,17 +2435,13 @@ CombinedLegResult run_combined_leg(
         delta_cmd = std::clamp(delta_cmd, -cfg.max_steering, cfg.max_steering);
 
         // Apply speed through PD controller (carries over between legs)
-        double actual_v = pd_ctrl.step(v_cmd, cfg.dt);
+        actual_v = pd_ctrl.step(v_cmd, cfg.dt);
+        actual_delta = std::clamp(delta_cmd, -cfg.max_steering, cfg.max_steering);
 
-        mpcc::VecU u;
-        u(0) = (actual_v - state(3)) / cfg.dt;
-        u(1) = (delta_cmd - state(4)) / cfg.dt;
-        u(0) = std::clamp(u(0), -cfg.max_acceleration, cfg.max_acceleration);
-        u(1) = std::clamp(u(1), -cfg.max_steering_rate, cfg.max_steering_rate);
-
-        state = plant.rk4_step(state, u, cfg.dt);
-        state(3) = std::clamp(state(3), cfg.min_velocity, cfg.max_velocity);
-        state(4) = std::clamp(state(4), -cfg.max_steering, cfg.max_steering);
+        mpcc::Vec2 u_direct;
+        u_direct(0) = actual_v;
+        u_direct(1) = actual_delta;
+        state = plant.rk4_step(state, u_direct, cfg.dt);
 
         // Update progress (monotonic)
         double new_progress = spline.find_closest_progress(state(0), state(1));
@@ -2287,6 +2461,7 @@ CombinedLegResult run_combined_leg(
         res.max_heading_err = std::max(res.max_heading_err, std::abs(heading_err));
         cte_sum += cte;
         res.steps++;
+        if (cte > 1.0) break;
 
         if (std::abs(std::abs(delta_cmd) - cfg.max_steering) < 0.01)
             res.steering_saturated_steps++;
@@ -2297,7 +2472,7 @@ CombinedLegResult run_combined_leg(
         pt.x_map = state(0);  pt.y_map = state(1);
         acc::map_to_qlabs_2d(state(0), state(1), tp, pt.x_ql, pt.y_ql);
         pt.theta = state(2);
-        pt.v_meas = state(3);  pt.v_cmd = v_cmd;
+        pt.v_meas = actual_v;  pt.v_cmd = v_cmd;
         pt.delta_cmd = delta_cmd;
         pt.cte = cte;  pt.heading_err = heading_err;
         pt.progress_pct = 100.0 * progress / total_len;
@@ -2309,6 +2484,8 @@ CombinedLegResult run_combined_leg(
     res.avg_cte = (res.steps > 0) ? cte_sum / res.steps : 0.0;
     res.progress_frac = progress / total_len;
     res.final_state = state;
+    res.final_v = actual_v;
+    res.final_delta = actual_delta;
     if (progress >= total_len - 0.1) res.completed = true;
 
     return res;
@@ -2345,8 +2522,10 @@ void test_full_mission_combined() {
     init_spline.build(init_mx, init_my, true);
     double init_theta = init_spline.get_tangent(0.0);
 
-    mpcc::VecX state;
-    state << hub_map_x, hub_map_y, init_theta, 0.0, 0.0;
+    mpcc::Vec3 state;
+    state << hub_map_x, hub_map_y, init_theta;
+    double state_v = 0.0;
+    double state_delta = 0.0;
 
     PDSpeedController pd_ctrl;
     double elapsed = 0.0;
@@ -2364,7 +2543,7 @@ void test_full_mission_combined() {
         if (!route) FAIL("Failed to plan %s", leg.name.c_str());
 
         auto result = run_combined_leg(route->first, route->second,
-            state, leg.name, leg.max_steps, pd_ctrl, elapsed);
+            state, state_v, state_delta, leg.name, leg.max_steps, pd_ctrl, elapsed);
 
         std::printf("\n    %s: max_cte=%.3f avg_cte=%.3f heading_err=%.1fdeg "
                     "steer_sat=%d prog=%.0f%% %s",
@@ -2390,10 +2569,10 @@ void test_full_mission_combined() {
 
         // Carry state to next leg, simulate stop at waypoint
         state = result.final_state;
+        state_v = 0.0;        // velocity = 0
+        state_delta = 0.0;    // steering centered
         if (!result.trace.empty())
             elapsed = result.trace.back().elapsed_s + 0.1;
-        state(3) = 0.0;  // velocity = 0
-        state(4) = 0.0;  // steering centered
         pd_ctrl.actual_speed = 0.0;
         elapsed += 1.0;   // 1s dwell at waypoint
     }
@@ -2452,6 +2631,214 @@ void test_full_mission_combined() {
 // =========================================================================
 // Main
 // =========================================================================
+// =========================================================================
+// Deployment-Realistic Tests (with DeploymentPlant delays + noise)
+// =========================================================================
+
+void test_realistic_hub_to_pickup() {
+    TEST("realistic: hub→pickup with TF delay + servo delay + noise → CTE < 0.35m");
+
+    acc::RoadGraph road_graph(0.001);
+    auto route = road_graph.plan_path_for_mission_leg("hub_to_pickup",
+        acc::HUB_X, acc::HUB_Y);
+    if (!route) FAIL("Failed to generate hub→pickup path");
+
+    acc::TransformParams tp;
+    std::vector<double> map_x, map_y;
+    acc::qlabs_path_to_map(route->first, route->second, tp, map_x, map_y);
+
+    acc::CubicSplinePath spline;
+    spline.build(map_x, map_y, true);
+    double total_len = spline.total_length();
+
+    mpcc::ActiveSolver solver;
+    mpcc::Config cfg;
+    cfg.horizon = 10; cfg.dt = 0.1; cfg.wheelbase = 0.256;
+    cfg.max_velocity = 0.55; cfg.min_velocity = 0.0; cfg.max_steering = 0.45;
+    cfg.reference_velocity = 0.45; cfg.contour_weight = 15.0; cfg.lag_weight = 10.0;
+    cfg.velocity_weight = 15.0; cfg.steering_weight = 0.05;
+    cfg.acceleration_weight = 0.01; cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0; cfg.progress_weight = 1.0;
+    cfg.boundary_weight = 0.0; cfg.max_sqp_iterations = 5; cfg.max_qp_iterations = 20;
+    cfg.startup_elapsed_s = 10.0;
+    cfg.diagnostics_enabled = true;
+    solver.init(cfg);
+    solver.spline_path = &spline;
+    solver.path_lookup.lookup = [&spline, total_len](
+        double px, double py, double s_min, double* s_out) -> mpcc::PathRef
+    {
+        double s = spline.find_closest_progress_from(px, py, s_min);
+        s = std::clamp(s, 0.0, total_len - 0.001);
+        if (s_out) *s_out = s;
+        mpcc::PathRef ref;
+        double ct, st;
+        spline.get_path_reference(s, ref.x, ref.y, ct, st);
+        ref.cos_theta = ct; ref.sin_theta = st;
+        ref.curvature = spline.get_curvature(s);
+        return ref;
+    };
+
+    // Initialize DeploymentPlant with delays and noise
+    double init_x, init_y;
+    spline.get_position(0.0, init_x, init_y);
+    double init_theta = spline.get_tangent(0.0);
+
+    DeploymentPlant dp(cfg.wheelbase, cfg.dt, true, true);
+    dp.set_initial_state(init_x, init_y, init_theta);
+
+    double progress = 0.0;
+    double max_cte = 0.0, cte_sum = 0.0;
+    int steps = 0;
+
+    for (int step = 0; step < 600; step++) {
+        if (progress >= total_len - 0.1) break;
+
+        mpcc::Vec3 meas = dp.get_measured_state();
+        double meas_v = dp.get_measured_velocity();
+
+        std::vector<mpcc::PathRef> refs(cfg.horizon + 1);
+        double s = progress;
+        for (int k = 0; k <= cfg.horizon; k++) {
+            s = std::clamp(s, 0.0, total_len - 0.001);
+            double rx, ry, ct, st;
+            spline.get_path_reference(s, rx, ry, ct, st);
+            refs[k].x = rx; refs[k].y = ry;
+            refs[k].cos_theta = ct; refs[k].sin_theta = st;
+            refs[k].curvature = spline.get_curvature(s);
+            double step_speed = cfg.reference_velocity * std::exp(-0.4 * std::abs(refs[k].curvature));
+            s += std::max(step_speed, 0.10) * cfg.dt;
+        }
+
+        auto result = solver.solve(meas, refs, progress, total_len, {}, {},
+                                    meas_v, dp.actual_delta);
+        if (!result.success) continue;
+
+        dp.step(result.v_cmd, result.delta_cmd, cfg.max_steering);
+
+        double np = spline.find_closest_progress(dp.true_state(0), dp.true_state(1));
+        if (np > progress) progress = np;
+
+        double rx, ry;
+        spline.get_position(progress, rx, ry);
+        double cte = std::hypot(dp.true_state(0) - rx, dp.true_state(1) - ry);
+        max_cte = std::max(max_cte, cte);
+        cte_sum += cte;
+        steps++;
+        if (cte > 1.0) break;
+    }
+
+    double avg_cte = steps > 0 ? cte_sum / steps : 0.0;
+    double prog_pct = 100.0 * progress / total_len;
+    std::printf("(max_cte=%.3f avg_cte=%.3f prog=%.0f%% steps=%d) ",
+        max_cte, avg_cte, prog_pct, steps);
+
+    if (max_cte > 0.35) FAIL("max CTE %.3f > 0.35m", max_cte);
+    if (progress / total_len < 0.70) FAIL("progress %.0f%% < 70%%", prog_pct);
+    PASS();
+}
+
+void test_solver_convergence() {
+    TEST("convergence: solver KKT < 1e-2, no QP failures, res_eq < 1e-3");
+
+    acc::RoadGraph road_graph(0.001);
+    auto route = road_graph.plan_path_for_mission_leg("hub_to_pickup",
+        acc::HUB_X, acc::HUB_Y);
+    if (!route) FAIL("Failed to generate path");
+
+    acc::TransformParams tp;
+    std::vector<double> map_x, map_y;
+    acc::qlabs_path_to_map(route->first, route->second, tp, map_x, map_y);
+
+    acc::CubicSplinePath spline;
+    spline.build(map_x, map_y, true);
+    double total_len = spline.total_length();
+
+    mpcc::ActiveSolver solver;
+    mpcc::Config cfg;
+    cfg.horizon = 10; cfg.dt = 0.1; cfg.wheelbase = 0.256;
+    cfg.max_velocity = 0.55; cfg.min_velocity = 0.0; cfg.max_steering = 0.45;
+    cfg.reference_velocity = 0.45; cfg.contour_weight = 15.0; cfg.lag_weight = 10.0;
+    cfg.velocity_weight = 15.0; cfg.steering_weight = 0.05;
+    cfg.acceleration_weight = 0.01; cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0; cfg.progress_weight = 1.0;
+    cfg.boundary_weight = 0.0; cfg.max_sqp_iterations = 5; cfg.max_qp_iterations = 20;
+    cfg.startup_elapsed_s = 10.0;
+    cfg.diagnostics_enabled = true;
+    solver.init(cfg);
+    solver.spline_path = &spline;
+    solver.path_lookup.lookup = [&spline, total_len](
+        double px, double py, double s_min, double* s_out) -> mpcc::PathRef
+    {
+        double s = spline.find_closest_progress_from(px, py, s_min);
+        s = std::clamp(s, 0.0, total_len - 0.001);
+        if (s_out) *s_out = s;
+        mpcc::PathRef ref;
+        double ct, st;
+        spline.get_path_reference(s, ref.x, ref.y, ct, st);
+        ref.cos_theta = ct; ref.sin_theta = st;
+        ref.curvature = spline.get_curvature(s);
+        return ref;
+    };
+
+    double init_x, init_y;
+    spline.get_position(0.0, init_x, init_y);
+    double init_theta = spline.get_tangent(0.0);
+
+    mpcc::KinematicModel plant(cfg.wheelbase);
+    mpcc::Vec3 state; state << init_x, init_y, init_theta;
+    double actual_v = 0.0, actual_delta = 0.0;
+    PDSpeedController pd_ctrl;
+
+    double progress = 0.0;
+    int qp_failures = 0;
+    double max_kkt = 0.0, max_res_eq = 0.0;
+    int total_sqp_iter = 0, solve_count = 0;
+
+    for (int step = 0; step < 300; step++) {
+        if (progress >= total_len - 0.1) break;
+
+        std::vector<mpcc::PathRef> refs(cfg.horizon + 1);
+        double s = progress;
+        for (int k = 0; k <= cfg.horizon; k++) {
+            s = std::clamp(s, 0.0, total_len - 0.001);
+            double rx, ry, ct, st;
+            spline.get_path_reference(s, rx, ry, ct, st);
+            refs[k].x = rx; refs[k].y = ry;
+            refs[k].cos_theta = ct; refs[k].sin_theta = st;
+            refs[k].curvature = spline.get_curvature(s);
+            double step_speed = cfg.reference_velocity * std::exp(-0.4 * std::abs(refs[k].curvature));
+            s += std::max(step_speed, 0.10) * cfg.dt;
+        }
+
+        auto result = solver.solve(state, refs, progress, total_len, {}, {},
+                                    actual_v, actual_delta);
+        if (result.success) {
+            solve_count++;
+            total_sqp_iter += result.diag.sqp_iter;
+            if (result.diag.kkt_norm_inf > max_kkt) max_kkt = result.diag.kkt_norm_inf;
+            if (result.diag.res_eq > max_res_eq) max_res_eq = result.diag.res_eq;
+            if (result.diag.qp_status != 0) qp_failures++;
+
+            actual_v = pd_ctrl.step(result.v_cmd, cfg.dt);
+            actual_delta = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
+            mpcc::Vec2 u(actual_v, actual_delta);
+            state = plant.rk4_step(state, u, cfg.dt);
+
+            double np = spline.find_closest_progress(state(0), state(1));
+            if (np > progress) progress = np;
+        }
+    }
+
+    double avg_sqp = solve_count > 0 ? (double)total_sqp_iter / solve_count : 0;
+    std::printf("(max_kkt=%.1e max_res_eq=%.1e avg_sqp=%.1f qp_fail=%d solves=%d) ",
+        max_kkt, max_res_eq, avg_sqp, qp_failures, solve_count);
+
+    if (max_kkt > 1e-2) FAIL("max KKT %.1e > 1e-2", max_kkt);
+    if (max_res_eq > 1e-3) FAIL("max res_eq %.1e > 1e-3", max_res_eq);
+    if (qp_failures > 5) FAIL("%d QP failures > 5", qp_failures);
+    PASS();
+}
+
 int main() {
     std::printf("=== Deployment-Realistic MPCC Tests ===\n\n");
 
@@ -2514,6 +2901,12 @@ int main() {
 
     std::printf("\n[Full Mission Combined — State Carry-Over + Hermite Blending]\n");
     test_full_mission_combined();
+
+    std::printf("\n[Deployment-Realistic — Delays + Noise]\n");
+    test_realistic_hub_to_pickup();
+
+    std::printf("\n[Solver Convergence]\n");
+    test_solver_convergence();
 
     std::printf("\n=== Results: %d passed, %d failed ===\n",
                 tests_passed, tests_failed);

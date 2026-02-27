@@ -112,6 +112,14 @@ sync_to_workspace() {
         --exclude='mpcc_launch_args.txt' \
         "$QUANSER_ACC_DIR/" "$DOCKER_PKG_DIR/"
 
+    # Ensure acados headers+libs are in the Docker-mounted workspace
+    # (container can't access /home/stephen/acados directly)
+    local ACADOS_SRC="${ACADOS_INSTALL_DIR:-$HOME/acados}"
+    local ACADOS_DST="$DEV_WORKSPACE/acados"
+    if [ -d "$ACADOS_SRC/include" ] && [ -d "$ACADOS_SRC/lib" ]; then
+        rsync -a "$ACADOS_SRC/include" "$ACADOS_SRC/lib" "$ACADOS_DST/"
+    fi
+
     print_status "Code synced: $QUANSER_ACC_DIR → $DOCKER_PKG_DIR"
 }
 
@@ -331,6 +339,8 @@ reset_car() {
         docker exec "$CONTAINER_ID" bash -c '
             source /opt/ros/humble/setup.bash
             cd /workspaces/isaac_ros-dev/ros2
+            # Clean stale Python build artifacts (removed modules like pympc_core)
+            rm -rf build/acc_stage1_mission install/acc_stage1_mission
             colcon build --packages-select acc_stage1_mission --symlink-install 2>&1 | tail -5
         ' && print_status "Python package rebuilt" || print_warning "Python build had warnings"
 
@@ -383,26 +393,34 @@ reset_car() {
 generate_report() {
     print_info "Generating mission report..."
 
-    # CSV logs are written to the Docker-mounted workspace, so they appear on the host at:
-    #   $DOCKER_PKG_DIR/logs/mpcc_*.csv
-    # The quanser-acc/logs/ symlink or direct path also works after rsync.
+    # === Log file locations ===
+    # Inside Docker: /workspaces/isaac_ros-dev/ros2/src/acc_stage1_mission/logs/
+    #   mpcc_YYYYMMDD_HHMMSS.csv           — per-cycle solver data (40 columns)
+    #   mpcc_trajectory_YYYYMMDD_HHMMSS.csv — per-stage predicted trajectory
+    #   mpcc_events_YYYYMMDD_HHMMSS.log     — discrete events (path changes, stops, etc.)
+    # On host (Docker mount): $DOCKER_PKG_DIR/logs/ = ~/Documents/ACC_Development/Development/ros2/src/acc_stage1_mission/logs/
+    # After copy: $QUANSER_ACC_DIR/logs/ = ~/quanser-acc/logs/
     local local_csv=""
 
     # Primary: check the Docker workspace mount on the host (logs written directly here)
-    local_csv=$(ls -t "$DOCKER_PKG_DIR"/logs/mpcc_*.csv 2>/dev/null | head -1 || true)
+    local_csv=$(ls -t "$DOCKER_PKG_DIR"/logs/mpcc_*.csv 2>/dev/null | grep -v trajectory | head -1 || true)
 
     # Fallback: check quanser-acc/logs/ (in case of local symlink or manual copy)
     if [ -z "$local_csv" ]; then
-        local_csv=$(ls -t "$QUANSER_ACC_DIR"/logs/mpcc_*.csv 2>/dev/null | head -1 || true)
+        local_csv=$(ls -t "$QUANSER_ACC_DIR"/logs/mpcc_*.csv 2>/dev/null | grep -v trajectory | head -1 || true)
     fi
 
-    # Last resort: try docker cp from /tmp/mission_logs (old log location)
+    # Last resort: try docker cp from container
     if [ -z "$local_csv" ]; then
         CONTAINER_ID=$(get_container_id)
         if [ -n "$CONTAINER_ID" ]; then
+            # Try the Docker workspace path first, then /tmp fallback
             local container_csv
-            container_csv=$(docker exec "$CONTAINER_ID" bash -c \
-                'ls -t /tmp/mission_logs/mpcc_*.csv 2>/dev/null | head -1' 2>/dev/null || true)
+            for search_dir in "/workspaces/isaac_ros-dev/ros2/src/acc_stage1_mission/logs" "/tmp/mission_logs"; do
+                container_csv=$(docker exec "$CONTAINER_ID" bash -c \
+                    "ls -t $search_dir/mpcc_*.csv 2>/dev/null | grep -v trajectory | head -1" 2>/dev/null || true)
+                [ -n "$container_csv" ] && break
+            done
             if [ -n "$container_csv" ]; then
                 mkdir -p "$QUANSER_ACC_DIR/logs"
                 local_csv="$QUANSER_ACC_DIR/logs/$(basename "$container_csv")"
@@ -412,17 +430,40 @@ generate_report() {
                     print_error "Failed to copy CSV from container"
                     local_csv=""
                 }
+                # Also copy trajectory and event logs if they exist
+                local csv_ts
+                csv_ts=$(basename "$container_csv" | sed 's/mpcc_\(.*\)\.csv/\1/')
+                local container_dir
+                container_dir=$(dirname "$container_csv")
+                for extra in "mpcc_trajectory_${csv_ts}.csv" "mpcc_events_${csv_ts}.log"; do
+                    docker cp "$CONTAINER_ID:$container_dir/$extra" "$QUANSER_ACC_DIR/logs/$extra" 2>/dev/null && {
+                        print_status "Copied: $extra"
+                    } || true
+                done
             fi
         fi
     fi
 
     if [ -z "$local_csv" ] || [ ! -f "$local_csv" ]; then
         print_warning "No MPCC CSV log found — cannot generate report"
+        print_info "Logs are written to: $DOCKER_PKG_DIR/logs/"
         print_info "Run a mission first, then use --stop --report."
         return 1
     fi
 
     print_info "Using CSV: $local_csv"
+
+    # Also copy companion logs to quanser-acc/logs/ for easy access
+    local csv_dir csv_ts
+    csv_dir=$(dirname "$local_csv")
+    csv_ts=$(basename "$local_csv" | sed 's/mpcc_\(.*\)\.csv/\1/')
+    if [ "$csv_dir" != "$QUANSER_ACC_DIR/logs" ]; then
+        mkdir -p "$QUANSER_ACC_DIR/logs"
+        for f in "$csv_dir/mpcc_${csv_ts}.csv" "$csv_dir/mpcc_trajectory_${csv_ts}.csv" "$csv_dir/mpcc_events_${csv_ts}.log"; do
+            [ -f "$f" ] && cp "$f" "$QUANSER_ACC_DIR/logs/" 2>/dev/null
+        done
+        print_info "Logs copied to: $QUANSER_ACC_DIR/logs/"
+    fi
 
     # Run the report generation script
     if [ -f "$QUANSER_ACC_DIR/scripts/generate_report.py" ]; then
@@ -471,7 +512,7 @@ stop_all() {
             pkill -9 -f "cartographer" 2>/dev/null
             pkill -9 -f "nav2" 2>/dev/null
             pkill -9 -f "component_container" 2>/dev/null
-            pkill -9 -f "_node" 2>/dev/null
+            pkill -9 -f "mpcc_controller_node|mission_manager|sign_detector_node|odom_from_tf_node|state_estimator|obstacle_tracker|traffic_light_map|qcar2_hardware" 2>/dev/null
             pkill -9 -f "static_transform_publisher" 2>/dev/null
             true
         ' 2>/dev/null || true
@@ -866,6 +907,8 @@ launch_mission() {
     docker exec "$CONTAINER_ID" bash -c '
         source /opt/ros/humble/setup.bash
         cd /workspaces/isaac_ros-dev/ros2
+        # Clean stale Python build artifacts (removed modules like pympc_core)
+        rm -rf build/acc_stage1_mission install/acc_stage1_mission
         colcon build --packages-select acc_stage1_mission --symlink-install 2>&1 | tail -5
     '
     if [ $? -ne 0 ]; then
@@ -979,11 +1022,17 @@ ros2 launch qcar2_nodes qcar2_cartographer_virtual_launch.py
 SCRIPT
 chmod +x /tmp/slam_launch.sh'
 
-    print_info "Launching Cartographer SLAM + Hardware (wait ~30s for init)..."
+    print_info "Launching Cartographer SLAM + Hardware..."
     launch_terminal "SLAM" "100x20+0+400" "
         docker exec -it $CONTAINER_ID bash /tmp/slam_launch.sh
     "
-    sleep 10
+
+    # Wait for Cartographer SLAM to initialize.
+    # Cartographer needs ~20-30s to start publishing map→odom→base_link TF.
+    # The MPCC terminal has its own 15s sleep, so total wait is ~45s from SLAM launch.
+    print_info "Waiting 30s for Cartographer SLAM initialization..."
+    sleep 30
+    print_status "SLAM initialization wait complete"
 
     # Terminal 3: Detection
     # C++ sign_detector always runs inside the MPCC launch file.
@@ -1049,8 +1098,8 @@ chmod +x /tmp/slam_launch.sh'
     cp "$mpcc_args_file" "$DOCKER_PKG_DIR/mpcc_launch_args.txt"
 
     launch_terminal "MPCC-Mission" "100x20+800+400" "
-        echo 'Waiting 45 seconds for Nav2 to initialize...'
-        sleep 45
+        echo 'Waiting 15 seconds for Cartographer SLAM stabilization...'
+        sleep 15
         docker exec -it $CONTAINER_ID bash -c '
             source /opt/ros/humble/setup.bash
             source /workspace/cartographer_ws/install/setup.bash

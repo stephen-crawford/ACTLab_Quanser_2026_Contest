@@ -156,7 +156,7 @@ int mpcc_qcar2_acados_sim_create(mpcc_qcar2_sim_solver_capsule * capsule)
  
     tmp_int = 4;
     sim_opts_set(mpcc_qcar2_sim_config, mpcc_qcar2_sim_opts, "num_stages", &tmp_int);
-    tmp_int = 1;
+    tmp_int = 3;
     sim_opts_set(mpcc_qcar2_sim_config, mpcc_qcar2_sim_opts, "num_steps", &tmp_int);
     tmp_bool = 0;
     sim_opts_set(mpcc_qcar2_sim_config, mpcc_qcar2_sim_opts, "jac_reuse", &tmp_bool);
@@ -193,9 +193,9 @@ int mpcc_qcar2_acados_sim_create(mpcc_qcar2_sim_solver_capsule * capsule)
     /* initialize parameter values */
     double* p = calloc(np, sizeof(double));
     
-    p[17] = 1000;
-    p[18] = 1000;
-    p[19] = 0.1;
+    p[17] = 10;
+    p[20] = 5;
+    p[21] = 5;
 
     mpcc_qcar2_acados_sim_update_params(capsule, p, np);
     free(p);

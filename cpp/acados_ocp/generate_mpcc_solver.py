@@ -37,7 +37,7 @@ DT = 0.1         # time step [s]
 
 # Control limits
 V_MIN = 0.0
-V_MAX = 1.2
+V_MAX = 0.55     # close to v_ref (0.45) to prevent solver from freely accelerating
 DELTA_MAX = 0.45  # ±25.8° hardware servo limit
 VTHETA_MIN = 0.0  # arc-length speed >= 0 (no backward progress)
 VTHETA_MAX = 2.0  # max arc-length speed
@@ -58,8 +58,9 @@ THETA_MAX = 50.0  # max path length (will be updated at runtime)
 # References: v_ref, delta_ref (2 doubles)
 # Previous controls: v_prev, delta_prev, vtheta_prev (3 doubles)
 # Obstacle: obs_x, obs_y, obs_r (3 doubles)
-# Total: 20 doubles per stage
-N_PARAMS = 20
+# Road boundaries: width_left, width_right (2 doubles) — half-widths from centerline
+# Total: 22 doubles per stage
+N_PARAMS = 22
 
 # Parameter slicing
 IDX_XREF = 0
@@ -82,6 +83,8 @@ IDX_VTHETAPREV = 16
 IDX_OBSX = 17
 IDX_OBSY = 18
 IDX_OBSR = 19
+IDX_WLEFT = 20    # road half-width to left boundary (matching mpc_planner)
+IDX_WRIGHT = 21   # road half-width to right boundary
 
 
 def create_mpcc_model():
@@ -206,8 +209,18 @@ def create_mpcc_ocp():
                   cost_smooth_v + cost_smooth_delta + cost_smooth_vtheta +
                   cost_ref_vel + cost_ref_steer)
 
-    # Terminal cost: 2x contouring/lag weight at final stage
-    terminal_cost = 2.0 * (q_c * e_c**2 + q_l * e_l**2)
+    # Terminal cost: amplified contouring/lag + heading alignment
+    # Matching mpc_planner terminal_contouring_mp=2.0 and terminal_angle_weight
+    terminal_contouring_mp = 2.0
+    terminal_cost = terminal_contouring_mp * (q_c * e_c**2 + q_l * e_l**2)
+
+    # Terminal heading cost (matching mpc_planner terminal_angle_weight)
+    # Aligns heading with path tangent at terminal stage
+    path_angle = atan2(dy_ref, dx_ref)
+    heading_error = psi - path_angle
+    # Use sin/cos form for angle wrapping: sin(a-b)^2 + (1-cos(a-b))^2 ≈ (a-b)^2 for small errors
+    terminal_angle_weight = 10.0  # moderate heading alignment at terminal
+    terminal_cost += terminal_angle_weight * (sin(heading_error)**2)
 
     ocp.cost.cost_type = 'EXTERNAL'
     ocp.cost.cost_type_e = 'EXTERNAL'
@@ -243,57 +256,78 @@ def create_mpcc_ocp():
 
     h_obs = (X_pos - obs_x)**2 + (Y_pos - obs_y)**2 - (obs_r + robot_r)**2
 
-    # Path constraints (nonlinear)
-    ocp.model.con_h_expr = h_obs
-    ocp.constraints.lh = np.array([0.0])      # >= 0
-    ocp.constraints.uh = np.array([1e6])       # no upper bound
+    # Road boundary constraints (matching mpc_planner contouring_constraints.py)
+    # e_c is the signed lateral (contour) error from path centerline.
+    # Positive e_c = vehicle is to the left of the path (when facing forward).
+    # width_left/width_right are half-widths from centerline to boundaries.
+    #
+    # Two inequalities (all <= 0):
+    #   e_c + w_cur - width_right <= 0  (don't cross right boundary)
+    #  -e_c + w_cur - width_left  <= 0  (don't cross left boundary)
+    w_cur = 0.10  # vehicle half-width [m] (QCar2 is ~0.20m wide)
+    width_left = p[IDX_WLEFT]
+    width_right = p[IDX_WRIGHT]
 
-    # Terminal path constraint
-    ocp.model.con_h_expr_e = h_obs
-    ocp.constraints.lh_e = np.array([0.0])
-    ocp.constraints.uh_e = np.array([1e6])
+    h_boundary_right = e_c + w_cur - width_right
+    h_boundary_left = -e_c + w_cur - width_left
 
-    # Slack variables for soft obstacle constraint
-    # L1 + L2 penalties for constraint violation
-    ocp.constraints.idxsh = np.array([0])
-    Zl = np.array([100.0])   # L2 penalty lower
-    Zu = np.array([0.0])     # L2 penalty upper (not needed for >= constraint)
-    zl = np.array([50.0])    # L1 penalty lower
-    zu = np.array([0.0])     # L1 penalty upper
-    ocp.cost.Zl = Zl
-    ocp.cost.Zu = Zu
-    ocp.cost.zl = zl
-    ocp.cost.zu = zu
+    # Path constraints: 3 total (obstacle + 2 boundaries)
+    # h_obs >= 0 (formulated as: 0 <= h_obs)
+    # h_boundary_right <= 0 (formulated as: h_boundary_right <= 0)
+    # h_boundary_left <= 0 (formulated as: h_boundary_left <= 0)
+    ocp.model.con_h_expr = vertcat(h_obs, h_boundary_right, h_boundary_left)
+    ocp.constraints.lh = np.array([0.0, -1e6, -1e6])  # obs >= 0, boundaries unconstrained below
+    ocp.constraints.uh = np.array([1e6, 0.0, 0.0])     # obs unconstrained above, boundaries <= 0
+
+    # Terminal path constraints (same)
+    ocp.model.con_h_expr_e = vertcat(h_obs, h_boundary_right, h_boundary_left)
+    ocp.constraints.lh_e = np.array([0.0, -1e6, -1e6])
+    ocp.constraints.uh_e = np.array([1e6, 0.0, 0.0])
+
+    # Slack variables: only on obstacle constraint (index 0).
+    # Boundary constraints are HARD (no slack) — matching mpc_planner (add_slack=False).
+    # The boundary widths are widened at runtime for obstacle avoidance (left only).
+    ocp.constraints.idxsh = np.array([0])        # only obstacle gets slack
+    ocp.cost.Zl = np.array([100.0])              # L2 penalty on obstacle slack
+    ocp.cost.Zu = np.array([0.0])
+    ocp.cost.zl = np.array([50.0])               # L1 penalty on obstacle slack
+    ocp.cost.zu = np.array([0.0])
 
     ocp.constraints.idxsh_e = np.array([0])
-    ocp.cost.Zl_e = Zl
-    ocp.cost.Zu_e = Zu
-    ocp.cost.zl_e = zl
-    ocp.cost.zu_e = zu
+    ocp.cost.Zl_e = np.array([100.0])
+    ocp.cost.Zu_e = np.array([0.0])
+    ocp.cost.zl_e = np.array([50.0])
+    ocp.cost.zu_e = np.array([0.0])
 
-    # ---- Solver options ----
-    ocp.solver_options.qp_solver = 'FULL_CONDENSING_QPOASES'
-    ocp.solver_options.nlp_solver_type = 'SQP'
-    ocp.solver_options.nlp_solver_max_iter = 20
-    ocp.solver_options.qp_solver_iter_max = 500
-    ocp.solver_options.integrator_type = 'ERK'     # Explicit Runge-Kutta
-    ocp.solver_options.sim_method_num_stages = 4   # RK4
-    ocp.solver_options.sim_method_num_steps = 1    # 1 step per interval
-    ocp.solver_options.tf = N * DT                 # total horizon time
-    ocp.solver_options.hessian_approx = 'EXACT'    # Exact Hessian for EXTERNAL cost
-    ocp.solver_options.regularize_method = 'CONVEXIFY'
-    ocp.solver_options.levenberg_marquardt = 1e-1   # Strong regularization for tight curves
-    ocp.solver_options.nlp_solver_tol_stat = 1e-3
-    ocp.solver_options.nlp_solver_tol_eq = 1e-4
-    ocp.solver_options.nlp_solver_tol_ineq = 1e-4
-    ocp.solver_options.nlp_solver_tol_comp = 1e-3
+    # ---- Solver options (matching mpc_planner generate_acados_solver.py) ----
+    # SQP with HPIPM QP solver, MIRROR regularization, warm-start.
+    # mpc_planner uses SQP_RTI with _num_iterations external loop;
+    # we use SQP (full convergence per call) because tests need cold-start convergence.
+    ocp.solver_options.qp_solver = 'PARTIAL_CONDENSING_HPIPM'  # matching mpc_planner
+    ocp.solver_options.nlp_solver_type = 'SQP'                 # Full convergence per call
+    ocp.solver_options.nlp_solver_max_iter = 15                # SQP iterations (was 10, hit limit 70% with aggressive weights)
+    ocp.solver_options.qp_solver_iter_max = 50                 # matching mpc_planner (default 50)
+    ocp.solver_options.qp_solver_warm_start = 2                # primal + dual warm start
+    ocp.solver_options.integrator_type = 'ERK'                 # Explicit Runge-Kutta
+    ocp.solver_options.sim_method_num_stages = 4               # RK4
+    ocp.solver_options.sim_method_num_steps = 3                # 3 steps per interval (matching mpc_planner)
+    ocp.solver_options.tf = N * DT                             # total horizon time
+    ocp.solver_options.hessian_approx = 'EXACT'                # Exact Hessian for EXTERNAL cost
+    ocp.solver_options.regularize_method = 'MIRROR'            # matching mpc_planner
+    ocp.solver_options.globalization = 'FIXED_STEP'            # matching mpc_planner
+    ocp.solver_options.qp_tol = 1e-5                           # matching mpc_planner
+    ocp.solver_options.tol = 1e-2                              # matching mpc_planner (looser NLP tolerance)
+    ocp.solver_options.print_level = 0                         # suppress solver output
 
     # Parameter values (will be overwritten at runtime, but needed for dimensions)
     ocp.parameter_values = np.zeros(N_PARAMS)
-    # Set obstacle far away by default
-    ocp.parameter_values[IDX_OBSX] = 1000.0
-    ocp.parameter_values[IDX_OBSY] = 1000.0
-    ocp.parameter_values[IDX_OBSR] = 0.1
+    # Default obstacle: inactive (zero radius, nearby position for well-conditioned Jacobians)
+    ocp.parameter_values[IDX_OBSX] = 10.0
+    ocp.parameter_values[IDX_OBSY] = 0.0
+    ocp.parameter_values[IDX_OBSR] = 0.0   # zero radius = inactive
+    # Default road widths: wide enough to not constrain (disabled until set)
+    ocp.parameter_values[IDX_WLEFT] = 5.0   # 5m half-width = unconstrained
+    ocp.parameter_values[IDX_WRIGHT] = 5.0
 
     # Code generation directory
     ocp.code_export_directory = 'c_generated_code'
@@ -307,7 +341,8 @@ def main():
     print(f"  State: [X, Y, psi, theta_A] (nx=4)")
     print(f"  Controls: [V, delta, V_theta] (nu=3)")
     print(f"  Parameters per stage: {N_PARAMS}")
-    print(f"  Cost type: EXTERNAL with EXACT Hessian + MIRROR regularization")
+    print(f"  Cost type: EXTERNAL with EXACT Hessian + MIRROR + SQP_RTI + HPIPM")
+    print(f"  Constraints: obstacle + road boundaries (matching mpc_planner)")
 
     ocp = create_mpcc_ocp()
 
@@ -340,7 +375,7 @@ def main():
         p_k[IDX_RV_ACCEL] = 0.01
         p_k[IDX_RV_STEER] = 1.5
         p_k[IDX_RV_THETA] = 0.1
-        p_k[IDX_RREF_VEL] = 15.0 if k == 0 else 0.0  # R_ref at k=0 only
+        p_k[IDX_RREF_VEL] = 15.0  # Velocity tracking at ALL stages
         p_k[IDX_RREF_STEER] = 0.05
         p_k[IDX_VREF] = 0.45
         p_k[IDX_DELTAREF] = 0.0
@@ -348,10 +383,13 @@ def main():
         p_k[IDX_VPREV] = 0.2
         p_k[IDX_DELTAPREV] = 0.0
         p_k[IDX_VTHETAPREV] = 0.0
-        # Obstacle far away
-        p_k[IDX_OBSX] = 1000.0
-        p_k[IDX_OBSY] = 1000.0
-        p_k[IDX_OBSR] = 0.1
+        # Obstacle nearby but safely away (keeps Jacobians well-conditioned)
+        p_k[IDX_OBSX] = 10.0
+        p_k[IDX_OBSY] = 0.0
+        p_k[IDX_OBSR] = 0.01
+        # Road boundaries: wide (unconstrained for validation)
+        p_k[IDX_WLEFT] = 5.0
+        p_k[IDX_WRIGHT] = 5.0
 
         if k < N:
             solver.set(k, 'p', p_k)

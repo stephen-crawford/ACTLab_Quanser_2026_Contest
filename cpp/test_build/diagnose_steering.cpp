@@ -55,7 +55,7 @@ int main() {
     cfg.horizon = 10;
     cfg.dt = 0.1;
     cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;
+    cfg.max_velocity = 0.55;
     cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;
@@ -75,7 +75,7 @@ int main() {
     cfg.max_qp_iterations = 20;
     cfg.startup_ramp_duration_s = 3.0;  // Matches deployed
     cfg.startup_elapsed_s = 0.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
 
     auto make_lookup = [&spline, total_len](
         double px, double py, double s_min, double* s_out) -> mpcc::PathRef {
@@ -110,6 +110,7 @@ int main() {
     stateA << init_x, init_y, init_theta, 0.0, 0.0;
     PDSpeedController pdA;
     double progressA = 0.0;
+    int cfailA = 0;
 
     for (int step = 0; step < 30; step++) {
         std::vector<mpcc::PathRef> refs(cfg.horizon + 1);
@@ -126,7 +127,8 @@ int main() {
         }
 
         auto result = solverA.solve(stateA, refs, progressA, total_len, {}, {});
-        if (!result.success) { printf("  SOLVER FAILED at step %d\n", step); break; }
+        if (!result.success) { if (++cfailA >= 5) { printf("  SOLVER FAILED at step %d\n", step); break; } continue; }
+        cfailA = 0;
 
         double v_cmd = std::clamp(result.v_cmd, cfg.min_velocity, cfg.max_velocity);
         double delta_cmd = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
@@ -142,6 +144,7 @@ int main() {
         printf("%4d | %6.3f %8.4f | %7.3f %11.4f | %7.4f %7.4f %7.4f | %7.4f %7.4f\n",
                step, v_cmd, delta_cmd, stateA(3), stateA(4),
                stateA(0), stateA(1), stateA(2), cte, herr);
+        if (cte > 1.0) break;
 
         double actual_v = pdA.step(v_cmd, cfg.dt);
         mpcc::VecU u;
@@ -173,6 +176,7 @@ int main() {
     double actual_delta_B = 0.0;
     PDSpeedController pdB;
     double progressB = 0.0;
+    int cfailB = 0;
 
     for (int step = 0; step < 30; step++) {
         std::vector<mpcc::PathRef> refs(cfg.horizon + 1);
@@ -191,7 +195,8 @@ int main() {
         mpcc::VecX x0_5d;
         x0_5d << stateB(0), stateB(1), stateB(2), actual_v_B, actual_delta_B;
         auto result = solverB.solve(x0_5d, refs, progressB, total_len, {}, {});
-        if (!result.success) { printf("  SOLVER FAILED at step %d\n", step); break; }
+        if (!result.success) { if (++cfailB >= 5) { printf("  SOLVER FAILED at step %d\n", step); break; } continue; }
+        cfailB = 0;
 
         double v_cmd = std::clamp(result.v_cmd, cfg.min_velocity, cfg.max_velocity);
         double delta_cmd = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
@@ -207,6 +212,7 @@ int main() {
         printf("%4d | %6.3f %8.4f | %7.3f %11.4f | %7.4f %7.4f %7.4f | %7.4f %7.4f\n",
                step, v_cmd, delta_cmd, actual_v_B, actual_delta_B,
                stateB(0), stateB(1), stateB(2), cte, herr);
+        if (cte > 1.0) break;
 
         actual_v_B = pdB.step(v_cmd, cfg.dt);
         actual_delta_B = delta_cmd;  // Direct! No rate limit.

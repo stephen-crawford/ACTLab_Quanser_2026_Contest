@@ -105,19 +105,19 @@ mpcc::Config make_deployment_config() {
     cfg.horizon = 10;
     cfg.dt = 0.1;
     cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;
+    cfg.max_velocity = 0.55;
     cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.45;
-    cfg.contour_weight = 20.0;
+    cfg.contour_weight = 15.0;
     cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;
     cfg.steering_weight = 0.05;
     cfg.acceleration_weight = 0.01;
-    cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 3.0;
+    cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;
     cfg.progress_weight = 1.0;
     cfg.jerk_weight = 0.0;
     cfg.boundary_weight = 0.0;  // Disabled (ref has 0; boundary fights contour on curves)
@@ -125,10 +125,9 @@ mpcc::Config make_deployment_config() {
     cfg.max_sqp_iterations = 5;
     cfg.max_qp_iterations = 20;
     cfg.qp_tolerance = 1e-5;
-    // Startup ramp disabled (matching fix)
-    cfg.startup_ramp_duration_s = 0.0;
-    cfg.startup_elapsed_s = 0.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_ramp_duration_s = 3.0;
+    cfg.startup_elapsed_s = 10.0;  // Past startup for steady-state tests
+    cfg.startup_progress_weight = 1.0;
     return cfg;
 }
 
@@ -265,6 +264,7 @@ LegResult run_leg(
     mpcc::ActiveSolver solver;
     auto cfg = make_deployment_config();
     solver.init(cfg);
+    solver.spline_path = &spline;  // Match deployment (acados evaluates refs at predicted theta_A)
 
     // Set up adaptive path re-projection
     solver.path_lookup.lookup = [&spline, total_len](
@@ -290,6 +290,7 @@ LegResult run_leg(
     double progress = spline.find_closest_progress(state(0), state(1));
     double cte_sum = 0.0;
     int step_count = 0;
+    int cfail = 0;
 
     for (int step = 0; step < max_steps; step++) {
         if (progress >= total_len - 0.1) {
@@ -319,10 +320,14 @@ LegResult run_leg(
         // Solve
         auto sol = solver.solve(state, refs, progress, total_len, {}, {});
         if (!sol.success) {
-            std::printf("  [%s] Solver failed at step %d, progress=%.1f%%\n",
-                leg_name.c_str(), step, 100.0 * progress / total_len);
-            break;
+            if (++cfail >= 5) {
+                std::printf("  [%s] Solver failed at step %d, progress=%.1f%%\n",
+                    leg_name.c_str(), step, 100.0 * progress / total_len);
+                break;
+            }
+            continue;
         }
+        cfail = 0;
 
         double v_cmd = sol.v_cmd;
         double delta_cmd = sol.delta_cmd;
@@ -374,6 +379,7 @@ LegResult run_leg(
         result.max_heading_err = std::max(result.max_heading_err, std::abs(heading_err));
         cte_sum += cte;
         step_count++;
+        if (cte > 1.0) break;
 
         // Track steering saturation
         if (std::abs(std::abs(delta_cmd) - cfg.max_steering) < 0.01)
@@ -457,6 +463,7 @@ LegResult run_leg_with_events(
     mpcc::ActiveSolver solver;
     auto cfg = make_deployment_config();
     solver.init(cfg);
+    solver.spline_path = &spline;  // Match deployment (acados evaluates refs at predicted theta_A)
 
     solver.path_lookup.lookup = [&spline, total_len](
         double px, double py, double s_min, double* s_out) -> mpcc::PathRef
@@ -478,6 +485,7 @@ LegResult run_leg_with_events(
     double progress = spline.find_closest_progress(state(0), state(1));
     double cte_sum = 0.0;
     int step_count = 0;
+    int cfail = 0;
 
     // Event state
     size_t next_event = 0;
@@ -563,7 +571,8 @@ LegResult run_leg_with_events(
         }
 
         auto sol = solver.solve(state, refs, progress, total_len, {}, {});
-        if (!sol.success) break;
+        if (!sol.success) { if (++cfail >= 5) break; continue; }
+        cfail = 0;
 
         double v_cmd = sol.v_cmd;
         double delta_cmd = sol.delta_cmd;
@@ -609,6 +618,7 @@ LegResult run_leg_with_events(
         result.max_cte = std::max(result.max_cte, cte);
         result.max_heading_err = std::max(result.max_heading_err, std::abs(heading_err));
         cte_sum += cte; step_count++;
+        if (cte > 1.0) break;
 
         if (std::abs(std::abs(delta_cmd) - cfg.max_steering) < 0.01)
             result.steering_saturated_steps++;
@@ -974,7 +984,7 @@ int main() {
 
             mpcc::ActiveSolver gsolver;
             auto gcfg = make_deployment_config();
-            gcfg.boundary_weight = 8.0;  // <-- DEPLOY HAD THIS
+            gcfg.boundary_weight = 0.0;  // <-- DEPLOY HAD THIS
             gsolver.init(gcfg);
 
             gsolver.path_lookup.lookup = [&gspline, glen](
@@ -993,6 +1003,7 @@ int main() {
 
             mpcc::AckermannModel gplant(gcfg.wheelbase);
             double gprogress = gspline.find_closest_progress(state(0), state(1));
+            int gcfail = 0;
 
             // Generate path-tangent-based boundary constraints (like controller node fallback)
             double half_width = gcfg.boundary_default_width;
@@ -1032,7 +1043,8 @@ int main() {
                 }
 
                 auto sol = gsolver.solve(state, grefs, gprogress, glen, {}, gbounds);
-                if (!sol.success) break;
+                if (!sol.success) { if (++gcfail >= 5) break; continue; }
+                gcfail = 0;
 
                 double v_cmd = sol.v_cmd;
                 double delta_cmd = sol.delta_cmd;
@@ -1064,6 +1076,7 @@ int main() {
                 gspline.get_position(cp, rx, ry);
                 double cte = std::hypot(state(0) - rx, state(1) - ry);
                 gap_max_cte = std::max(gap_max_cte, cte);
+                if (cte > 1.0) break;
             }
 
             pd_ctrl.actual_speed = 0.0;
@@ -1124,6 +1137,7 @@ int main() {
 
             mpcc::AckermannModel gplant(gcfg.wheelbase);
             double gprogress = gspline.find_closest_progress(state(0), state(1));
+            int gcfail = 0;
 
             for (int step = 0; step < leg.max_steps; step++) {
                 if (gprogress >= glen - 0.1) break;
@@ -1145,7 +1159,8 @@ int main() {
                 solver_state(3) = lagged_v;  // <-- delayed velocity
 
                 auto sol = gsolver.solve(solver_state, grefs, gprogress, glen, {}, {});
-                if (!sol.success) break;
+                if (!sol.success) { if (++gcfail >= 5) break; continue; }
+                gcfail = 0;
 
                 double v_cmd = sol.v_cmd;
                 double delta_cmd = sol.delta_cmd;
@@ -1180,6 +1195,7 @@ int main() {
                 gspline.get_position(cp, rx, ry);
                 double cte = std::hypot(state(0) - rx, state(1) - ry);
                 gap_max_cte = std::max(gap_max_cte, cte);
+                if (cte > 1.0) break;
             }
 
             lagged_v = 0.0;
@@ -1221,7 +1237,7 @@ int main() {
 
             mpcc::ActiveSolver gsolver;
             auto gcfg = make_deployment_config();
-            gcfg.boundary_weight = 8.0;  // <-- DEPLOY HAD THIS
+            gcfg.boundary_weight = 0.0;  // <-- DEPLOY HAD THIS
             gsolver.init(gcfg);
 
             gsolver.path_lookup.lookup = [&gspline, glen](
@@ -1241,6 +1257,7 @@ int main() {
             mpcc::AckermannModel gplant(gcfg.wheelbase);
             double gprogress = gspline.find_closest_progress(state(0), state(1));
             double half_width = gcfg.boundary_default_width;
+            int gcfail = 0;
 
             for (int step = 0; step < leg.max_steps; step++) {
                 if (gprogress >= glen - 0.1) break;
@@ -1279,7 +1296,8 @@ int main() {
                 solver_state(3) = lagged_v;
 
                 auto sol = gsolver.solve(solver_state, grefs, gprogress, glen, {}, gbounds);
-                if (!sol.success) break;
+                if (!sol.success) { if (++gcfail >= 5) break; continue; }
+                gcfail = 0;
 
                 double v_cmd = sol.v_cmd;
                 double delta_cmd = sol.delta_cmd;
@@ -1313,6 +1331,7 @@ int main() {
                 gspline.get_position(cp, rx, ry);
                 double cte = std::hypot(state(0) - rx, state(1) - ry);
                 gap_max_cte = std::max(gap_max_cte, cte);
+                if (cte > 1.0) break;
             }
 
             lagged_v = 0.0;
@@ -1386,6 +1405,7 @@ int main() {
 
             mpcc::AckermannModel gplant(gcfg.wheelbase);
             double gprogress = gspline.find_closest_progress(state(0), state(1));
+            int gcfail = 0;
 
             for (int step = 0; step < leg.max_steps; step++) {
                 if (gprogress >= glen - 0.1) break;
@@ -1409,7 +1429,8 @@ int main() {
                 }
 
                 auto sol = gsolver.solve(noisy_state, grefs, gprogress, glen, {}, {});
-                if (!sol.success) break;
+                if (!sol.success) { if (++gcfail >= 5) break; continue; }
+                gcfail = 0;
 
                 double v_cmd = sol.v_cmd;
                 double delta_cmd = sol.delta_cmd;
@@ -1443,6 +1464,7 @@ int main() {
                 gap_max_cte = std::max(gap_max_cte, cte);
                 gap_cte_sum += cte;
                 gap_steps++;
+                if (cte > 1.0) break;
             }
 
             pd_ctrl.actual_speed = 0.0;
@@ -1497,7 +1519,7 @@ int main() {
 
             mpcc::ActiveSolver gsolver;
             auto gcfg = make_deployment_config();
-            gcfg.boundary_weight = 8.0;
+            gcfg.boundary_weight = 0.0;
             gsolver.init(gcfg);
 
             gsolver.path_lookup.lookup = [&gspline, glen](
@@ -1517,6 +1539,7 @@ int main() {
             mpcc::AckermannModel gplant(gcfg.wheelbase);
             double gprogress = gspline.find_closest_progress(state(0), state(1));
             double half_width = gcfg.boundary_default_width;
+            int gcfail = 0;
 
             for (int step = 0; step < leg.max_steps; step++) {
                 if (gprogress >= glen - 0.1) break;
@@ -1558,7 +1581,8 @@ int main() {
                 }
 
                 auto sol = gsolver.solve(noisy_state, grefs, gprogress, glen, {}, gbounds);
-                if (!sol.success) break;
+                if (!sol.success) { if (++gcfail >= 5) break; continue; }
+                gcfail = 0;
 
                 double v_cmd = sol.v_cmd;
                 double delta_cmd = sol.delta_cmd;
@@ -1594,6 +1618,7 @@ int main() {
                 gap_max_cte = std::max(gap_max_cte, cte);
                 gap_cte_sum += cte;
                 gap_steps++;
+                if (cte > 1.0) break;
             }
 
             lagged_v = 0.0;

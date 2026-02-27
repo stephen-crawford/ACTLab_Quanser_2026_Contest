@@ -21,7 +21,7 @@ struct Config {
     int horizon = 10;  // Match reference (PolyCtrl 2025 K=10). Longer horizons cause oscillation with linearized QP.
     double dt = 0.1;
     double wheelbase = 0.256;
-    double max_velocity = 1.2;
+    double max_velocity = 0.55;  // Hard speed ceiling — close to reference_velocity to prevent overshoot
     double min_velocity = 0.0;
     double max_steering = 0.45;  // ±25.8° — hardware servo limit (ref uses π/6=30° but hardware clips at 0.45)
 
@@ -31,31 +31,32 @@ struct Config {
 
     double reference_velocity = 0.45;
 
-    // Cost weights — tuned via swerving diagnosis (Feb 2026)
-    // Startup phase (3s) handles initial heading alignment with low steering damping.
-    // Normal phase uses moderate steering_rate_weight=1.5 (ref 1.1, was 3.0).
-    // Velocity tracking applied at k=0 only (ref R_ref at k=0), smoothness at k>0.
-    double contour_weight = 15.0;      // ref q_c=1.8 — higher for tighter lateral tracking
-    double lag_weight = 10.0;          // ref q_l=7.0
-    double velocity_weight = 15.0;     // ref R_ref[0]=17.0 — tracks v_ref (applied at k=0 only)
+    // Cost weights — intermediate between reference ratio and deployment-tested values.
+    // Reference (CasADi IPOPT) uses q_c:q_l = 1.8:7.0 = 0.26, but acados EXTERNAL cost
+    // has different scaling. contour=4 was too weak (CTE 0.673m), contour=15 too aggressive
+    // (CTE 0.360m + swerving). contour=8 is the compromise.
+    double contour_weight = 8.0;       // Intermediate: 4→too weak, 15→too aggressive
+    double lag_weight = 15.0;          // Strong progress to prevent circling
+    double velocity_weight = 15.0;     // ref R_ref[0]=17.0 — tracks v_ref at all stages
     double steering_weight = 0.05;     // ref R_ref[1]=0.05 — tracks δ_ref=0 (no feedforward)
     double acceleration_weight = 0.01; // ref R_u[0]=0.005 — smoothness (Δv)²
-    double steering_rate_weight = 1.5; // ref R_u[1]=1.1 — moderate damping (was 3.0, caused swerving)
+    double steering_rate_weight = 1.1; // ref R_u[1]=1.1 — match reference exactly
     double jerk_weight = 0.0;          // not in reference
-    double heading_weight = 0.0;       // NOT in reference — set to 0 to match. Was 2.0; caused swerving by fighting contour cost on curves (amplified by servo delay + TF latency)
+    double heading_weight = 0.0;       // NOT in reference — set to 0. Fights contour on curves.
     double progress_weight = 1.0;     // ref gamma=1.0 — rewards forward progress (-gamma*v*dt)
 
-    // Startup ramp — enabled (3.0s). Reference uses different weights during first 3s:
-    // Low steering damping + high progress weight for fast heading alignment.
-    double startup_ramp_duration_s = 3.0;
+    // Startup ramp — 1.5s. Brief ramp for initial alignment.
+    // Startup weights: slightly more conservative, then quickly transition to normal.
+    // Steering is INSTANT (direct servo, no PID) — hardware applies commands within 15ms.
+    double startup_ramp_duration_s = 1.5;
     double startup_elapsed_s = 0.0;
-    double startup_contour_weight = 1.0;
-    double startup_lag_weight = 10.0;
-    double startup_velocity_weight = 5.0;
-    double startup_heading_weight = 1.0;  // Mild heading correction during startup only (3s). Reference has 0 everywhere, but our linearized QP benefits from explicit heading guidance at large errors. Decays to 0 via ramp.
-    double startup_steering_rate_weight = 0.05;
-    double startup_progress_weight = 5.0;    // ref gamma=5.0 during startup (aggressive progress)
-    double startup_curvature_decay = -5.0;
+    double startup_contour_weight = 6.0;      // Slightly less than normal (8) during startup
+    double startup_lag_weight = 12.0;          // Slightly less progress at start
+    double startup_velocity_weight = 15.0;     // Same as normal
+    double startup_heading_weight = 0.5;       // Mild heading correction during startup only
+    double startup_steering_rate_weight = 2.0; // Slightly more damping at start (normal=1.1)
+    double startup_progress_weight = 1.0;      // Normal
+    double startup_curvature_decay = -0.4;     // Match reference exactly (was -1.0)
 
     // Obstacle
     double robot_radius = 0.13;
@@ -70,6 +71,10 @@ struct Config {
     int max_sqp_iterations = 5;   // PyMPC uses 5; was 3 (insufficient for curve convergence)
     int max_qp_iterations = 20;   // qpOASES iteration limit (acados multiplies by 10 internally)
     double qp_tolerance = 1e-5;
+
+    // Diagnostics logging (deployment + test instrumentation)
+    bool diagnostics_enabled = false;    // Extract solver convergence data after each solve
+    bool per_stage_logging = false;      // Log per-stage trajectory + references (expensive)
 };
 
 struct PathRef {
@@ -103,6 +108,49 @@ struct BoundaryConstraint {
     double b_left, b_right;
 };
 
+struct SolverDiagnostics {
+    // Convergence (from acados via ocp_nlp_get)
+    int acados_status = -1;     // Raw return code (0=converged, 2=max_iter, 3/4=MINSTEP)
+    int sqp_iter = 0;
+    double kkt_norm_inf = -1.0;
+    int qp_status = -1;
+
+    // Residuals (matching mpc_planner extraction)
+    double res_eq = -1.0;       // Dynamics violation
+    double res_ineq = -1.0;     // Constraint violation (obstacle/boundary)
+    double res_comp = -1.0;
+    double res_stat = -1.0;
+
+    // Timing (acados internal)
+    double acados_time_tot_ms = 0.0;
+    double acados_time_qp_ms = 0.0;
+
+    // Warmstart
+    bool warmstart_used = false;
+    int warmstart_shift_count = 0;
+
+    // Startup ramp
+    double startup_progress = 0.0;  // 0=startup, 1=normal
+
+    // Effective weights (after ramp interpolation)
+    double eff_contour_w = 0.0;
+    double eff_lag_w = 0.0;
+    double eff_vel_w = 0.0;
+    double eff_sr_w = 0.0;
+    double eff_progress_w = 0.0;
+    double eff_v_ref_k0 = 0.0;  // Curvature-adapted v_ref at first stage
+
+    // Per-stage predicted trajectory (4D state, 3D control)
+    std::vector<double> stage_x, stage_y, stage_psi, stage_theta_a;  // N+1
+    std::vector<double> stage_v, stage_delta, stage_v_theta;          // N
+
+    // Per-stage references sent to solver
+    std::vector<double> ref_x, ref_y, ref_v, ref_curv;  // N+1
+
+    // Obstacle data
+    double obs_x = 0, obs_y = 0, obs_r = 0, obs_dist = -1;
+};
+
 struct Result {
     double v_cmd;
     double delta_cmd;
@@ -113,6 +161,7 @@ struct Result {
     double solve_time_us;
     bool success;
     double cost;
+    SolverDiagnostics diag;
 };
 
 // Solver uses 3D state, 2D control

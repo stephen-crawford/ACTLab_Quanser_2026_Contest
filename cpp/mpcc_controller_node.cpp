@@ -542,25 +542,62 @@ private:
             auto t = tf_buffer_->lookupTransform(
                 "map", "base_link", tf2::TimePointZero,
                 tf2::durationFromSec(0.05));
-            state_x_ = t.transform.translation.x;
-            state_y_ = t.transform.translation.y;
+            double raw_x = t.transform.translation.x;
+            double raw_y = t.transform.translation.y;
             auto& q = t.transform.rotation;
-            state_theta_ = std::atan2(2.0*(q.w*q.z + q.x*q.y),
-                                       1.0 - 2.0*(q.y*q.y + q.z*q.z));
+            double raw_theta = std::atan2(2.0*(q.w*q.z + q.x*q.y),
+                                           1.0 - 2.0*(q.y*q.y + q.z*q.z));
 
             // Estimate velocity from position change
             auto now = this->now().seconds();
             if (last_pose_time_ > 0) {
                 double dt = now - last_pose_time_;
                 if (dt > 0.01) {
-                    double dx = state_x_ - last_x_;
-                    double dy = state_y_ - last_y_;
+                    double dx = raw_x - last_x_;
+                    double dy = raw_y - last_y_;
                     state_v_ = std::sqrt(dx*dx + dy*dy) / dt;
                 }
             }
+
+            // Apply heading rate filter: Cartographer SLAM can produce heading
+            // jumps of 10-26 degrees per 100ms step (physically impossible).
+            // Max yaw rate = (v/L) * tan(delta_max) * cos(beta_max).
+            // At v_max=0.55: ~1.0 rad/s. We use 2x safety margin (2.0 rad/s).
+            // Any heading change exceeding this is SLAM correction noise.
+            if (has_odom_ && last_pose_time_ > 0) {
+                double dt = now - last_pose_time_;
+                if (dt > 0.005 && dt < 0.5) {
+                    double dtheta = raw_theta - state_theta_;
+                    // Normalize to [-pi, pi]
+                    while (dtheta > M_PI) dtheta -= 2.0 * M_PI;
+                    while (dtheta < -M_PI) dtheta += 2.0 * M_PI;
+
+                    double max_yaw_rate = 2.0;  // rad/s (2x physical max)
+                    double max_dtheta = max_yaw_rate * dt;
+                    if (std::abs(dtheta) > max_dtheta) {
+                        double clamped = std::clamp(dtheta, -max_dtheta, max_dtheta);
+                        double new_theta = state_theta_ + clamped;
+                        // Normalize
+                        while (new_theta > M_PI) new_theta -= 2.0 * M_PI;
+                        while (new_theta < -M_PI) new_theta += 2.0 * M_PI;
+                        tf_heading_filter_active_ = true;
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                            "Heading filter: raw jump %.1f deg/step (max %.1f), clamped",
+                            std::abs(dtheta) * 180.0 / M_PI,
+                            max_dtheta * 180.0 / M_PI);
+                        raw_theta = new_theta;
+                    } else {
+                        tf_heading_filter_active_ = false;
+                    }
+                }
+            }
+
+            state_x_ = raw_x;
+            state_y_ = raw_y;
+            state_theta_ = raw_theta;
             last_pose_time_ = now;
-            last_x_ = state_x_;
-            last_y_ = state_y_;
+            last_x_ = raw_x;
+            last_y_ = raw_y;
             has_odom_ = true;
             return true;
         } catch (const tf2::TransformException&) {
@@ -1070,6 +1107,7 @@ private:
 
         double v_cmd = result.v_cmd;
         double delta_cmd = result.delta_cmd;
+        raw_delta_cmd_ = delta_cmd;  // Save pre-slew-rate value for logging
 
         // Decelerate near goal
         if (remaining < 0.5) {
@@ -1095,6 +1133,7 @@ private:
             delta_cmd = std::clamp(delta_cmd, lo, hi);
             delta_cmd = std::clamp(delta_cmd, -config_.max_steering, config_.max_steering);
         }
+        slew_rate_clipped_ = (std::abs(delta_cmd - raw_delta_cmd_) > 0.001);
 
         // Publish MotorCommands directly (bypass nav2_qcar_command_convert)
         if (use_direct_motor_ && motor_pub_) {
@@ -1194,7 +1233,8 @@ private:
                  "warmstart,warmstart_shifts,startup_progress,"
                  "eff_contour_w,eff_lag_w,eff_vel_w,eff_sr_w,eff_progress_w,eff_v_ref_k0,"
                  "obs_x,obs_y,obs_r,obs_dist,"
-                 "state_source,tf_age_ms,steering_sat_count\n";
+                 "state_source,tf_age_ms,steering_sat_count,"
+                 "raw_delta_cmd,slew_clipped,heading_filtered\n";
         }
         {
             std::ofstream f(mpcc_traj_csv_path_);
@@ -1212,7 +1252,9 @@ private:
               << " steer_rate=" << config_.steering_rate_weight
               << " heading=" << config_.heading_weight
               << " max_steer=" << config_.max_steering
-              << " direct_motor=" << (use_direct_motor_ ? "true" : "false") << "\n\n";
+              << " direct_motor=" << (use_direct_motor_ ? "true" : "false")
+              << " steering_slew_rate=" << steering_slew_rate_
+              << " heading_filter=2.0rad/s" << "\n\n";
         }
         log_start_time_ = this->now().seconds();
         RCLCPP_INFO(this->get_logger(), "=== MPCC LOGS ===");
@@ -1270,7 +1312,11 @@ private:
               // State source and TF age
               << state_source << ","
               << std::setprecision(1) << tf_age_ms << ","
-              << steering_saturated_count_ << "\n";
+              << steering_saturated_count_ << ","
+              // Diagnostic: raw solver delta before slew-rate, clipping flags
+              << std::setprecision(4) << raw_delta_cmd_ << ","
+              << (slew_rate_clipped_ ? 1 : 0) << ","
+              << (tf_heading_filter_active_ ? 1 : 0) << "\n";
         } catch (...) {}
 
         // Write per-stage trajectory adaptively: every 10th cycle or high CTE
@@ -1482,6 +1528,8 @@ private:
     // Direct motor mode
     bool use_direct_motor_ = true;
     double steering_slew_rate_ = 1.0;  // rad/s
+    bool slew_rate_clipped_ = false;
+    double raw_delta_cmd_ = 0.0;
 
     // State estimator
     bool use_state_estimator_ = false;
@@ -1495,6 +1543,7 @@ private:
     // TF state
     double last_pose_time_ = 0.0;
     double last_x_ = 0.0, last_y_ = 0.0;
+    bool tf_heading_filter_active_ = false;
 
     // Timing
     rclcpp::Time start_time_;

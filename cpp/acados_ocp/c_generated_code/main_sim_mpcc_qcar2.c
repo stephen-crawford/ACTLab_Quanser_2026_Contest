@@ -101,9 +101,11 @@ int main()
     p[14] = 0;
     p[15] = 0;
     p[16] = 0;
-    p[17] = 1000;
-    p[18] = 1000;
-    p[19] = 0.1;
+    p[17] = 10;
+    p[18] = 0;
+    p[19] = 0;
+    p[20] = 5;
+    p[21] = 5;
 
     mpcc_qcar2_acados_sim_update_params(capsule, p, NP);
   

@@ -58,7 +58,7 @@ def plot_mission_path(output_dir):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle('Combined Mission Simulation', fontsize=14)
 
-    # Bird's-eye view (QLabs frame)
+    # Bird's-eye view (QLabs overhead: +X=UP, +Y=LEFT → plot Y vs X, invert horizontal)
     ax = axes[0, 0]
     legs = np.unique(data['leg'])
     colors = {'hub_to_pickup': '#2196F3', 'pickup_to_dropoff': '#FF9800', 'dropoff_to_hub': '#4CAF50'}
@@ -66,17 +66,18 @@ def plot_mission_path(output_dir):
         leg_str = str(leg)
         mask = data['leg'] == leg
         c = colors.get(leg_str, '#888888')
-        ax.plot(data['x_qlabs'][mask], data['y_qlabs'][mask], '-', color=c, linewidth=1.5, label=leg_str)
+        ax.plot(data['y_qlabs'][mask], data['x_qlabs'][mask], '-', color=c, linewidth=1.5, label=leg_str)
     # Plot reference paths if available
     for leg_str, c in colors.items():
         ref_path = os.path.join(output_dir, f'combined_ref_{leg_str}.csv')
         if os.path.exists(ref_path):
             ref = load_csv(ref_path)
             if ref is not None:
-                ax.plot(ref['x_qlabs'], ref['y_qlabs'], '--', color=c, alpha=0.4, linewidth=0.8)
-    ax.set_xlabel('X (QLabs)')
-    ax.set_ylabel('Y (QLabs)')
-    ax.set_title('Trajectory (QLabs frame)')
+                ax.plot(ref['y_qlabs'], ref['x_qlabs'], '--', color=c, alpha=0.4, linewidth=0.8)
+    ax.invert_xaxis()  # +Y_qlabs = LEFT = screen left
+    ax.set_xlabel('Y_QLabs (m)')
+    ax.set_ylabel('X_QLabs (m)')
+    ax.set_title('Trajectory (QLabs overhead view)')
     ax.set_aspect('equal')
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
@@ -228,13 +229,21 @@ def plot_full_mission_sim(output_dir):
                                       ' (Traffic)' if suffix == '_traffic' else '')
         fig.suptitle(title, fontsize=14)
 
-        # XY
+        # XY — use QLabs overhead view orientation (+X=UP, +Y=LEFT)
         ax = axes[0, 0]
         x_col = 'x_qlabs' if 'x_qlabs' in data.dtype.names else 'x'
         y_col = 'y_qlabs' if 'y_qlabs' in data.dtype.names else 'y'
+        is_qlabs = 'x_qlabs' in data.dtype.names
         if x_col in data.dtype.names and y_col in data.dtype.names:
-            ax.plot(data[x_col], data[y_col], 'b-', linewidth=1)
-        frame = 'QLabs' if 'x_qlabs' in data.dtype.names else 'map'
+            if is_qlabs:
+                # QLabs overhead: plot Y on horizontal (inverted), X on vertical
+                ax.plot(data[y_col], data[x_col], 'b-', linewidth=1)
+                ax.invert_xaxis()
+                ax.set_xlabel('Y_QLabs (m)')
+                ax.set_ylabel('X_QLabs (m)')
+            else:
+                ax.plot(data[x_col], data[y_col], 'b-', linewidth=1)
+        frame = 'QLabs overhead' if is_qlabs else 'map'
         ax.set_title(f'Trajectory ({frame} frame)')
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)

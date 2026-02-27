@@ -193,11 +193,17 @@ def generate_report(data, planned_paths, output_path, blended_paths=None):
                     ha='center', va='bottom', xytext=(0, 3),
                     textcoords='offset points')
 
+    # QLabs overhead view: +X = UP, +Y = LEFT
+    # Plot: horizontal = Y_ql (inverted), vertical = X_ql
+    def to_plot(x_ql, y_ql):
+        return y_ql, x_ql
+
     # Draw planned paths (thin, background)
     for name, path in planned_paths.items():
         color = LEG_COLORS.get(name, 'cyan')
         label = LEG_LABELS.get(name, name)
-        ax.plot(path[:, 0], path[:, 1], color=color, linewidth=1.5,
+        ph, pv = to_plot(path[:, 0], path[:, 1])
+        ax.plot(ph, pv, color=color, linewidth=1.5,
                 alpha=0.4, zorder=3, label=label)
 
     # Draw blended paths (what the controller actually tracks) — thicker, foreground
@@ -210,7 +216,8 @@ def generate_report(data, planned_paths, output_path, blended_paths=None):
         for name, path in blended_paths.items():
             color = LEG_COLORS.get(name, 'cyan')
             label = BLEND_LABELS.get(name, f'Tracked: {name}')
-            ax.plot(path[:, 0], path[:, 1], color=color, linewidth=2.5,
+            ph, pv = to_plot(path[:, 0], path[:, 1])
+            ax.plot(ph, pv, color=color, linewidth=2.5,
                     alpha=0.9, zorder=4, label=label, linestyle='--')
 
     # Draw executed path (map→QLabs transform)
@@ -220,7 +227,8 @@ def generate_report(data, planned_paths, output_path, blended_paths=None):
         x_ql[i], y_ql[i] = map_to_qlabs(data['x'][i], data['y'][i])
 
     cte = np.abs(data['cross_track_err'])
-    points = np.column_stack([x_ql, y_ql]).reshape(-1, 1, 2)
+    plot_h, plot_v = to_plot(x_ql, y_ql)
+    points = np.column_stack([plot_h, plot_v]).reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
     norm = mcolors.Normalize(vmin=0, vmax=0.5)
     seg_cte = (cte[:-1] + cte[1:]) / 2.0
@@ -234,9 +242,10 @@ def generate_report(data, planned_paths, output_path, blended_paths=None):
     waypoints = {'Hub': HUB, 'Pickup': PICKUP, 'Dropoff': DROPOFF}
     colors = {'Hub': 'magenta', 'Pickup': 'blue', 'Dropoff': 'orange'}
     for name, (wx, wy) in waypoints.items():
-        ax.plot(wx, wy, '*', color=colors[name], markersize=15, zorder=10,
+        ph, pv = to_plot(wx, wy)
+        ax.plot(ph, pv, '*', color=colors[name], markersize=15, zorder=10,
                 markeredgecolor='black', markeredgewidth=0.5)
-        ax.annotate(name, (wx, wy), fontsize=10, fontweight='bold',
+        ax.annotate(name, (ph, pv), fontsize=10, fontweight='bold',
                     color=colors[name], ha='center', va='bottom',
                     xytext=(0, 10), textcoords='offset points',
                     bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
@@ -256,21 +265,23 @@ def generate_report(data, planned_paths, output_path, blended_paths=None):
             verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
 
-    ax.set_xlabel('X (QLabs frame, m)')
-    ax.set_ylabel('Y (QLabs frame, m)')
-    ax.set_title('Simulation Report: Planned vs Simulated Path')
+    ax.invert_xaxis()  # +Y_qlabs = LEFT = screen left
+    ax.set_xlabel('Y_QLabs (m)')
+    ax.set_ylabel('X_QLabs (m)')
+    ax.set_title('Simulation Report (QLabs overhead view)')
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
     ax.legend(loc='lower right', fontsize=8)
 
     # Auto-scale
-    all_x, all_y = list(x_ql), list(y_ql)
+    all_h, all_v = list(plot_h), list(plot_v)
     for path in planned_paths.values():
-        all_x.extend(path[:, 0])
-        all_y.extend(path[:, 1])
+        ph, pv = to_plot(path[:, 0], path[:, 1])
+        all_h.extend(ph)
+        all_v.extend(pv)
     margin = 0.3
-    ax.set_xlim(min(all_x) - margin, max(all_x) + margin)
-    ax.set_ylim(min(all_y) - margin, max(all_y) + margin)
+    ax.set_xlim(max(all_h) + margin, min(all_h) - margin)  # inverted
+    ax.set_ylim(min(all_v) - margin, max(all_v) + margin)
 
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)

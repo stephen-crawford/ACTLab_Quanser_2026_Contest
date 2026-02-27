@@ -265,7 +265,13 @@ LEG_LABELS = {
 
 
 def generate_figure(csv_path, data, planned_paths):
-    """Generate and save the mission report figure."""
+    """Generate and save the mission report figure.
+
+    Plots in QLabs overhead camera orientation:
+    - QLabs +X = screen UP, QLabs +Y = screen LEFT
+    - To match this: plot Y_ql on horizontal axis (inverted), X_ql on vertical axis
+    - This means: ax.plot(y_ql, x_ql) with ax.invert_xaxis()
+    """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -274,20 +280,26 @@ def generate_figure(csv_path, data, planned_paths):
 
     fig, ax = plt.subplots(1, 1, figsize=(12, 10))
 
+    # Helper: convert QLabs (x_ql, y_ql) to plot coords matching overhead view
+    # Plot horizontal = Y_ql (inverted via invert_xaxis), vertical = X_ql
+    def to_plot(x_ql, y_ql):
+        return y_ql, x_ql
+
     # --- Draw SDCS road network (thin gray lines in QLabs frame) ---
     nodes = get_sdcs_nodes()
     edges = get_sdcs_edges()
 
     for (n1, n2) in edges:
         if n1 in nodes and n2 in nodes:
-            x1, y1 = nodes[n1]
-            x2, y2 = nodes[n2]
-            ax.plot([x1, x2], [y1, y2], color='#cccccc', linewidth=0.5, zorder=1)
+            px1, py1 = to_plot(*nodes[n1])
+            px2, py2 = to_plot(*nodes[n2])
+            ax.plot([px1, px2], [py1, py2], color='#cccccc', linewidth=0.5, zorder=1)
 
     # Draw node positions
     for nid, (nx, ny) in nodes.items():
-        ax.plot(nx, ny, 'o', color='#aaaaaa', markersize=3, zorder=2)
-        ax.annotate(str(nid), (nx, ny), fontsize=5, color='#999999',
+        px, py = to_plot(nx, ny)
+        ax.plot(px, py, 'o', color='#aaaaaa', markersize=3, zorder=2)
+        ax.annotate(str(nid), (px, py), fontsize=5, color='#999999',
                     ha='center', va='bottom', xytext=(0, 3),
                     textcoords='offset points')
 
@@ -295,7 +307,8 @@ def generate_figure(csv_path, data, planned_paths):
     for name, path in planned_paths.items():
         color = LEG_COLORS.get(name, 'cyan')
         label = LEG_LABELS.get(name, f'Planned: {name}')
-        ax.plot(path[:, 0], path[:, 1], color=color, linewidth=2.0,
+        pp_x, pp_y = to_plot(path[:, 0], path[:, 1])
+        ax.plot(pp_x, pp_y, color=color, linewidth=2.0,
                 alpha=0.8, zorder=3, label=label)
 
     # --- Draw executed path color-coded by cross-track error ---
@@ -308,8 +321,11 @@ def generate_figure(csv_path, data, planned_paths):
     cte = np.abs(data['cross_track_err'])
     max_cte_color = 0.5  # saturate colormap at 0.5m
 
+    # Convert to plot coordinates (swap to match QLabs overhead view)
+    plot_h, plot_v = to_plot(x_ql, y_ql)
+
     # Create line segments for color-coded path
-    points = np.column_stack([x_ql, y_ql]).reshape(-1, 1, 2)
+    points = np.column_stack([plot_h, plot_v]).reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
 
     norm = mcolors.Normalize(vmin=0, vmax=max_cte_color)
@@ -326,9 +342,10 @@ def generate_figure(csv_path, data, planned_paths):
     waypoints = {'Hub': HUB, 'Pickup': PICKUP, 'Dropoff': DROPOFF}
     colors = {'Hub': 'magenta', 'Pickup': 'blue', 'Dropoff': 'orange'}
     for name, (wx, wy) in waypoints.items():
-        ax.plot(wx, wy, '*', color=colors[name], markersize=15, zorder=10,
+        px, py = to_plot(wx, wy)
+        ax.plot(px, py, '*', color=colors[name], markersize=15, zorder=10,
                 markeredgecolor='black', markeredgewidth=0.5)
-        ax.annotate(name, (wx, wy), fontsize=10, fontweight='bold',
+        ax.annotate(name, (px, py), fontsize=10, fontweight='bold',
                     color=colors[name], ha='center', va='bottom',
                     xytext=(0, 10), textcoords='offset points',
                     bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
@@ -351,27 +368,32 @@ def generate_figure(csv_path, data, planned_paths):
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
 
     # --- Formatting ---
-    ax.set_xlabel('X (QLabs frame, m)')
-    ax.set_ylabel('Y (QLabs frame, m)')
-    ax.set_title('Mission Report: Planned vs Executed Path')
+    # QLabs overhead: +Y = LEFT, +X = UP
+    # Plot horizontal = Y_ql, vertical = X_ql, invert horizontal so +Y (left) is screen-left
+    ax.invert_xaxis()
+    ax.set_xlabel('Y_QLabs (m) — left is +Y')
+    ax.set_ylabel('X_QLabs (m) — up is +X')
+    ax.set_title('Mission Report: Planned vs Executed Path (QLabs overhead view)')
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
     ax.legend(loc='lower right', fontsize=8)
 
     # Auto-scale with some margin
-    all_x = list(x_ql)
-    all_y = list(y_ql)
+    all_h = list(plot_h)
+    all_v = list(plot_v)
     for path in planned_paths.values():
-        all_x.extend(path[:, 0])
-        all_y.extend(path[:, 1])
+        ph, pv = to_plot(path[:, 0], path[:, 1])
+        all_h.extend(ph)
+        all_v.extend(pv)
     for (wx, wy) in waypoints.values():
-        all_x.append(wx)
-        all_y.append(wy)
+        ph, pv = to_plot(wx, wy)
+        all_h.append(ph)
+        all_v.append(pv)
 
-    if all_x and all_y:
+    if all_h and all_v:
         margin = 0.3
-        ax.set_xlim(min(all_x) - margin, max(all_x) + margin)
-        ax.set_ylim(min(all_y) - margin, max(all_y) + margin)
+        ax.set_xlim(max(all_h) + margin, min(all_h) - margin)  # inverted for +Y=LEFT
+        ax.set_ylim(min(all_v) - margin, max(all_v) + margin)
 
     # Save
     csv_basename = os.path.splitext(os.path.basename(csv_path))[0]

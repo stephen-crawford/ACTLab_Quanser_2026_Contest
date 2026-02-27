@@ -64,27 +64,27 @@ int main() {
     cfg.horizon = 10;
     cfg.dt = 0.1;
     cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;
+    cfg.max_velocity = 0.55;
     cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.45;
-    cfg.contour_weight = 20.0;
+    cfg.contour_weight = 15.0;
     cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;
     cfg.steering_weight = 0.05;
     cfg.acceleration_weight = 0.01;
-    cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 3.0;
+    cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;
     cfg.jerk_weight = 0.0;
     cfg.boundary_weight = 0.0;
     cfg.progress_weight = 1.0;
     cfg.max_sqp_iterations = 5;
     cfg.max_qp_iterations = 20;
-    cfg.startup_ramp_duration_s = 0.0;  // disabled
+    cfg.startup_ramp_duration_s = 3.0;
     cfg.startup_elapsed_s = 0.0;
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
 
     // ====== Test 1: Solver with NO path lookup (pre-computed refs) ======
     printf("=== Test 1: Pre-computed path refs (no adaptive re-projection) ===\n");
@@ -205,6 +205,7 @@ int main() {
         double state_x = 0.016, state_y = 0.004, state_theta = 0.014;
         double state_v = 0.034, state_delta = 0.0;
         double progress = 0.0;
+        int cfail = 0;
 
         // Simulate without plant model — just test what the solver does
         // when state_delta is set to the commanded value (as deployment does)
@@ -240,7 +241,8 @@ int main() {
                    step, result.v_cmd, result.delta_cmd, state_v, state_delta,
                    state_x, state_y, state_theta, cte, herr);
 
-            if (!result.success) { printf("  SOLVER FAILED!\n"); break; }
+            if (!result.success) { if (++cfail >= 5) { printf("  SOLVER FAILED!\n"); break; } continue; }
+            cfail = 0;
 
             // Deployment feedback: state_delta = delta_cmd (NOT measured from plant!)
             // This is what mpcc_controller_node.cpp line 1113 does

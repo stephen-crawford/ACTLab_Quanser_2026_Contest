@@ -22,10 +22,14 @@ mkdir -p "$OUTPUT_DIR"
 
 QUICK=false
 VERBOSE=false
+DIAGNOSTICS=false
+REALISTIC=false
 for arg in "$@"; do
     case "$arg" in
-        --quick)   QUICK=true ;;
-        --verbose) VERBOSE=true ;;
+        --quick)       QUICK=true ;;
+        --verbose)     VERBOSE=true ;;
+        --diagnostics) DIAGNOSTICS=true ;;
+        --realistic)   REALISTIC=true ;;
     esac
 done
 
@@ -40,6 +44,16 @@ FAIL_COUNT=0
 BUILD_FAIL_COUNT=0
 
 CXX_FLAGS="-std=c++17 -O2 -I.. -I/usr/include/eigen3"
+
+# Optional feature flags
+if $DIAGNOSTICS; then
+    CXX_FLAGS="$CXX_FLAGS -DDIAGNOSTICS_ENABLED"
+    echo "  Diagnostics: ENABLED"
+fi
+if $REALISTIC; then
+    CXX_FLAGS="$CXX_FLAGS -DREALISTIC_DELAYS"
+    echo "  Realistic delays: ENABLED"
+fi
 
 # acados setup
 ACADOS_DIR="${ACADOS_INSTALL_DIR:-/home/stephen/acados}"

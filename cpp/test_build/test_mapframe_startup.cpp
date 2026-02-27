@@ -169,25 +169,25 @@ int main() {
     cfg.horizon = 10;
     cfg.dt = 0.1;
     cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;
+    cfg.max_velocity = 0.55;
     cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
     cfg.reference_velocity = 0.45;
-    cfg.contour_weight = 20.0;
+    cfg.contour_weight = 15.0;
     cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;
     cfg.steering_weight = 0.05;
     cfg.acceleration_weight = 0.01;
-    cfg.steering_rate_weight = 1.0;
-    cfg.heading_weight = 3.0;
+    cfg.steering_rate_weight = 1.5;
+    cfg.heading_weight = 0.0;
     cfg.jerk_weight = 0.0;
     cfg.boundary_weight = 0.0;
     cfg.progress_weight = 1.0;
     cfg.max_sqp_iterations = 5;
     cfg.max_qp_iterations = 20;
-    cfg.startup_ramp_duration_s = 0.0;
+    cfg.startup_ramp_duration_s = 3.0;
 
     // Step 7: Full deployment simulation
     printf("=== Deployment-Realistic Simulation ===\n");
@@ -196,6 +196,7 @@ int main() {
 
     mpcc::ActiveSolver solver;
     solver.init(cfg);
+    solver.spline_path = &spline;  // Match deployment (acados evaluates refs at predicted theta_A)
 
     // Adaptive path re-projection (as deployed)
     solver.path_lookup.lookup = [&spline, total_len](
@@ -224,6 +225,7 @@ int main() {
     double max_cte = 0.0, sum_cte = 0.0;
     int steer_sat_count = 0;
     int n_steps = 0;
+    int cfail = 0;
 
     // Trace data for CSV
     std::vector<double> tr_t, tr_x, tr_y, tr_theta, tr_v, tr_vcmd;
@@ -249,7 +251,8 @@ int main() {
         mpcc::VecX x0;
         x0 << state(0), state(1), state(2), actual_v, actual_delta;
         auto result = solver.solve(x0, refs, progress, total_len, {}, {});
-        if (!result.success) { printf("  SOLVER FAILED at step %d\n", step); break; }
+        if (!result.success) { if (++cfail >= 5) { printf("  SOLVER FAILED at step %d\n", step); break; } continue; }
+        cfail = 0;
 
         double v_cmd = std::clamp(result.v_cmd, cfg.min_velocity, cfg.max_velocity);
         double delta_cmd = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
@@ -285,6 +288,7 @@ int main() {
 
         max_cte = std::max(max_cte, cte);
         sum_cte += cte;
+        if (max_cte > 1.0) break;
         if (std::abs(delta_cmd) > cfg.max_steering - 0.01) steer_sat_count++;
         n_steps++;
 

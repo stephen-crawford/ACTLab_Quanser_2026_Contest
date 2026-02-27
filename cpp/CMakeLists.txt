@@ -36,8 +36,16 @@ find_package(yaml-cpp REQUIRED)
 # =============================================================================
 set(ACADOS_DIR "$ENV{ACADOS_INSTALL_DIR}" CACHE PATH "acados install directory")
 if(NOT ACADOS_DIR)
-  set(ACADOS_DIR "/home/stephen/acados")
+  # Try common locations: host install, then Docker workspace
+  if(EXISTS "/home/stephen/acados/include")
+    set(ACADOS_DIR "/home/stephen/acados")
+  elseif(EXISTS "/workspaces/isaac_ros-dev/acados/include")
+    set(ACADOS_DIR "/workspaces/isaac_ros-dev/acados")
+  else()
+    message(FATAL_ERROR "acados not found. Set ACADOS_INSTALL_DIR or install to /home/stephen/acados")
+  endif()
 endif()
+message(STATUS "Using acados from: ${ACADOS_DIR}")
 
 # acados generated solver code
 set(ACADOS_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/acados_ocp/c_generated_code")
@@ -62,8 +70,18 @@ target_include_directories(acados_mpcc_generated PUBLIC
   ${ACADOS_DIR}/include/hpipm/include
 )
 
+target_compile_definitions(acados_mpcc_generated PUBLIC ACADOS_WITH_QPOASES)
 target_link_directories(acados_mpcc_generated PUBLIC ${ACADOS_DIR}/lib)
-target_link_libraries(acados_mpcc_generated acados hpipm blasfeo m)
+target_link_libraries(acados_mpcc_generated acados hpipm blasfeo qpOASES_e m)
+
+# Ensure all executables linking acados can find shared libs at runtime.
+# Use -Wl,--disable-new-dtags to force RPATH (inherited by transitive deps)
+# instead of RUNPATH (which only applies to direct deps).
+set(CMAKE_BUILD_RPATH "${ACADOS_DIR}/lib")
+set(CMAKE_INSTALL_RPATH "${ACADOS_DIR}/lib")
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+add_link_options("-Wl,--disable-new-dtags")
 
 # =============================================================================
 # acc_core - Static library for non-ROS computational code

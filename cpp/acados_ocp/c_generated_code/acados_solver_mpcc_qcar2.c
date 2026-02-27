@@ -155,8 +155,8 @@ void mpcc_qcar2_acados_create_set_plan(ocp_nlp_plan_t* nlp_solver_plan, const in
 
     nlp_solver_plan->nlp_solver = SQP;
 
-    nlp_solver_plan->ocp_qp_solver_plan.qp_solver = FULL_CONDENSING_QPOASES;
-    nlp_solver_plan->relaxed_ocp_qp_solver_plan.qp_solver = FULL_CONDENSING_QPOASES;
+    nlp_solver_plan->ocp_qp_solver_plan.qp_solver = PARTIAL_CONDENSING_HPIPM;
+    nlp_solver_plan->relaxed_ocp_qp_solver_plan.qp_solver = PARTIAL_CONDENSING_HPIPM;
     nlp_solver_plan->nlp_cost[0] = EXTERNAL;
     for (int i = 1; i < N; i++)
         nlp_solver_plan->nlp_cost[i] = EXTERNAL;
@@ -177,7 +177,7 @@ void mpcc_qcar2_acados_create_set_plan(ocp_nlp_plan_t* nlp_solver_plan, const in
     }
     nlp_solver_plan->nlp_constraints[N] = BGH;
 
-    nlp_solver_plan->regularization = CONVEXIFY;
+    nlp_solver_plan->regularization = MIRROR;
 
     nlp_solver_plan->globalization = FIXED_STEP;
 }
@@ -440,9 +440,9 @@ void mpcc_qcar2_acados_create_set_default_parameters(mpcc_qcar2_solver_capsule* 
     const int N = capsule->nlp_solver_plan->N;
     // initialize parameters to nominal value
     double* p = calloc(NP, sizeof(double));
-    p[17] = 1000;
-    p[18] = 1000;
-    p[19] = 0.1;
+    p[17] = 10;
+    p[20] = 5;
+    p[21] = 5;
 
     for (int i = 0; i <= N; i++) {
         mpcc_qcar2_acados_update_params(capsule, i, p, NP);
@@ -631,7 +631,7 @@ void mpcc_qcar2_acados_setup_nlp_in(mpcc_qcar2_solver_capsule* capsule, const in
     double* lubu = calloc(2*NBU, sizeof(double));
     double* lbu = lubu;
     double* ubu = lubu + NBU;
-    ubu[0] = 1.2;
+    ubu[0] = 0.55;
     lbu[1] = -0.45;
     ubu[1] = 0.45;
     ubu[2] = 2;
@@ -683,6 +683,8 @@ void mpcc_qcar2_acados_setup_nlp_in(mpcc_qcar2_solver_capsule* capsule, const in
     double* luh = calloc(2*NH, sizeof(double));
     double* lh = luh;
     double* uh = luh + NH;
+    lh[1] = -1000000;
+    lh[2] = -1000000;
     uh[0] = 1000000;
 
     for (int i = 1; i < N; i++)
@@ -759,6 +761,8 @@ void mpcc_qcar2_acados_setup_nlp_in(mpcc_qcar2_solver_capsule* capsule, const in
     double* luh_e = calloc(2*NHN, sizeof(double));
     double* lh_e = luh_e;
     double* uh_e = luh_e + NHN;
+    lh_e[1] = -1000000;
+    lh_e[2] = -1000000;
     uh_e[0] = 1000000;
 
     ocp_nlp_constraints_model_set_external_param_fun(nlp_config, nlp_dims, nlp_in, N, "nl_constr_h_fun_jac", &capsule->nl_constr_h_e_fun_jac);
@@ -855,7 +859,7 @@ static void mpcc_qcar2_acados_create_set_opts(mpcc_qcar2_solver_capsule* capsule
 
     // set up sim_method_num_steps
     // all sim_method_num_steps are identical
-    int sim_method_num_steps = 1;
+    int sim_method_num_steps = 3;
     for (int i = 0; i < N; i++)
         ocp_nlp_solver_opts_set_at_stage(nlp_config, nlp_opts, i, "dynamics_num_steps", &sim_method_num_steps);
 
@@ -878,12 +882,23 @@ static void mpcc_qcar2_acados_create_set_opts(mpcc_qcar2_solver_capsule* capsule
     for (int i = 0; i < N; i++)
         ocp_nlp_solver_opts_set_at_stage(nlp_config, nlp_opts, i, "dynamics_jac_reuse", &tmp_bool);
 
-    double levenberg_marquardt = 0.1;
+    double levenberg_marquardt = 0;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "levenberg_marquardt", &levenberg_marquardt);
 
     /* options QP solver */
+    int qp_solver_cond_N;const int qp_solver_cond_N_ori = 10;
+    qp_solver_cond_N = N < qp_solver_cond_N_ori ? N : qp_solver_cond_N_ori; // use the minimum value here
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_cond_N", &qp_solver_cond_N);
     double reg_epsilon = 0.0001;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "reg_epsilon", &reg_epsilon);
+    double reg_max_cond_block = 10000000;
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "reg_max_cond_block", &reg_max_cond_block);
+
+    double reg_min_epsilon = 0.00000001;
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "reg_min_epsilon", &reg_min_epsilon);
+
+    bool reg_adaptive_eps = false;
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "reg_adaptive_eps", &reg_adaptive_eps);
 
     int nlp_solver_ext_qp_res = 0;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "ext_qp_res", &nlp_solver_ext_qp_res);
@@ -898,24 +913,31 @@ static void mpcc_qcar2_acados_create_set_opts(mpcc_qcar2_solver_capsule* capsule
 
     double nlp_solver_tol_min_step_norm = 0;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "tol_min_step_norm", &nlp_solver_tol_min_step_norm);
+    // set HPIPM mode: should be done before setting other QP solver options
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_hpipm_mode", "BALANCE");
+
+
+
+    int qp_solver_t0_init = 2;
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_t0_init", &qp_solver_t0_init);
 
 
 
 
     // set SQP specific options
-    double nlp_solver_tol_stat = 0.001;
+    double nlp_solver_tol_stat = 0.01;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "tol_stat", &nlp_solver_tol_stat);
 
-    double nlp_solver_tol_eq = 0.0001;
+    double nlp_solver_tol_eq = 0.01;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "tol_eq", &nlp_solver_tol_eq);
 
-    double nlp_solver_tol_ineq = 0.0001;
+    double nlp_solver_tol_ineq = 0.01;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "tol_ineq", &nlp_solver_tol_ineq);
 
-    double nlp_solver_tol_comp = 0.001;
+    double nlp_solver_tol_comp = 0.01;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "tol_comp", &nlp_solver_tol_comp);
 
-    int nlp_solver_max_iter = 20;
+    int nlp_solver_max_iter = 15;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "max_iter", &nlp_solver_max_iter);
 
     // set options for adaptive Levenberg-Marquardt Update
@@ -978,13 +1000,29 @@ static void mpcc_qcar2_acados_create_set_opts(mpcc_qcar2_solver_capsule* capsule
     double anderson_activation_threshold = 10;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "anderson_activation_threshold", &anderson_activation_threshold);
 
-    int qp_solver_iter_max = 500;
+    int qp_solver_iter_max = 50;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_iter_max", &qp_solver_iter_max);
 
 
+    double qp_solver_tol_stat = 0.00001;
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_tol_stat", &qp_solver_tol_stat);
+    double qp_solver_tol_eq = 0.00001;
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_tol_eq", &qp_solver_tol_eq);
+    double qp_solver_tol_ineq = 0.00001;
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_tol_ineq", &qp_solver_tol_ineq);
+    double qp_solver_tol_comp = 0.00001;
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_tol_comp", &qp_solver_tol_comp);
+    int qp_solver_warm_start = 2;
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_warm_start", &qp_solver_warm_start);
 
     int print_level = 0;
     ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "print_level", &print_level);
+    int qp_solver_cond_ric_alg = 1;
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_cond_ric_alg", &qp_solver_cond_ric_alg);
+
+    int qp_solver_ric_alg = 1;
+    ocp_nlp_solver_opts_set(nlp_config, nlp_opts, "qp_ric_alg", &qp_solver_ric_alg);
+
 
     int ext_cost_num_hess = 0;
     for (int i = 0; i < N; i++)
@@ -1098,8 +1136,22 @@ int mpcc_qcar2_acados_create_with_discretization(mpcc_qcar2_solver_capsule* caps
  */
 int mpcc_qcar2_acados_update_qp_solver_cond_N(mpcc_qcar2_solver_capsule* capsule, int qp_solver_cond_N)
 {
-    printf("\nacados_update_qp_solver_cond_N() not implemented, since no partial condensing solver is used!\n\n");
-    exit(1);
+    // 1) destroy solver
+    ocp_nlp_solver_destroy(capsule->nlp_solver);
+
+    // 2) set new value for "qp_cond_N"
+    const int N = capsule->nlp_solver_plan->N;
+    if(qp_solver_cond_N > N)
+        printf("Warning: qp_solver_cond_N = %d > N = %d\n", qp_solver_cond_N, N);
+    ocp_nlp_solver_opts_set(capsule->nlp_config, capsule->nlp_opts, "qp_cond_N", &qp_solver_cond_N);
+
+    // 3) continue with the remaining steps from mpcc_qcar2_acados_create_with_discretization(...):
+    // -> 8) create solver
+    capsule->nlp_solver = ocp_nlp_solver_create(capsule->nlp_config, capsule->nlp_dims, capsule->nlp_opts, capsule->nlp_in);
+
+    // -> 9) do precomputations
+    int status = mpcc_qcar2_acados_create_precompute(capsule);
+    return status;
 }
 
 
@@ -1130,6 +1182,14 @@ int mpcc_qcar2_acados_reset(mpcc_qcar2_solver_capsule* capsule, int reset_qp_sol
             ocp_nlp_out_set(nlp_config, nlp_dims, nlp_out, nlp_in, i, "pi", buffer);
         }
     }
+    // get qp_status: if NaN -> reset memory
+    int qp_status;
+    ocp_nlp_get(capsule->nlp_solver, "qp_status", &qp_status);
+    if (reset_qp_solver_mem || (qp_status == 3))
+    {
+        // printf("\nin reset qp_status %d -> resetting QP memory\n", qp_status);
+        ocp_nlp_solver_reset_qp_memory(nlp_solver, nlp_in, nlp_out);
+    }
 
     free(buffer);
     return 0;
@@ -1142,7 +1202,7 @@ int mpcc_qcar2_acados_update_params(mpcc_qcar2_solver_capsule* capsule, int stag
 {
     int solver_status = 0;
 
-    int casadi_np = 20;
+    int casadi_np = 22;
     if (casadi_np != np) {
         printf("acados_update_params: trying to set %i parameters for external functions."
             " External function has %i parameters. Exiting.\n", np, casadi_np);
@@ -1281,7 +1341,7 @@ void mpcc_qcar2_acados_print_stats(mpcc_qcar2_solver_capsule* capsule)
         printf("stat_n_max = %d is too small, increase it in the template!\n", stat_n_max);
         exit(1);
     }
-    double stat[336];
+    double stat[256];
     ocp_nlp_get(capsule->nlp_solver, "statistics", stat);
 
     int nrow = nlp_iter+1 < stat_m ? nlp_iter+1 : stat_m;

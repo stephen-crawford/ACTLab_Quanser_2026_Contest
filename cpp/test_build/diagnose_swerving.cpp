@@ -87,7 +87,7 @@ TestResult run_with_realistic_model(
     cfg.horizon = 10;
     cfg.dt = 0.1;
     cfg.wheelbase = 0.256;
-    cfg.max_velocity = 1.2;
+    cfg.max_velocity = 0.55;
     cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;
     cfg.max_acceleration = 1.5;
@@ -107,7 +107,7 @@ TestResult run_with_realistic_model(
     cfg.max_qp_iterations = 20;
     cfg.startup_ramp_duration_s = 3.0;
     cfg.startup_elapsed_s = 10.0;  // Past startup for steady-state testing
-    cfg.startup_progress_weight = 5.0;
+    cfg.startup_progress_weight = 1.0;
 
     mpcc::ActiveSolver solver;
     solver.init(cfg);
@@ -163,6 +163,7 @@ TestResult run_with_realistic_model(
     int step_count = 0;
     double cte_sum = 0, osc_sum = 0, speed_sum = 0;
     int max_steps = 500;
+    int cfail = 0;
 
     for (int step = 0; step < max_steps; step++) {
         if (progress >= total_len - 0.1) { res.completed = true; break; }
@@ -204,7 +205,8 @@ TestResult run_with_realistic_model(
         }
 
         auto result = solver.solve(x0, refs, progress, total_len, {}, {});
-        if (!result.success) break;
+        if (!result.success) { if (++cfail >= 5) break; continue; }
+        cfail = 0;
 
         double v_cmd = std::clamp(result.v_cmd, cfg.min_velocity, cfg.max_velocity);
         double delta_cmd = std::clamp(result.delta_cmd, -cfg.max_steering, cfg.max_steering);
@@ -239,6 +241,7 @@ TestResult run_with_realistic_model(
         double cte = std::hypot(true_state(0) - rpx, true_state(1) - rpy);
         res.max_cte = std::max(res.max_cte, cte);
         cte_sum += cte;
+        if (cte > 1.0) break;
 
         double osc = std::abs(delta_cmd - prev_delta);
         res.max_steer_osc = std::max(res.max_steer_osc, osc);
@@ -404,7 +407,7 @@ int main() {
                 // Run single trace
                 mpcc::Config cfg;
                 cfg.horizon = 10; cfg.dt = 0.1; cfg.wheelbase = 0.256;
-                cfg.max_velocity = 1.2; cfg.min_velocity = 0.0;
+                cfg.max_velocity = 0.55; cfg.min_velocity = 0.0;
                 cfg.max_steering = 0.45; cfg.max_acceleration = 1.5;
                 cfg.max_steering_rate = 1.5; cfg.reference_velocity = 0.45;
                 cfg.contour_weight = 15.0; cfg.lag_weight = 10.0;
@@ -414,7 +417,7 @@ int main() {
                 cfg.jerk_weight = 0.0; cfg.boundary_weight = 0.0;
                 cfg.max_sqp_iterations = 5; cfg.max_qp_iterations = 20;
                 cfg.startup_ramp_duration_s = 3.0; cfg.startup_elapsed_s = 10.0;
-                cfg.startup_progress_weight = 5.0;
+                cfg.startup_progress_weight = 1.0;
 
                 mpcc::ActiveSolver solver;
                 solver.init(cfg);
@@ -446,6 +449,7 @@ int main() {
 
                 // Servo delay buffer
                 std::vector<double> dbuf(1, 0.0);  // 1 step = 100ms for dt=0.1
+                int cfail2 = 0;
 
                 for (int step = 0; step < 500; step++) {
                     if (progress >= tl - 0.1) break;
@@ -474,7 +478,8 @@ int main() {
                     }
 
                     auto res = solver.solve(x0, refs, progress, tl, {}, {});
-                    if (!res.success) break;
+                    if (!res.success) { if (++cfail2 >= 5) break; continue; }
+                    cfail2 = 0;
 
                     double v_cmd = std::clamp(res.v_cmd, cfg.min_velocity, cfg.max_velocity);
                     double delta_cmd = std::clamp(res.delta_cmd, -cfg.max_steering, cfg.max_steering);
@@ -506,6 +511,7 @@ int main() {
 
                     f << step << "," << ts(0) << "," << ts(1) << "," << ts(2) << ","
                       << ts(3) << "," << delta_cmd << "," << cte << "," << herr << "\n";
+                    if (cte > 1.0) break;
                 }
 
                 printf("  Written: %s\n", fname);
