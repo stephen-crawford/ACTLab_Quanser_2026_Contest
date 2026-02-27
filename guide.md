@@ -1,38 +1,28 @@
-# ACC Stage 1 Mission - Setup & Run Guide
+# ACC Mission - Setup & Run Guide (Current)
 
 ## Overview
 
-This package provides the mission manager for the Quanser ACC Virtual ROS Stage I contest. The mission navigates: **Hub → Pickup → Dropoff → Hub**.
+This repository runs the current C++ MPCC mission stack for the Quanser ACC virtual contest.  
+Mission sequence: **Hub -> Pickup -> Dropoff -> Hub**.
+
+Authoritative references:
+- `README.md` (active run/build commands)
+- `docs/DEBUG_BASELINE_LOCK.md` (locked debugging baseline)
 
 ---
 
 ## Quick Start (Recommended)
 
-### Option A: Using Helper Scripts
+### Option A: Current One-Command Flow (Recommended)
 
-**From Host (Ubuntu 24.04):**
+Run from repo root:
 ```bash
-cd /home/$USER/Documents/ACC_Development/Development/ros2/src/acc_stage1_mission/scripts
-
-# Setup containers (opens QLabs first)
-./run_stage1.sh
-
-# Or setup + run scenario automatically
-./run_stage1.sh --scenario
-```
-
-**Then in DEV container:**
-```bash
-cd /workspaces/isaac_ros-dev/ros2/src/acc_stage1_mission/scripts
-
-# Mission only (no obstacle detection)
-./run_stage1_dev.sh
-
-# With traffic system detector (CPU-based)
-./run_stage1_dev.sh --detect
-
-# With YOLO detector (requires GPU)
-./run_stage1_dev.sh --yolo
+./run_mission.sh
+./run_mission.sh --no-gpu
+./run_mission.sh --overlay
+./run_mission.sh --dashboard
+./run_mission.sh --stop
+./run_mission.sh --reset
 ```
 
 ### Option B: Manual Setup (Step-by-Step)
@@ -104,44 +94,25 @@ source install/setup.bash
 
 ---
 
-## Step 6: Launch SLAM & Navigation (DEV Container - Terminal 1)
+## Step 6: Launch SLAM + Hardware (DEV Container - Terminal 1)
 
 ```bash
-ros2 launch qcar2_nodes qcar2_slam_and_nav_bringup_virtual_launch.py
+ros2 launch qcar2_nodes qcar2_cartographer_virtual_launch.py
 ```
 
-Wait ~20-30 seconds for Nav2 to fully initialize.
+Wait ~20-30 seconds for SLAM and sensors to initialize.
 
 ---
 
-## Step 7: Launch Mission (DEV Container - Terminal 2)
+## Step 7: Launch MPCC Mission (DEV Container - Terminal 2)
 
-**Basic launch:**
 ```bash
-ros2 launch acc_stage1_mission mission_launch.py
+ros2 launch acc_stage1_mission mpcc_mission_launch.py
 ```
 
-**With parameters:**
-```bash
-ros2 launch acc_stage1_mission mission_launch.py \
-    goal_timeout_s:=180.0 \
-    max_retries_per_leg:=5 \
-    enable_obstacle_detection:=true
-```
+## Step 8: Optional Visualization (Host/DEV)
 
----
-
-## Step 8: Launch Detector (DEV Container - Terminal 3, Optional)
-
-**YOLO detector (GPU required):**
-```bash
-ros2 run qcar2_autonomy yolo_detector
-```
-
-**Traffic system detector (CPU-based):**
-```bash
-ros2 run qcar2_autonomy traffic_system_detector
-```
+Use `./run_mission.sh --overlay` or `./run_mission.sh --dashboard` for additional diagnostics.
 
 ---
 
@@ -170,26 +141,21 @@ hub:
 
 ### Finding Coordinates
 
-1. Launch Nav2
+1. Launch SLAM + mission stack
 2. Run pose logger: `ros2 run acc_stage1_mission pose_logger`
 3. Use RViz2 "2D Goal Pose" to drive QCar2 to each location
 4. Copy the logged coordinates to `mission.yaml`
 
-### Launch Parameters
+### Mission Parameters
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `config_file` | mission.yaml | Path to mission config |
-| `use_tf_hub` | true | Capture hub position from TF at startup |
-| `hub_tf_timeout_s` | 15.0 | TF lookup timeout |
-| `goal_timeout_s` | 120.0 | Navigation goal timeout |
-| `max_retries_per_leg` | 3 | Retries before recovery strategy |
-| `goal_tol_m` | 0.35 | Goal tolerance in meters |
-| `enable_obstacle_detection` | true | Subscribe to /motion_enable |
-| `obstacle_pause_timeout_s` | 30.0 | Max pause time for obstacles |
-| `enable_led` | true | Control QCar2 LEDs from mission state |
-| `backup_distance_m` | 0.15 | Recovery backup distance |
-| `backup_speed` | 0.1 | Recovery backup speed (m/s) |
+Primary MPCC runtime parameters are loaded from `config/presets/default.yaml` via `run_mission.sh`.
+
+Current baseline (deployment-tuned):
+- `reference_velocity: 0.45`
+- `contour_weight: 8.0`
+- `lag_weight: 15.0`
+- `horizon: 10`
+- `boundary_weight: 0.0`
 
 ---
 
@@ -207,16 +173,19 @@ ros2 node list
 ros2 topic list -t
 ```
 
-### Monitor Mission State
+### Monitor MPCC / Mission State
 ```bash
-# Mission status
-ros2 topic echo /mission_state
+# MPCC status
+ros2 topic echo /mpcc/status
 
-# Navigation feedback
-ros2 topic echo /navigate_to_pose/_action/feedback
+# Traffic/sign decisions
+ros2 topic echo /traffic_control_state
 
 # Obstacle detection
 ros2 topic echo /motion_enable
+
+# Planned path
+ros2 topic echo /plan
 ```
 
 ### Pose Logging
@@ -226,22 +195,16 @@ ros2 run acc_stage1_mission pose_logger
 
 ---
 
-## File Structure
+## File Structure (Current)
 
 ```
-acc_stage1_mission/
-├── acc_stage1_mission/
-│   ├── mission_manager.py     # Main mission state machine
-│   └── pose_logger.py         # Utility for finding coordinates
-├── config/
-│   └── mission.yaml           # Waypoint configuration
-├── launch/
-│   ├── mission_launch.py      # Standard launch file
-│   └── mission_with_detection_launch.py  # Launch with detector
-├── scripts/
-│   ├── run_stage1.sh          # Host orchestration script
-│   └── run_stage1_dev.sh      # DEV container script
-└── guide.md                   # This file
+quanser-acc/
+├── cpp/                       # C++ controller/mission nodes
+├── config/presets/            # MPCC preset parameters
+├── launch/mpcc_mission_launch.py
+├── run_mission.sh             # Primary launch/stop/reset entrypoint
+├── README.md                  # Main project documentation
+└── docs/DEBUG_BASELINE_LOCK.md
 ```
 
 ---
@@ -249,18 +212,13 @@ acc_stage1_mission/
 ## Troubleshooting
 
 ### "No transform from base_link to map"
-- Wait for SLAM/Nav2 to fully initialize (~25s)
-- Check that Cartographer is publishing TF
+- Wait for Cartographer to initialize (~25s)
+- Check TF tree and odometry bridge nodes
 
-### Navigation goals timeout
-- Increase `goal_timeout_s`
-- Check costmap for obstacles blocking path
-- Verify waypoint coordinates are reachable
-
-### Mission stuck at pickup/dropoff
-- Check `dwell_s` setting in mission.yaml
-- Verify goal tolerance vs Nav2 settings
+### Oscillation / oversteer
+- Use the triage order in `docs/DEBUG_BASELINE_LOCK.md`
+- Verify active params from preset and launch logs before retuning
 
 ### Detector not working
-- YOLO requires GPU - use traffic_system_detector on CPU
+- YOLO bridge requires GPU availability
 - Check camera topic: `ros2 topic echo /camera/color_image --once`

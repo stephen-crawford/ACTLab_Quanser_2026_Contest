@@ -1,0 +1,11 @@
+---
+description: Always use locked Quanser debug baseline
+alwaysApply: true
+---
+
+# Quanser Debug Baseline Lock
+
+- For debugging this repo, treat `docs/DEBUG_BASELINE_LOCK.md` as authoritative context.
+- Prefer its verified facts over stale references in other markdown files when conflicts appear.
+- Do not propose model-equation changes until baseline triage order in that file is exhausted.
+- If new evidence conflicts with the baseline, create a candidate-update note first; do not overwrite baseline claims directly.
