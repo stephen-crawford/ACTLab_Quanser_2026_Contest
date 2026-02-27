@@ -6,23 +6,17 @@ The vehicle operates as a taxi: **Hub &rarr; Pickup &rarr; Dropoff &rarr; Hub**,
 
 ## Why a Modular Stack
 
-The 2025 reference implementation (PolyCtrl) was a monolithic Python system: a single MPC node made all decisions, a single YOLO detector handled all perception, and D\* handled all routing. It worked, but every component was tightly coupled and difficult to test, tune, or swap independently.
+The code features a modular design with interchangeable components to allow for testing and changes based on the scenario. Each subsystem: detection, path planning, control, state estimation, and obstacle tracking, can be swapped across a variety of options via YAML configuration. Using this design, a variety of tests were run to determine the best complete stack. 
 
-We rebuilt the stack around **pluggable backends** for each subsystem — detection, path planning, control, state estimation, and obstacle tracking. Each backend conforms to a common interface so they can be compared head-to-head and swapped at runtime through a single YAML file. This let us:
 
-1. **Benchmark alternatives quantitatively** before choosing defaults (see [Comparison Tests](#comparison-tests))
-2. **Port hot paths to C++** while keeping Python fallbacks available for rapid prototyping
-3. **Isolate failures** — a detection bug doesn't require touching the controller; a controller change doesn't break path planning
-4. **Tune confidently** — preset configurations let us A/B test the 2025 reference weights against our tuned weights on the same architecture
-
-The result is a C++ real-time stack (7 nodes, ~50 Hz control loop) backed by a Python fallback stack that shares the same interfaces, configuration, and mission logic.
+The result is a C++ real-time stack (7 nodes; controller runs at `dt=0.1s` / 10 Hz) which shares interfaces, configuration, and mission logic.
 
 ## Architecture
 
 ```
 Camera ─────► sign_detector (C++ HSV)  ──► /motion_enable
               or                            /traffic_control_state
-              obstacle_detector (Python)
+              
 
 Lidar ──────► obstacle_tracker (C++ Kalman) ──► /obstacle_positions
 
@@ -41,14 +35,14 @@ Road Graph ─► mission_manager (C++) ──► /plan (Path)
                                     qcar2_hardware (HIL driver)
 ```
 
-All 7 C++ nodes launch from a single `ros2 launch` command. The Python fallback nodes exist for development and debugging but are not used in competition runs.
+All 7 C++ nodes launch from a single `ros2 launch` command. 
 
 ### Packages
 
 | Package | Language | Role |
 |---------|----------|------|
 | `acc_mpcc_controller_cpp` | C++ | Primary stack: MPCC controller, mission manager, sign detector, state estimator, obstacle tracker, traffic light mapper, odom bridge |
-| `acc_stage1_mission` | Python | Fallback stack + shared config, launch files, interfaces, YOLO bridge, dashboard |
+| `acc_stage1_mission` | Python | Interfaces, YOLO bridge, dashboard |
 | `qcar2_nodes` | C++ | Hardware interface (motors, cameras, lidar, LEDs) |
 | `qcar2_interfaces` | C++ | Custom ROS 2 messages (`MotorCommands`, `BooleanLeds`) |
 
@@ -85,15 +79,11 @@ Preset YAML files in `config/presets/` bundle MPCC tuning parameters for quick c
 
 | Preset | `reference_velocity` | `contour_weight` | `lag_weight` | `horizon` | Notes |
 |--------|---------------------|-------------------|--------------|-----------|-------|
-| `default` | 0.50 m/s | 25.0 | 5.0 | 20 | Current tuning — prioritizes lane keeping |
-| `legacy_2025` | 0.70 m/s | 1.8 | 7.0 | 10 | PolyCtrl 2025 reference weights |
+| `default` | 0.45 m/s | 8.0 | 15.0 | 10 | Deployment-tuned baseline (Feb 2026) |
 
 ```bash
 ./run_mission.sh           # Uses default preset
-./run_mission.sh --2025    # Uses legacy_2025 preset for comparison
 ```
-
-**Why the weights changed:** Root cause analysis of the 2025 runs showed that `contour_weight (1.8) < lag_weight (7.0)` caused the optimizer to prioritize longitudinal progress over lateral accuracy. On tight curves, the vehicle cut corners and accumulated lane departure infractions. Inverting the ratio to `contour=25, lag=5` and reducing speed from 0.70 to 0.50 m/s eliminated lane violations while maintaining mission completion times within the competition window.
 
 ## Comparison Tests
 
@@ -114,7 +104,7 @@ Generates 24 synthetic QLabs-like test images (5 object classes x 3 distances + 
 
 Per-class breakdown shows HSV excels at stop signs (F1=0.53) and cones (F1=0.67) — the two classes most critical for infraction avoidance. Traffic lights are handled by the state machine's temporal persistence rather than single-frame accuracy.
 
-**Why HSV is the C++ default:** At 1.6 ms per frame it runs at >600 Hz, leaving the CPU budget entirely for the MPCC solver. It requires zero ML dependencies, making the stack self-contained. When a GPU is available, the YOLO bridge relays custom-model detections for pedestrians and edge cases that HSV cannot handle, but it never overrides the HSV node's traffic control decisions.
+**Why HSV is the default:** At 1.6 ms per frame it runs at >600 Hz, leaving the CPU budget entirely for the MPCC solver. It requires zero ML dependencies, making the stack self-contained. When a GPU is available, the YOLO bridge relays custom-model detections for pedestrians and edge cases that HSV cannot handle, but it never overrides the HSV node's traffic control decisions.
 
 **Output figures** (in `scripts/detection_results/`):
 1. Detection grid — ground truth vs. predictions across scenes and detectors
@@ -176,18 +166,18 @@ Training pipeline: `training/capture_data.py` collects annotated frames, `traini
 
 Model Predictive Contouring Control (MPCC) formulates path following as a constrained optimization: minimize lateral deviation from the reference path (contouring error) while maximizing progress along it (lag), subject to kinematic constraints and road boundaries.
 
+## Obstacle avoidance
+
+Linearized halfspace constraints are used for real-time obstacle avoidance behavior. This is applied to all stationary obstacles in the road allowing for evasive replanning into the left lane, as well as pedestrians who are not in crosswalks. Pedestrians in crosswalks are treated as stop signs until they clear the road.
+
 ### C++ SQP Implementation (Default)
 
 The primary controller (`cpp/mpcc_controller_node.cpp`) uses an Eigen-based Sequential Quadratic Programming solver with gradient projection for boundary constraints. Key design choices:
 
 - **Direct motor commands**: Publishes `MotorCommands` (steering angle + throttle) directly to `qcar2_hardware`, bypassing the Nav2 velocity converter for lower latency
-- **Curvature-adaptive speed**: `v_ref = reference_velocity * exp(-1.2 * |curvature|)` — slows into turns, accelerates on straights
+- **Curvature-adaptive speed**: `v_ref = reference_velocity * exp(-0.4 * |curvature|)` — slows into turns, accelerates on straights
 - **Encoder feedback**: Reads `/qcar2_joint` wheel encoder velocity for closed-loop speed estimation
 - **Road boundary soft constraints**: Loaded from `config/road_boundaries.yaml`, penalized in the cost function rather than hard-constrained (avoids infeasibility on noisy localization)
-
-### Python CasADi Fallback
-
-The fallback controller (`acc_stage1_mission/mpcc_controller.py`) uses CasADi's Opti framework with a fresh NLP formulation per solve. Functionally identical cost function and constraints, but ~10x slower per solve due to the CasADi overhead. Useful for prototyping new cost terms before porting to C++.
 
 ## Running
 
@@ -195,14 +185,13 @@ The fallback controller (`acc_stage1_mission/mpcc_controller.py`) uses CasADi's 
 # Recommended: automated multi-terminal launch
 ./run_mission.sh             # Full C++ stack (auto-detects GPU for YOLO)
 ./run_mission.sh --no-gpu    # C++ HSV detection only
-./run_mission.sh --2025      # Compare with 2025 reference weights
 ./run_mission.sh --dashboard # Enable real-time telemetry plots
 ./run_mission.sh --stop      # Stop all nodes (preserves QLabs window)
 ./run_mission.sh --reset     # Sync code + rebuild + reset car position
 ./run_mission.sh --logs      # Show latest session logs
 
 # Manual launch (inside Isaac ROS container):
-ros2 launch qcar2_nodes virtual_sim.launch.py        # Terminal 1: hardware + SLAM
+ros2 launch qcar2_nodes qcar2_cartographer_virtual_launch.py # Terminal 1: hardware + SLAM
 ros2 launch acc_stage1_mission mpcc_mission_launch.py # Terminal 2: MPCC + mission
 python3 Setup_Real_Scenario_Interleaved.py            # Terminal 3: QLabs scenario
 ```
@@ -250,17 +239,13 @@ quanser-acc/
 │   ├── road_boundaries.{h,cpp}   #   Spline boundary loader
 │   └── CMakeLists.txt
 ├── acc_stage1_mission/           # Python package
-│   ├── mission_manager.py        #   Python mission manager (fallback)
-│   ├── mpcc_controller.py        #   Python MPCC controller (fallback)
-│   ├── obstacle_detector.py      #   Modular detection backends
 │   ├── yolo_bridge.py            #   GPU YOLO <-> ROS2 relay
 │   ├── detection_interface.py    #   Detection backend abstraction
 │   ├── planner_interface.py      #   Path planning backend abstraction
 │   ├── module_config.py          #   YAML config loader + validation
 │   ├── pedestrian_tracker.py     #   Kalman pedestrian tracker
 │   ├── road_graph.py             #   Python road graph (fallback)
-│   ├── dashboard.py              #   Real-time telemetry plots
-│   └── pympc_core/               #   CasADi MPCC solver
+│   ├── dashboard.py              #   Real-time telemetry plot
 ├── config/
 │   ├── modules.yaml              #   Backend selection (benchmarked defaults)
 │   ├── mission.yaml              #   Waypoints + coordinate transforms
@@ -288,8 +273,8 @@ quanser-acc/
 
 | Infraction | Stars | Our Mitigation |
 |-----------|-------|----------------|
-| Lane departure (minor) | -1 | `contour_weight=25` >> `lag_weight=5`; curvature-adaptive speed |
-| Lane departure (major) | -2 to -5 | Road boundary soft constraints (`boundary_weight=30`); `max_velocity=0.60` |
+| Lane departure (minor) | -1 | Progress-first MPCC tuning (`lag_weight > contour_weight`) + curvature-adaptive speed |
+| Lane departure (major) | -2 to -5 | Reference-matched dynamics/timing (`dt=0.1`, 10 Hz loop) + boundary-aware cost (`boundary_weight=0` baseline) |
 | Incomplete stop at stop sign | -2 | 3-second timed stop; spatial per-sign cooldown prevents double-stopping |
 | Running red light | -2 | Traffic light state machine with 8s timeout + post-action suppression |
 | Cone collision | -2 | Lidar-fused obstacle tracker; MPCC path avoidance |
@@ -316,3 +301,9 @@ ros2 topic echo /obstacle_positions
 ```
 
 If the vehicle oscillates, reduce `reference_velocity` and increase `steering_rate_weight`. If it cuts corners, increase `contour_weight` relative to `lag_weight`.
+
+For authoritative debugging context and verified baseline values, use `docs/DEBUG_BASELINE_LOCK.md`.
+
+## Acknowledgements
+
+This code was created with help from the PolyCtrl team submission from 2025 (collaborators with Brown). Further, code from https://github.com/stephen-crawford/PyMPC and github.com/tud-amr/mpc_planner was used as a reference throughout. All rights to the original code belong to the original authors, as appropriate.
