@@ -541,7 +541,13 @@ private:
             // Same path re-published — keep warm-start and preserve monotonic progress.
             // On self-near paths, nearest-point can jump backward across close-by segments;
             // allowing regressions here causes route thrash and steering saturation.
-            double p = ref_path_.find_closest_progress(state_x_, state_y_);
+            double p = 0.0;
+            if (spline_path_ && spline_path_->is_built()) {
+                double s_min = std::max(0.0, current_progress_ - 0.25);
+                p = spline_path_->find_closest_progress_from(state_x_, state_y_, s_min);
+            } else {
+                p = ref_path_.find_closest_progress(state_x_, state_y_);
+            }
             if (p > current_progress_) current_progress_ = p;
         }
     }
@@ -994,7 +1000,9 @@ private:
         double new_progress;
         double path_total_len;
         if (spline_path_ && spline_path_->is_built()) {
-            new_progress = spline_path_->find_closest_progress(state_x_, state_y_);
+            // Constrained forward search avoids branch-jumps on self-near routes.
+            double s_min = std::max(0.0, current_progress_ - 0.25);
+            new_progress = spline_path_->find_closest_progress_from(state_x_, state_y_, s_min);
             path_total_len = spline_path_->total_length();
         } else {
             new_progress = ref_path_.find_closest_progress(state_x_, state_y_);
@@ -1433,6 +1441,16 @@ private:
             solver_failure_count_ = 0;  // reset after requesting
         }
 
+        // Trigger 3: sustained no-progress while steering is saturated.
+        // This indicates the current local path segment is not recoverable with
+        // the current warm-start and should be re-anchored from current pose.
+        if (!should_request &&
+            stuck_timer_ > REPLAN_NO_PROGRESS_DURATION_S &&
+            steering_saturated_count_ > REPLAN_SATURATION_COUNT_THRESHOLD) {
+            should_request = true;
+            reason = "no_progress_steering_saturated";
+        }
+
         if (should_request) {
             char buf[512];
             std::snprintf(buf, sizeof(buf),
@@ -1561,6 +1579,8 @@ private:
     static constexpr double REPLAN_MAX_SPEED_FOR_CTE = 0.25;       // m/s
     static constexpr double REPLAN_MIN_STUCK_TIME_FOR_CTE = 2.0;   // s
     static constexpr bool REPLAN_ENABLE_CTE = false;               // avoid route-thrash from CTE-triggered replans
+    static constexpr double REPLAN_NO_PROGRESS_DURATION_S = 5.0;
+    static constexpr int REPLAN_SATURATION_COUNT_THRESHOLD = 30;
     static constexpr double RESUME_STABILIZE_S = 1.5;              // seconds
     static constexpr double RESUME_MAX_SPEED = 0.28;               // m/s
     static constexpr double RESUME_MAX_STEERING = 0.24;            // rad (~14 deg)

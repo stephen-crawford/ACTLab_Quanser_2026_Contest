@@ -1388,7 +1388,7 @@ private:
 
         case MissionState::GO_LEG: {
             // Obstacle pause
-            if (enable_obstacle_ && !motion_enabled_) {
+            if (enable_obstacle_ && !mpcc_mode_ && !motion_enabled_) {
                 bool has_path = !mpcc_mode_ || current_path_.has_value();
                 if (has_path) {
                     pause_for_obstacle();
