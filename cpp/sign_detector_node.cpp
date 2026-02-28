@@ -92,7 +92,7 @@ struct DetectorConfig {
     double stop_sign_pause = 3.0;
     double stop_sign_cooldown = 5.0;
     double traffic_light_cooldown = 6.0;
-    double cross_waiting_timeout = 8.0;   // Max wait at red light (short to prevent deadlock)
+    double cross_waiting_timeout = 5.0;   // Max wait at red light (short to prevent deadlock)
 
     // Detection persistence
     int detection_threshold = 2;     // Consecutive frames to trigger
@@ -112,6 +112,11 @@ struct DetectorConfig {
     // Require the sign to be reasonably centered in the image and not too high.
     double stop_sign_center_tolerance = 0.35;  // normalized x offset from center
     double stop_sign_min_y_fraction = 0.30;    // bbox center y / image height
+
+    // Traffic-light geometric gating.
+    // Lights are typically in the upper/middle image and near lane centerline.
+    double traffic_light_center_tolerance = 0.45;
+    double traffic_light_max_y_fraction = 0.75;
 };
 
 // ============================================================================
@@ -664,16 +669,28 @@ private:
         }
 
         // --- Traffic light logic ---
+        auto traffic_light_geom_ok = [&](const Detection& det) {
+            int cx = det.bbox.x + det.bbox.width / 2;
+            int cy = det.bbox.y + det.bbox.height / 2;
+            double half_w = std::max(1.0, image_width_ * 0.5);
+            double x_offset_norm = std::abs(cx - image_width_ * 0.5) / half_w;
+            double y_frac = static_cast<double>(cy) / std::max(1, image_height_);
+            return x_offset_norm <= cfg_.traffic_light_center_tolerance &&
+                   y_frac <= cfg_.traffic_light_max_y_fraction;
+        };
+
         // Startup gate: ignore red lights for the first N seconds (reference: self.jaman)
         // The vehicle starts at hub and needs to drive before encountering real traffic lights
         double time_since_start = now - node_start_time_;
         if (best_red.type == SignType::TRAFFIC_LIGHT_RED && !any_stop_trigger &&
+            traffic_light_geom_ok(best_red) &&
             time_since_start <= RED_LIGHT_STARTUP_DELAY_S) {
             // Startup gate: ignore red light during startup period
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                 "Ignoring red light during startup gate (%.0f/%.0fs)",
                 time_since_start, RED_LIGHT_STARTUP_DELAY_S);
         } else if (best_red.type == SignType::TRAFFIC_LIGHT_RED && !any_stop_trigger &&
+            traffic_light_geom_ok(best_red) &&
             time_since_start > RED_LIGHT_STARTUP_DELAY_S) {
             red_detect_frames_++;
             green_detect_frames_ = 0;
@@ -704,7 +721,8 @@ private:
                     return;
                 }
             }
-        } else if (best_green.type == SignType::TRAFFIC_LIGHT_GREEN && !any_stop_trigger) {
+        } else if (best_green.type == SignType::TRAFFIC_LIGHT_GREEN && !any_stop_trigger &&
+                   traffic_light_geom_ok(best_green)) {
             green_detect_frames_++;
             red_detect_frames_ = 0;
 

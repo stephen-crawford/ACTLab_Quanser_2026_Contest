@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <queue>
 #include <string>
@@ -115,7 +116,8 @@ public:
     /// Returns (x[], y[]) in QLabs frame, or nullopt.
     std::optional<std::pair<std::vector<double>, std::vector<double>>>
     plan_path_for_mission_leg(const std::string& route_name,
-                              double cur_x, double cur_y) const;
+                              double cur_x, double cur_y,
+                              double cur_yaw = std::numeric_limits<double>::quiet_NaN()) const;
 
     /// Find the best pre-computed route from start to goal (QLabs coords).
     /// Returns (x[], y[]) or nullopt.

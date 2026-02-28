@@ -50,6 +50,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -507,7 +508,11 @@ private:
             solver_failure_count_ = 0;
             steering_saturated_count_ = 0;
             sustained_cross_track_start_ = 0.0;
+            sustained_lane_violation_start_ = 0.0;
             replan_requested_ = false;
+            current_goal_distance_m_ = std::numeric_limits<double>::infinity();
+            best_goal_distance_m_ = std::numeric_limits<double>::infinity();
+            goal_distance_stall_timer_ = 0.0;
 
             // Build cubic spline path too (for smooth curvature)
             try {
@@ -1037,14 +1042,20 @@ private:
                     "No progress for %.1fs (progress=%.1f%%, closest=%.1f%%)",
                     stuck_timer_, current_progress_ / path_total_len * 100.0,
                     new_progress / path_total_len * 100.0);
-                // Only reset solver warm-start, NOT progress
-                solver_.reset();
-                stuck_timer_ = 0.0;
             }
         }
 
         // Check goal reached
         double remaining = path_total_len - current_progress_;
+        double goal_dx = ref_path_.x.empty() ? 0.0 : (ref_path_.x.back() - state_x_);
+        double goal_dy = ref_path_.y.empty() ? 0.0 : (ref_path_.y.back() - state_y_);
+        current_goal_distance_m_ = std::hypot(goal_dx, goal_dy);
+        if (current_goal_distance_m_ + GOAL_DISTANCE_IMPROVE_EPS < best_goal_distance_m_) {
+            best_goal_distance_m_ = current_goal_distance_m_;
+            goal_distance_stall_timer_ = 0.0;
+        } else {
+            goal_distance_stall_timer_ += config_.dt;
+        }
         if (remaining < 0.15) {
             publish_stop();
             publish_status("Goal reached");
@@ -1441,7 +1452,19 @@ private:
             solver_failure_count_ = 0;  // reset after requesting
         }
 
-        // Trigger 3: sustained no-progress while steering is saturated.
+        // Trigger 3: lane-edge excursion (CTE relative to right-lane centerline).
+        if (!should_request && ct_abs > REPLAN_LANE_EDGE_CTE) {
+            if (sustained_lane_violation_start_ <= 0.0) {
+                sustained_lane_violation_start_ = now_s;
+            } else if ((now_s - sustained_lane_violation_start_) > REPLAN_LANE_EDGE_DURATION_S) {
+                should_request = true;
+                reason = "lane_edge_violation";
+            }
+        } else {
+            sustained_lane_violation_start_ = 0.0;
+        }
+
+        // Trigger 4: sustained no-progress while steering is saturated.
         // This indicates the current local path segment is not recoverable with
         // the current warm-start and should be re-anchored from current pose.
         if (!should_request &&
@@ -1451,9 +1474,21 @@ private:
             reason = "no_progress_steering_saturated";
         }
 
+        // Trigger 5: hard no-progress timeout.
         if (!should_request && stuck_timer_ > REPLAN_HARD_NO_PROGRESS_DURATION_S) {
             should_request = true;
             reason = "no_progress_timeout";
+        }
+
+        // Trigger 6: progress/goal inconsistency.
+        // If progress keeps increasing while goal distance does not improve, we are
+        // likely tracking the wrong branch of a self-near route.
+        if (!should_request &&
+            progress_pct > REPLAN_GOAL_STALL_MIN_PROGRESS_PCT &&
+            current_goal_distance_m_ > REPLAN_GOAL_STALL_MIN_GOAL_DIST_M &&
+            goal_distance_stall_timer_ > REPLAN_GOAL_STALL_DURATION_S) {
+            should_request = true;
+            reason = "goal_distance_stall";
         }
 
         if (should_request) {
@@ -1584,9 +1619,15 @@ private:
     static constexpr double REPLAN_MAX_SPEED_FOR_CTE = 0.25;       // m/s
     static constexpr double REPLAN_MIN_STUCK_TIME_FOR_CTE = 2.0;   // s
     static constexpr bool REPLAN_ENABLE_CTE = false;               // avoid route-thrash from CTE-triggered replans
+    static constexpr double REPLAN_LANE_EDGE_CTE = 0.12;
+    static constexpr double REPLAN_LANE_EDGE_DURATION_S = 1.0;
     static constexpr double REPLAN_NO_PROGRESS_DURATION_S = 5.0;
     static constexpr double REPLAN_HARD_NO_PROGRESS_DURATION_S = 8.0;
     static constexpr int REPLAN_SATURATION_COUNT_THRESHOLD = 30;
+    static constexpr double REPLAN_GOAL_STALL_MIN_PROGRESS_PCT = 60.0;
+    static constexpr double REPLAN_GOAL_STALL_MIN_GOAL_DIST_M = 1.2;
+    static constexpr double REPLAN_GOAL_STALL_DURATION_S = 4.0;
+    static constexpr double GOAL_DISTANCE_IMPROVE_EPS = 0.03;
     static constexpr double RESUME_STABILIZE_S = 1.5;              // seconds
     static constexpr double RESUME_MAX_SPEED = 0.28;               // m/s
     static constexpr double RESUME_MAX_STEERING = 0.24;            // rad (~14 deg)
@@ -1595,6 +1636,10 @@ private:
     std::string traffic_state_json_;
     double current_progress_ = 0.0;
     double stuck_timer_ = 0.0;
+    double sustained_lane_violation_start_ = 0.0;
+    double current_goal_distance_m_ = std::numeric_limits<double>::infinity();
+    double best_goal_distance_m_ = std::numeric_limits<double>::infinity();
+    double goal_distance_stall_timer_ = 0.0;
     ReferencePath ref_path_;
     std::vector<mpcc::Obstacle> detected_obstacles_;
 

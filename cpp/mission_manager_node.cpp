@@ -49,6 +49,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -832,12 +833,13 @@ private:
 
         // Get current position in QLabs frame
         double cur_qx = tp_.origin_x, cur_qy = tp_.origin_y;
+        double cur_qyaw = std::numeric_limits<double>::quiet_NaN();
         auto pose = get_current_pose();
         if (pose) {
-            acc::map_to_qlabs_2d((*pose)[0], (*pose)[1], tp_, cur_qx, cur_qy);
+            acc::map_to_qlabs((*pose)[0], (*pose)[1], (*pose)[2], tp_, cur_qx, cur_qy, cur_qyaw);
         }
 
-        auto path = road_graph_->plan_path_for_mission_leg(leg.route_name, cur_qx, cur_qy);
+        auto path = road_graph_->plan_path_for_mission_leg(leg.route_name, cur_qx, cur_qy, cur_qyaw);
         if (!path || path->first.size() < 2) {
             RCLCPP_WARN(this->get_logger(), "Road graph returned no path for %s", leg.label.c_str());
             if (mpcc_mode_) {

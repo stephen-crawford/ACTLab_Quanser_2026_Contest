@@ -611,6 +611,81 @@ int RoadGraph::find_closest_idx(const std::vector<double>& wx,
     return idx;
 }
 
+static int find_closest_idx_directional(const std::vector<double>& wx,
+                                        const std::vector<double>& wy,
+                                        double px, double py,
+                                        double pyaw)
+{
+    auto nearest_idx_fn = [&](double& nearest_dist_out) {
+        double best = 1e18;
+        int idx = 0;
+        for (size_t i = 0; i < wx.size(); ++i) {
+            double dx = wx[i] - px;
+            double dy = wy[i] - py;
+            double d2 = dx * dx + dy * dy;
+            if (d2 < best) { best = d2; idx = static_cast<int>(i); }
+        }
+        nearest_dist_out = std::sqrt(best);
+        return idx;
+    };
+
+    int n = static_cast<int>(wx.size());
+    if (n < 3 || !std::isfinite(pyaw)) {
+        double nearest_dist_unused = 0.0;
+        return nearest_idx_fn(nearest_dist_unused);
+    }
+
+    double nearest_dist = 0.0;
+    int nearest_idx = nearest_idx_fn(nearest_dist);
+    double hx = std::cos(pyaw);
+    double hy = std::sin(pyaw);
+
+    double best_score = 1e18;
+    int best_idx = nearest_idx;
+
+    for (int i = 1; i < n - 1; ++i) {
+        double dx = wx[i] - px;
+        double dy = wy[i] - py;
+        double dist = std::hypot(dx, dy);
+
+        // Keep candidates local to current position to avoid long jumps.
+        if (dist > nearest_dist + 0.60) continue;
+
+        double tx = wx[i + 1] - wx[i - 1];
+        double ty = wy[i + 1] - wy[i - 1];
+        double tnorm = std::hypot(tx, ty);
+        if (tnorm < 1e-6) continue;
+        tx /= tnorm;
+        ty /= tnorm;
+
+        // Prefer tangent aligned with current vehicle heading.
+        double heading_align = tx * hx + ty * hy;  // [-1, 1]
+
+        // Also prefer direction that points toward route end.
+        double gx = wx.back() - wx[i];
+        double gy = wy.back() - wy[i];
+        double gnorm = std::hypot(gx, gy);
+        double goal_align = 1.0;
+        if (gnorm > 1e-6) {
+            gx /= gnorm;
+            gy /= gnorm;
+            goal_align = tx * gx + ty * gy;  // [-1, 1]
+        }
+
+        double reverse_penalty = (goal_align < -0.1) ? 10.0 : 0.0;
+        double score = dist * dist
+                     + 0.25 * (1.0 - heading_align)
+                     + 0.35 * (1.0 - goal_align)
+                     + reverse_penalty;
+        if (score < best_score) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    return best_idx;
+}
+
 int RoadGraph::find_first_local_min(const std::vector<double>& wx,
                                     const std::vector<double>& wy,
                                     double px, double py,
@@ -758,13 +833,14 @@ std::string RoadGraph::get_route_for_leg(const std::string& start_label,
 
 std::optional<std::pair<std::vector<double>, std::vector<double>>>
 RoadGraph::plan_path_for_mission_leg(const std::string& route_name,
-                                     double cur_x, double cur_y) const
+                                     double cur_x, double cur_y,
+                                     double cur_yaw) const
 {
     auto it = routes_.find(route_name);
     if (it == routes_.end()) return std::nullopt;
 
     const auto& route = it->second;
-    int start_idx = find_closest_idx(route.x, route.y, cur_x, cur_y);
+    int start_idx = find_closest_idx_directional(route.x, route.y, cur_x, cur_y, cur_yaw);
 
     int n = static_cast<int>(route.x.size());
     int segment_start = start_idx;
