@@ -24,12 +24,14 @@ QUICK=false
 VERBOSE=false
 DIAGNOSTICS=false
 REALISTIC=false
+TIMEOUT_SEC=180
 for arg in "$@"; do
     case "$arg" in
         --quick)       QUICK=true ;;
         --verbose)     VERBOSE=true ;;
         --diagnostics) DIAGNOSTICS=true ;;
         --realistic)   REALISTIC=true ;;
+        --timeout=*)   TIMEOUT_SEC="${arg#*=}" ;;
     esac
 done
 
@@ -88,6 +90,14 @@ build_and_run() {
     local name="$1"
     shift
     local srcs="$@"
+    local timeout_s="$TIMEOUT_SEC"
+
+    # Heavy tests can legitimately run longer.
+    case "$name" in
+        test_deployment|test_full_mission_sim|test_mapframe_startup)
+            timeout_s=$((TIMEOUT_SEC + 120))
+            ;;
+    esac
 
     printf "%-35s " "$name"
 
@@ -101,11 +111,27 @@ build_and_run() {
         return 1
     fi
 
-    # Run
-    if env LD_LIBRARY_PATH=$ACADOS_DIR/lib:${LD_LIBRARY_PATH:-} ./"$name" > "$OUTPUT_DIR/${name}.log" 2>&1; then
+    # Run with timeout so stuck simulations always terminate and keep logs.
+    local run_status=0
+    timeout --signal=TERM --kill-after=15s "${timeout_s}s" \
+        env LD_LIBRARY_PATH=$ACADOS_DIR/lib:${LD_LIBRARY_PATH:-} ./"$name" \
+        > "$OUTPUT_DIR/${name}.log" 2>&1 || run_status=$?
+
+    if [ "$run_status" -eq 0 ]; then
         local results=$(grep -o 'Results:.*' "$OUTPUT_DIR/${name}.log" | head -1)
         printf "${GREEN}PASS${NC}  %s\n" "$results"
         PASS_COUNT=$((PASS_COUNT + 1))
+    elif [ "$run_status" -eq 124 ] || [ "$run_status" -eq 137 ]; then
+        {
+            echo ""
+            echo "[TIMEOUT] ${name} exceeded ${timeout_s}s and was terminated."
+            echo "[TIMEOUT] Partial logs preserved for diagnostics."
+        } >> "$OUTPUT_DIR/${name}.log"
+        printf "${RED}TIMEOUT${NC} (>${timeout_s}s)\n"
+        if $VERBOSE; then
+            grep -E 'FAIL|TIMEOUT|No progress|CTE|stuck|saturated' "$OUTPUT_DIR/${name}.log" | head -10 || true
+        fi
+        FAIL_COUNT=$((FAIL_COUNT + 1))
     else
         local results=$(grep -o 'Results:.*' "$OUTPUT_DIR/${name}.log" | head -1)
         local failures=$(grep 'FAIL' "$OUTPUT_DIR/${name}.log" | head -5)
@@ -131,6 +157,7 @@ echo "=============================================="
 echo " MPCC Test Suite — $TIMESTAMP"
 echo "=============================================="
 echo "Output: $OUTPUT_DIR"
+echo "Per-test timeout: ${TIMEOUT_SEC}s (heavy deployment tests +120s)"
 echo ""
 
 ROAD_GRAPH="../road_graph.cpp"

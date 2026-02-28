@@ -203,16 +203,20 @@ public:
         // Parameters — tuned to fix swerving (Feb 2026)
         // Key changes: startup phase re-enabled (3s), steering_rate_weight 3.0→1.5,
         // velocity tracking at k=0 only (matching reference R_ref structure)
-        this->declare_parameter("reference_velocity", 0.45);
-        this->declare_parameter("contour_weight", 8.0);
+        this->declare_parameter("reference_velocity", 0.30);
+        this->declare_parameter("contour_weight", 4.0);
         this->declare_parameter("lag_weight", 15.0);
         this->declare_parameter("horizon", 10);
         this->declare_parameter("boundary_weight", 0.0);
+        this->declare_parameter("max_velocity", 0.35);
+        this->declare_parameter("steering_rate_weight", 1.3);
+        this->declare_parameter("heading_weight", 0.0);
         this->declare_parameter("boundary_default_width", 0.22);
         this->declare_parameter("road_boundaries_config", std::string(""));
         this->declare_parameter("use_direct_motor", true);
         this->declare_parameter("use_state_estimator", false);
-        this->declare_parameter("steering_slew_rate", 1.0);  // rad/s command limiter (anti-oversteer)
+        this->declare_parameter("steering_slew_rate", 0.7);  // rad/s command limiter (anti-oversteer)
+        this->declare_parameter("speed_slew_rate", 2.0);     // m/s^2 command limiter
         // Startup weight overrides — during first 3s, use HIGHER steering damping
         // to prevent aggressive steering during path alignment. Previous values
         // (sr=0.05, contour=1.0) allowed 30x more aggressive steering → oversteering.
@@ -228,7 +232,7 @@ public:
         cfg.horizon = this->get_parameter("horizon").as_int();
         cfg.dt = 0.1;
         cfg.wheelbase = 0.256;
-        cfg.max_velocity = 0.55;  // Hard speed ceiling — close to v_ref to prevent solver hitting max
+        cfg.max_velocity = this->get_parameter("max_velocity").as_double();
         cfg.min_velocity = 0.0;   // Reference uses u_min=[0.0, ...]
         cfg.max_steering = 0.45;  // ±25.8° — hardware servo limit (ref uses π/6=30° but servo clips at 0.45)
         cfg.max_acceleration = 1.5;   // Reference has no explicit limit; allow fast response
@@ -239,7 +243,8 @@ public:
         cfg.velocity_weight = 15.0;  // Track v_ref strongly (ref: R_ref[0]=17.0)
         cfg.steering_weight = 0.05;   // Reference R_ref[1]=0.05, penalizes |δ| gently
         cfg.acceleration_weight = 0.01;  // Reference R_u[0]=0.005; near-zero for fast speed changes
-        cfg.steering_rate_weight = 1.1; // Match reference R_u[1]=1.1 exactly
+        cfg.steering_rate_weight = this->get_parameter("steering_rate_weight").as_double();
+        cfg.heading_weight = this->get_parameter("heading_weight").as_double();
         cfg.jerk_weight = 0.0;       // Reference has no jerk penalty
         cfg.robot_radius = 0.13;
         cfg.safety_margin = 0.10;
@@ -281,6 +286,7 @@ public:
 
         use_state_estimator_ = this->get_parameter("use_state_estimator").as_bool();
         steering_slew_rate_ = this->get_parameter("steering_slew_rate").as_double();
+        speed_slew_rate_ = this->get_parameter("speed_slew_rate").as_double();
 
         // CubicSplinePath (built when path received)
         spline_path_ = std::make_unique<acc::CubicSplinePath>();
@@ -425,6 +431,15 @@ public:
     }
 
 private:
+    // Keep heading continuous across +/-pi wrap so MPCC linearization
+    // does not see artificial 2*pi jumps near 180 deg turns.
+    static double unwrap_angle_near(double wrapped, double reference_unwrapped) {
+        double delta = wrapped - reference_unwrapped;
+        while (delta > M_PI) delta -= 2.0 * M_PI;
+        while (delta < -M_PI) delta += 2.0 * M_PI;
+        return reference_unwrapped + delta;
+    }
+
     void odom_callback(nav_msgs::msg::Odometry::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         odom_velocity_ = msg->twist.twist.linear.x;
@@ -432,8 +447,14 @@ private:
             state_x_ = msg->pose.pose.position.x;
             state_y_ = msg->pose.pose.position.y;
             auto& q = msg->pose.pose.orientation;
-            state_theta_ = std::atan2(2.0*(q.w*q.z + q.x*q.y),
-                                       1.0 - 2.0*(q.y*q.y + q.z*q.z));
+            double wrapped_theta = std::atan2(2.0*(q.w*q.z + q.x*q.y),
+                                              1.0 - 2.0*(q.y*q.y + q.z*q.z));
+            if (has_theta_unwrapped_) {
+                state_theta_ = unwrap_angle_near(wrapped_theta, state_theta_);
+            } else {
+                state_theta_ = wrapped_theta;
+                has_theta_unwrapped_ = true;
+            }
             state_v_ = msg->twist.twist.linear.x;
             has_odom_ = true;
         }
@@ -565,8 +586,14 @@ private:
             double raw_x = t.transform.translation.x;
             double raw_y = t.transform.translation.y;
             auto& q = t.transform.rotation;
-            double raw_theta = std::atan2(2.0*(q.w*q.z + q.x*q.y),
-                                           1.0 - 2.0*(q.y*q.y + q.z*q.z));
+            double wrapped_theta = std::atan2(2.0*(q.w*q.z + q.x*q.y),
+                                              1.0 - 2.0*(q.y*q.y + q.z*q.z));
+            double raw_theta = wrapped_theta;
+            if (has_theta_unwrapped_) {
+                raw_theta = unwrap_angle_near(wrapped_theta, state_theta_);
+            } else {
+                has_theta_unwrapped_ = true;
+            }
 
             // Estimate velocity from position change
             auto now = this->now().seconds();
@@ -588,18 +615,12 @@ private:
                 double dt = now - last_pose_time_;
                 if (dt > 0.005 && dt < 0.5) {
                     double dtheta = raw_theta - state_theta_;
-                    // Normalize to [-pi, pi]
-                    while (dtheta > M_PI) dtheta -= 2.0 * M_PI;
-                    while (dtheta < -M_PI) dtheta += 2.0 * M_PI;
 
                     double max_yaw_rate = 2.0;  // rad/s (2x physical max)
                     double max_dtheta = max_yaw_rate * dt;
                     if (std::abs(dtheta) > max_dtheta) {
                         double clamped = std::clamp(dtheta, -max_dtheta, max_dtheta);
                         double new_theta = state_theta_ + clamped;
-                        // Normalize
-                        while (new_theta > M_PI) new_theta -= 2.0 * M_PI;
-                        while (new_theta < -M_PI) new_theta += 2.0 * M_PI;
                         tf_heading_filter_active_ = true;
                         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                             "Heading filter: raw jump %.1f deg/step (max %.1f), clamped",
@@ -818,7 +839,7 @@ private:
             // On curves (κ=1.25): step = v_ref * exp(-0.5) * dt = 0.039m (40% tighter)
             // On tight curves (κ=2): step = v_ref * exp(-0.8) * dt = 0.029m (55% tighter)
             double curv = std::abs(refs[k].curvature);
-            double step_speed = v_ref * std::exp(-0.4 * curv);
+            double step_speed = v_ref * std::exp(-0.55 * curv);
             step_speed = std::max(step_speed, 0.10);
             s += step_speed * dt;
         }
@@ -891,7 +912,7 @@ private:
             }
 
             // Advance by curvature-adaptive speed (matching get_spline_path_refs)
-            double step_speed = v_ref * std::exp(-0.4 * curv);
+            double step_speed = v_ref * std::exp(-0.55 * curv);
             step_speed = std::max(step_speed, 0.10);
             s += step_speed * dt;
         }
@@ -1037,6 +1058,53 @@ private:
             stuck_timer_ = 0.0;
         } else {
             stuck_timer_ += config_.dt;
+            // If projection is pinned on self-near geometry but tracking error is
+            // small and vehicle is moving, advance progress by dead reckoning.
+            // This avoids getting trapped at a local closest-point minimum.
+            if (stuck_timer_ > PROGRESS_DEADRECKON_STUCK_S &&
+                state_v_ > PROGRESS_DEADRECKON_MIN_SPEED) {
+                double ct_now = std::abs(compute_cross_track_error());
+                double heading_err_now = 0.0;
+                if (spline_path_ && spline_path_->is_built()) {
+                    double tan_s = spline_path_->get_tangent(current_progress_);
+                    heading_err_now = acc::normalize_angle(state_theta_ - tan_s);
+                } else {
+                    heading_err_now = compute_heading_error();
+                }
+                if (ct_now < PROGRESS_DEADRECKON_MAX_CTE &&
+                    std::abs(heading_err_now) < PROGRESS_DEADRECKON_MAX_HEADING_ERR) {
+                    current_progress_ = std::min(
+                        path_total_len,
+                        current_progress_ + PROGRESS_DEADRECKON_GAIN * state_v_ * config_.dt);
+                    new_progress = current_progress_;
+                }
+            }
+            // If the vehicle is clearly moving but monotonic projection is pinned,
+            // re-anchor progress globally to avoid chasing stale references on
+            // self-near route sections.
+            if (stuck_timer_ > PROGRESS_RELOCALIZE_STUCK_S &&
+                std::abs(state_v_) > PROGRESS_RELOCALIZE_MIN_SPEED) {
+                double global_progress = current_progress_;
+                if (spline_path_ && spline_path_->is_built()) {
+                    global_progress = spline_path_->find_closest_progress(state_x_, state_y_);
+                } else {
+                    global_progress = ref_path_.find_closest_progress(state_x_, state_y_);
+                }
+                const double progress_jump = global_progress - current_progress_;
+                if (progress_jump > PROGRESS_RELOCALIZE_MIN_JUMP &&
+                    progress_jump < PROGRESS_RELOCALIZE_MAX_FORWARD_JUMP) {
+                    current_progress_ = global_progress;
+                    solver_.reset();
+                    state_delta_ = 0.0;
+                    stuck_timer_ = 0.0;
+                    char relocalize_msg[160];
+                    std::snprintf(relocalize_msg, sizeof(relocalize_msg),
+                                  "Progress relocalize: %.1f%% -> %.1f%%",
+                                  100.0 * new_progress / std::max(path_total_len, 1e-6),
+                                  100.0 * global_progress / std::max(path_total_len, 1e-6));
+                    log_event(relocalize_msg);
+                }
+            }
             if (stuck_timer_ > 5.0) {
                 RCLCPP_WARN(this->get_logger(),
                     "No progress for %.1fs (progress=%.1f%%, closest=%.1f%%)",
@@ -1082,7 +1150,10 @@ private:
         // vehicle speed and half of reference velocity. This prevents the horizon from
         // extending too far ahead at startup (when v≈0), which caused the solver to
         // see aggressive curves and command bang-bang steering oscillation.
-        double lookahead_v = std::max(state_v_, config_.reference_velocity * 0.5);
+        // Keep horizon spacing conservative in deployment: if we let lookahead grow
+        // with measured speed, the controller over-anticipates on self-near curves.
+        double lookahead_v =
+            std::clamp(state_v_, config_.reference_velocity * 0.4, config_.reference_velocity);
         std::vector<mpcc::PathRef> path_refs;
         if (spline_path_ && spline_path_->is_built()) {
             path_refs = get_spline_path_refs(
@@ -1174,7 +1245,18 @@ private:
         }
 
         v_cmd = std::clamp(v_cmd, config_.min_velocity, config_.max_velocity);
-        delta_cmd = std::clamp(delta_cmd, -config_.max_steering, config_.max_steering);
+        if (speed_slew_rate_ > 0.0) {
+            double max_dv = speed_slew_rate_ * config_.dt;
+            v_cmd = std::clamp(v_cmd, state_v_ - max_dv, state_v_ + max_dv);
+            v_cmd = std::clamp(v_cmd, config_.min_velocity, config_.max_velocity);
+        }
+        double steer_limit = config_.max_steering;
+        if (state_v_ > 0.55) {
+            // Keep full steering authority in normal operation; only clamp at
+            // speeds above configured mission limits to avoid unreachable curves.
+            steer_limit = std::min(steer_limit, HIGH_SPEED_STEER_LIMIT);
+        }
+        delta_cmd = std::clamp(delta_cmd, -steer_limit, steer_limit);
 
         // Apply a first-order steering slew-rate limit to prevent aggressive
         // command jumps that manifest as oversteer in deployment.
@@ -1183,7 +1265,7 @@ private:
             double lo = state_delta_ - max_step;
             double hi = state_delta_ + max_step;
             delta_cmd = std::clamp(delta_cmd, lo, hi);
-            delta_cmd = std::clamp(delta_cmd, -config_.max_steering, config_.max_steering);
+            delta_cmd = std::clamp(delta_cmd, -steer_limit, steer_limit);
         }
         slew_rate_clipped_ = (std::abs(delta_cmd - raw_delta_cmd_) > 0.001);
 
@@ -1306,6 +1388,7 @@ private:
               << " max_steer=" << config_.max_steering
               << " direct_motor=" << (use_direct_motor_ ? "true" : "false")
               << " steering_slew_rate=" << steering_slew_rate_
+              << " speed_slew_rate=" << speed_slew_rate_
               << " heading_filter=2.0rad/s" << "\n\n";
         }
         log_start_time_ = this->now().seconds();
@@ -1453,7 +1536,11 @@ private:
         }
 
         // Trigger 3: lane-edge excursion (CTE relative to right-lane centerline).
-        if (!should_request && ct_abs > REPLAN_LANE_EDGE_CTE) {
+        if (!should_request &&
+            REPLAN_ENABLE_LANE_EDGE &&
+            progress_pct > REPLAN_LANE_EDGE_MIN_PROGRESS_PCT &&
+            stuck_timer_ > REPLAN_LANE_EDGE_MIN_STUCK_S &&
+            ct_abs > REPLAN_LANE_EDGE_CTE) {
             if (sustained_lane_violation_start_ <= 0.0) {
                 sustained_lane_violation_start_ = now_s;
             } else if ((now_s - sustained_lane_violation_start_) > REPLAN_LANE_EDGE_DURATION_S) {
@@ -1468,6 +1555,7 @@ private:
         // This indicates the current local path segment is not recoverable with
         // the current warm-start and should be re-anchored from current pose.
         if (!should_request &&
+            REPLAN_ENABLE_SATURATED_RECOVERY &&
             stuck_timer_ > REPLAN_NO_PROGRESS_DURATION_S &&
             steering_saturated_count_ > REPLAN_SATURATION_COUNT_THRESHOLD) {
             should_request = true;
@@ -1475,7 +1563,10 @@ private:
         }
 
         // Trigger 5: hard no-progress timeout.
-        if (!should_request && stuck_timer_ > REPLAN_HARD_NO_PROGRESS_DURATION_S) {
+        if (!should_request &&
+            REPLAN_ENABLE_NO_PROGRESS &&
+            progress_pct > REPLAN_NO_PROGRESS_MIN_PROGRESS_PCT &&
+            stuck_timer_ > REPLAN_HARD_NO_PROGRESS_DURATION_S) {
             should_request = true;
             reason = "no_progress_timeout";
         }
@@ -1484,6 +1575,7 @@ private:
         // If progress keeps increasing while goal distance does not improve, we are
         // likely tracking the wrong branch of a self-near route.
         if (!should_request &&
+            REPLAN_ENABLE_GOAL_STALL &&
             progress_pct > REPLAN_GOAL_STALL_MIN_PROGRESS_PCT &&
             current_goal_distance_m_ > REPLAN_GOAL_STALL_MIN_GOAL_DIST_M &&
             goal_distance_stall_timer_ > REPLAN_GOAL_STALL_DURATION_S) {
@@ -1589,6 +1681,7 @@ private:
     // State (protected by mutex)
     std::mutex state_mutex_;
     double state_x_ = 0.0, state_y_ = 0.0, state_theta_ = 0.0;
+    bool has_theta_unwrapped_ = false;
     double state_v_ = 0.0, state_delta_ = 0.0;
     double odom_velocity_ = 0.0;
     bool has_odom_ = false;
@@ -1621,16 +1714,33 @@ private:
     static constexpr bool REPLAN_ENABLE_CTE = false;               // avoid route-thrash from CTE-triggered replans
     static constexpr double REPLAN_LANE_EDGE_CTE = 0.12;
     static constexpr double REPLAN_LANE_EDGE_DURATION_S = 1.0;
+    static constexpr double REPLAN_LANE_EDGE_MIN_PROGRESS_PCT = 70.0;
+    static constexpr double REPLAN_LANE_EDGE_MIN_STUCK_S = 2.0;
+    static constexpr bool REPLAN_ENABLE_LANE_EDGE = false;
     static constexpr double REPLAN_NO_PROGRESS_DURATION_S = 5.0;
-    static constexpr double REPLAN_HARD_NO_PROGRESS_DURATION_S = 8.0;
+    static constexpr double REPLAN_HARD_NO_PROGRESS_DURATION_S = 12.0;
+    static constexpr double REPLAN_NO_PROGRESS_MIN_PROGRESS_PCT = 20.0;
     static constexpr int REPLAN_SATURATION_COUNT_THRESHOLD = 30;
+    static constexpr bool REPLAN_ENABLE_NO_PROGRESS = false;
+    static constexpr bool REPLAN_ENABLE_SATURATED_RECOVERY = false;
     static constexpr double REPLAN_GOAL_STALL_MIN_PROGRESS_PCT = 60.0;
     static constexpr double REPLAN_GOAL_STALL_MIN_GOAL_DIST_M = 1.2;
     static constexpr double REPLAN_GOAL_STALL_DURATION_S = 4.0;
+    static constexpr bool REPLAN_ENABLE_GOAL_STALL = false;
+    static constexpr double PROGRESS_RELOCALIZE_STUCK_S = 2.0;
+    static constexpr double PROGRESS_RELOCALIZE_MIN_SPEED = 0.10;
+    static constexpr double PROGRESS_RELOCALIZE_MIN_JUMP = 0.15;
+    static constexpr double PROGRESS_RELOCALIZE_MAX_FORWARD_JUMP = 3.0;
+    static constexpr double PROGRESS_DEADRECKON_STUCK_S = 1.0;
+    static constexpr double PROGRESS_DEADRECKON_MIN_SPEED = 0.05;
+    static constexpr double PROGRESS_DEADRECKON_MAX_CTE = 0.20;
+    static constexpr double PROGRESS_DEADRECKON_MAX_HEADING_ERR = 0.9;
+    static constexpr double PROGRESS_DEADRECKON_GAIN = 1.0;
     static constexpr double GOAL_DISTANCE_IMPROVE_EPS = 0.03;
     static constexpr double RESUME_STABILIZE_S = 1.5;              // seconds
     static constexpr double RESUME_MAX_SPEED = 0.28;               // m/s
     static constexpr double RESUME_MAX_STEERING = 0.24;            // rad (~14 deg)
+    static constexpr double HIGH_SPEED_STEER_LIMIT = 0.40;         // rad (~22.9 deg)
 
     bool mission_hold_ = false;
     std::string traffic_state_json_;
@@ -1649,7 +1759,8 @@ private:
 
     // Direct motor mode
     bool use_direct_motor_ = true;
-    double steering_slew_rate_ = 1.0;  // rad/s
+    double steering_slew_rate_ = 0.7;  // rad/s
+    double speed_slew_rate_ = 2.0;     // m/s^2
     bool slew_rate_clipped_ = false;
     double raw_delta_cmd_ = 0.0;
 

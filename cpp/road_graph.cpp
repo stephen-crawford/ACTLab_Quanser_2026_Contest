@@ -751,52 +751,42 @@ RoadGraph::RoadGraph(double ds) : ds_(ds) {
         for (auto& xv : loop_x_) {
             xv *= 1.01;
         }
+        // Determine mission split indices on the centerline geometry first.
+        // The right-lane offset can move the first pickup pass farther away from
+        // the raw pickup point and accidentally select the second pass.
+        pickup_idx_ = find_first_local_min(loop_x_, loop_y_, PICKUP_X, PICKUP_Y, 0.8, 0);
+        dropoff_idx_ = find_first_local_min(loop_x_, loop_y_, DROPOFF_X, DROPOFF_Y, 1.0, pickup_idx_);
+        hub_idx_ = static_cast<int>(loop_x_.size()) - 1;
 
-        offset_path_to_right_lane_center(loop_x_, loop_y_, 0.15);
-
-        // Find waypoint indices closest to key locations on the shifted right-lane
-        // path so leg slicing stays contiguous.
-        // The loop path passes near Pickup TWICE (once via node 20 outbound,
-        // once returning via inner track). Use find_first_local_min to get the
-        // FIRST pass for correct mission leg ordering: Hub -> Pickup -> Dropoff -> Hub.
-        pickup_idx_ = find_first_local_min(loop_x_, loop_y_, PICKUP_X, PICKUP_Y, 0.5, 0);
-        // Search for dropoff only AFTER pickup (it comes second in the loop)
-        dropoff_idx_ = find_first_local_min(loop_x_, loop_y_, DROPOFF_X, DROPOFF_Y, 0.5, pickup_idx_);
-        hub_idx_ = static_cast<int>(loop_x_.size()) - 1;  // end of loop
+        // Shift the path to the right-lane center for controller tracking.
+        // Keep the split indices from centerline ordering (same waypoint order).
+        offset_path_to_right_lane_center(loop_x_, loop_y_, 0.05);
     }
 
-    // Also generate individual route segments for the mission manager
-    // (sliced from the loop path at the pickup/dropoff waypoint indices)
+    // Generate mission legs by slicing the canonical loop at pickup/dropoff.
     if (!loop_x_.empty() && pickup_idx_ >= 0 && dropoff_idx_ >= 0) {
-        // hub_to_pickup: from start (hub) to pickup index
-        {
-            int end = std::min(pickup_idx_ + 1, static_cast<int>(loop_x_.size()));
-            routes_["hub_to_pickup"] = {
-                std::vector<double>(loop_x_.begin(), loop_x_.begin() + end),
-                std::vector<double>(loop_y_.begin(), loop_y_.begin() + end)
+        int n = static_cast<int>(loop_x_.size());
+
+        int hp_end = std::min(pickup_idx_ + 1, n);
+        routes_["hub_to_pickup"] = {
+            std::vector<double>(loop_x_.begin(), loop_x_.begin() + hp_end),
+            std::vector<double>(loop_y_.begin(), loop_y_.begin() + hp_end)
+        };
+
+        int pd_start = pickup_idx_;
+        int pd_end = std::min(dropoff_idx_ + 1, n);
+        if (pd_start < pd_end) {
+            routes_["pickup_to_dropoff"] = {
+                std::vector<double>(loop_x_.begin() + pd_start, loop_x_.begin() + pd_end),
+                std::vector<double>(loop_y_.begin() + pd_start, loop_y_.begin() + pd_end)
             };
         }
 
-        // pickup_to_dropoff: from pickup index to dropoff index
-        {
-            int start = pickup_idx_;
-            int end = std::min(dropoff_idx_ + 1, static_cast<int>(loop_x_.size()));
-            if (start < end) {
-                routes_["pickup_to_dropoff"] = {
-                    std::vector<double>(loop_x_.begin() + start, loop_x_.begin() + end),
-                    std::vector<double>(loop_y_.begin() + start, loop_y_.begin() + end)
-                };
-            }
-        }
-
-        // dropoff_to_hub: from dropoff index to end (hub)
-        {
-            int start = dropoff_idx_;
-            routes_["dropoff_to_hub"] = {
-                std::vector<double>(loop_x_.begin() + start, loop_x_.end()),
-                std::vector<double>(loop_y_.begin() + start, loop_y_.end())
-            };
-        }
+        int dh_start = dropoff_idx_;
+        routes_["dropoff_to_hub"] = {
+            std::vector<double>(loop_x_.begin() + dh_start, loop_x_.end()),
+            std::vector<double>(loop_y_.begin() + dh_start, loop_y_.end())
+        };
     }
 }
 
@@ -846,8 +836,11 @@ RoadGraph::plan_path_for_mission_leg(const std::string& route_name,
     int segment_start = start_idx;
     int segment_len = n - segment_start;
 
-    if (segment_len < 5) {
-        segment_start = std::max(0, n - 20);
+    // If we're too close to the route end, keep at least ~1m of path to avoid
+    // near-zero-length local plans that can trap the controller in no-progress loops.
+    int min_segment_pts = std::min(n, 1000);  // ds=0.001 -> ~1.0m
+    if (segment_len < min_segment_pts) {
+        segment_start = std::max(0, n - min_segment_pts);
         segment_len = n - segment_start;
     }
 
@@ -938,8 +931,9 @@ RoadGraph::plan_path_from_pose(double cur_x, double cur_y,
     int n = static_cast<int>(best_route->x.size());
     int segment_len = n - start_idx;
 
-    if (segment_len < 5) {
-        start_idx = std::max(0, n - 20);
+    int min_segment_pts = std::min(n, 1000);  // ds=0.001 -> ~1.0m
+    if (segment_len < min_segment_pts) {
+        start_idx = std::max(0, n - min_segment_pts);
         segment_len = n - start_idx;
     }
 

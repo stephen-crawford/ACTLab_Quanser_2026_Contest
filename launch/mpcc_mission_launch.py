@@ -30,13 +30,13 @@ def generate_launch_description():
     # Launch arguments — tuned via full-mission simulation (Feb 2026)
     reference_velocity_arg = DeclareLaunchArgument(
         'reference_velocity',
-        default_value='0.45',
+        default_value='0.30',
         description='Target velocity (m/s) - lower for tighter tracking'
     )
 
     contour_weight_arg = DeclareLaunchArgument(
         'contour_weight',
-        default_value='8.0',
+        default_value='4.0',
         description='Weight for path contouring (lateral) error. Intermediate: 4 too weak, 15 too aggressive.'
     )
 
@@ -72,8 +72,13 @@ def generate_launch_description():
 
     steering_slew_rate_arg = DeclareLaunchArgument(
         'steering_slew_rate',
-        default_value='1.0',
+        default_value='0.7',
         description='Maximum steering command slew rate (rad/s) to reduce oversteer from abrupt command jumps'
+    )
+    speed_slew_rate_arg = DeclareLaunchArgument(
+        'speed_slew_rate',
+        default_value='2.0',
+        description='Maximum speed command slew rate (m/s^2) to reduce accel spikes'
     )
 
     use_dashboard_arg = DeclareLaunchArgument(
@@ -124,6 +129,7 @@ def generate_launch_description():
             'use_direct_motor': LaunchConfiguration('use_direct_motor'),
             'use_state_estimator': LaunchConfiguration('use_state_estimator'),
             'steering_slew_rate': LaunchConfiguration('steering_slew_rate'),
+            'speed_slew_rate': LaunchConfiguration('speed_slew_rate'),
         }],
     )
 
@@ -198,6 +204,7 @@ def generate_launch_description():
         use_direct_motor_arg,
         use_state_estimator_arg,
         steering_slew_rate_arg,
+        speed_slew_rate_arg,
         use_dashboard_arg,
         use_overlay_arg,
         odom_from_tf_node,

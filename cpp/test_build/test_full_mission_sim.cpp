@@ -86,6 +86,7 @@ struct TracePoint {
     double x_ql, y_ql;     // QLabs frame
     double theta;
     double v_meas, v_cmd, delta_cmd;
+    double v_ref_k0;
     double cte;
     double heading_err;
     double progress_pct;
@@ -105,18 +106,18 @@ mpcc::Config make_deployment_config() {
     cfg.horizon = 10;
     cfg.dt = 0.1;
     cfg.wheelbase = 0.256;
-    cfg.max_velocity = 0.55;
+    cfg.max_velocity = 0.35;
     cfg.min_velocity = 0.0;
     cfg.max_steering = 0.45;  // hardware servo limit
     cfg.max_acceleration = 1.5;
     cfg.max_steering_rate = 1.5;
-    cfg.reference_velocity = 0.45;
-    cfg.contour_weight = 15.0;
+    cfg.reference_velocity = 0.30;
+    cfg.contour_weight = 4.0;
     cfg.lag_weight = 10.0;
     cfg.velocity_weight = 15.0;
     cfg.steering_weight = 0.05;
     cfg.acceleration_weight = 0.01;
-    cfg.steering_rate_weight = 1.5;
+    cfg.steering_rate_weight = 1.3;
     cfg.heading_weight = 0.0;
     cfg.progress_weight = 1.0;
     cfg.jerk_weight = 0.0;
@@ -302,7 +303,8 @@ LegResult run_leg(
         // (matches mpcc_controller_node.cpp::get_spline_path_refs exactly)
         std::vector<mpcc::PathRef> refs(cfg.horizon + 1);
         double s = progress;
-        double lookahead_v = std::max(state(3), cfg.reference_velocity * 0.5);
+        double lookahead_v =
+            std::clamp(state(3), cfg.reference_velocity * 0.4, cfg.reference_velocity);
         for (int k = 0; k <= cfg.horizon; k++) {
             s = std::clamp(s, 0.0, total_len - 0.001);
             double rx, ry, ct, st;
@@ -312,7 +314,7 @@ LegResult run_leg(
             refs[k].curvature = spline.get_curvature(s);
             // Curvature-adaptive spacing (matching controller)
             double curv = std::abs(refs[k].curvature);
-            double step_speed = lookahead_v * std::exp(-0.4 * curv);
+            double step_speed = lookahead_v * std::exp(-0.55 * curv);
             step_speed = std::max(step_speed, 0.10);
             s += step_speed * cfg.dt;
         }
@@ -331,6 +333,8 @@ LegResult run_leg(
 
         double v_cmd = sol.v_cmd;
         double delta_cmd = sol.delta_cmd;
+        const double v_ref_k0 =
+            std::max(0.10, lookahead_v * std::exp(-0.55 * std::abs(refs[0].curvature)));
 
         // Decelerate near goal
         double remaining = total_len - progress;
@@ -400,6 +404,7 @@ LegResult run_leg(
         tp_out.v_meas = state(3);
         tp_out.v_cmd = v_cmd;
         tp_out.delta_cmd = delta_cmd;
+        tp_out.v_ref_k0 = v_ref_k0;
         tp_out.cte = cte;
         tp_out.heading_err = heading_err;
         tp_out.progress_pct = 100.0 * progress / total_len;
@@ -534,6 +539,7 @@ LegResult run_leg_with_events(
             tp_out.theta = state(2);
             tp_out.v_meas = state(3); tp_out.v_cmd = 0.0;
             tp_out.delta_cmd = state(4);
+            tp_out.v_ref_k0 = 0.0;
             double cp2 = spline.find_closest_progress(state(0), state(1));
             double rx2, ry2; spline.get_position(cp2, rx2, ry2);
             tp_out.cte = std::hypot(state(0)-rx2, state(1)-ry2);
@@ -556,7 +562,8 @@ LegResult run_leg_with_events(
         // (matches mpcc_controller_node.cpp::get_spline_path_refs exactly)
         std::vector<mpcc::PathRef> refs(cfg.horizon + 1);
         double s = progress;
-        double lookahead_v = std::max(state(3), cfg.reference_velocity * 0.5);
+        double lookahead_v =
+            std::clamp(state(3), cfg.reference_velocity * 0.4, cfg.reference_velocity);
         for (int k = 0; k <= cfg.horizon; k++) {
             s = std::clamp(s, 0.0, total_len - 0.001);
             double rx, ry, ct, st;
@@ -565,7 +572,7 @@ LegResult run_leg_with_events(
             refs[k].cos_theta = ct;  refs[k].sin_theta = st;
             refs[k].curvature = spline.get_curvature(s);
             double curv = std::abs(refs[k].curvature);
-            double step_speed = lookahead_v * std::exp(-0.4 * curv);
+            double step_speed = lookahead_v * std::exp(-0.55 * curv);
             step_speed = std::max(step_speed, 0.10);
             s += step_speed * cfg.dt;
         }
@@ -576,6 +583,8 @@ LegResult run_leg_with_events(
 
         double v_cmd = sol.v_cmd;
         double delta_cmd = sol.delta_cmd;
+        const double v_ref_k0 =
+            std::max(0.10, lookahead_v * std::exp(-0.55 * std::abs(refs[0].curvature)));
 
         // Decelerate near goal
         double remaining = total_len - progress;
@@ -633,6 +642,7 @@ LegResult run_leg_with_events(
         tp_out.theta = state(2);
         tp_out.v_meas = state(3); tp_out.v_cmd = v_cmd;
         tp_out.delta_cmd = delta_cmd;
+        tp_out.v_ref_k0 = v_ref_k0;
         tp_out.cte = cte; tp_out.heading_err = heading_err;
         tp_out.progress_pct = 100.0 * progress / total_len;
         tp_out.curvature = spline.get_curvature(cp);
@@ -750,7 +760,7 @@ int main() {
     std::string csv_path = "full_mission_sim.csv";
     {
         std::ofstream f(csv_path);
-        f << "elapsed_s,x,y,theta,v_meas,v_cmd,delta_cmd,progress_pct,"
+        f << "elapsed_s,x,y,theta,v_meas,v_cmd,delta_cmd,progress_pct,eff_v_ref_k0,"
              "solve_time_us,cross_track_err,heading_err,n_obstacles,"
              "motion_enabled,traffic_stop\n";
         for (auto& tp : all_trace) {
@@ -761,6 +771,7 @@ int main() {
               << std::setprecision(4) << tp.v_meas << "," << tp.v_cmd << ","
               << tp.delta_cmd << ","
               << std::setprecision(1) << tp.progress_pct << ","
+              << std::setprecision(4) << tp.v_ref_k0 << ","
               << "50,"  // solve_time_us (mock)
               << std::setprecision(4) << tp.cte << "," << tp.heading_err << ","
               << "0,1,0\n";
@@ -879,7 +890,7 @@ int main() {
     // Write traffic CSV
     {
         std::ofstream f("full_mission_traffic.csv");
-        f << "elapsed_s,x,y,theta,v_meas,v_cmd,delta_cmd,progress_pct,"
+        f << "elapsed_s,x,y,theta,v_meas,v_cmd,delta_cmd,progress_pct,eff_v_ref_k0,"
              "solve_time_us,cross_track_err,heading_err,n_obstacles,"
              "motion_enabled,traffic_stop\n";
         for (auto& tp : traffic_trace) {
@@ -889,6 +900,7 @@ int main() {
               << tp.theta << "," << tp.v_meas << "," << tp.v_cmd << ","
               << tp.delta_cmd << ","
               << std::setprecision(1) << tp.progress_pct << ","
+              << std::setprecision(4) << tp.v_ref_k0 << ","
               << "50," << std::setprecision(4) << tp.cte << "," << tp.heading_err << ","
               << "0,1,0\n";
         }

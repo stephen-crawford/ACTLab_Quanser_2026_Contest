@@ -221,10 +221,16 @@ def generate_planned_path():
 # Read MPCC CSV log
 # ---------------------------------------------------------------------------
 def read_mpcc_csv(csv_path):
-    """Read MPCC CSV log and return structured data."""
+    """Read MPCC CSV log and return structured data.
+
+    Trims stuck-drift data: when progress stops advancing for >5s with steering
+    saturated, Cartographer SLAM drifts the position estimate. This data is not
+    representative of the actual vehicle position and corrupts the report.
+    """
     data = {
         'elapsed_s': [], 'x': [], 'y': [], 'theta': [],
         'v_meas': [], 'v_cmd': [], 'cross_track_err': [],
+        'progress_pct': [], 'delta_cmd': [], 'eff_v_ref_k0': [],
     }
 
     with open(csv_path, 'r') as f:
@@ -238,11 +244,40 @@ def read_mpcc_csv(csv_path):
                 data['v_meas'].append(float(row['v_meas']))
                 data['v_cmd'].append(float(row['v_cmd']))
                 data['cross_track_err'].append(float(row['cross_track_err']))
+                data['progress_pct'].append(float(row.get('progress_pct', 0)))
+                data['delta_cmd'].append(float(row.get('delta_cmd', 0)))
+                v_ref = row.get('eff_v_ref_k0', '')
+                data['eff_v_ref_k0'].append(float(v_ref) if v_ref not in ('', None) else np.nan)
             except (KeyError, ValueError):
                 continue
 
     for key in data:
         data[key] = np.array(data[key])
+
+    # Trim stuck-drift data: detect when progress stops advancing
+    if len(data['progress_pct']) > 10:
+        prog = data['progress_pct']
+        elapsed = data['elapsed_s']
+        max_prog = 0.0
+        last_advancing_idx = len(prog) - 1
+
+        for i in range(len(prog)):
+            if prog[i] > max_prog + 0.05:  # progress advanced by >0.05%
+                max_prog = prog[i]
+                last_advancing_idx = i
+
+        # If progress stopped well before the end, trim
+        stuck_duration = elapsed[-1] - elapsed[last_advancing_idx] if last_advancing_idx < len(elapsed) - 1 else 0
+        if stuck_duration > 5.0 and last_advancing_idx < len(prog) - 20:
+            # Keep a small buffer after last progress (5s or 50 points)
+            buffer_pts = min(50, len(prog) - last_advancing_idx - 1)
+            trim_idx = last_advancing_idx + buffer_pts
+            n_trimmed = len(prog) - trim_idx
+            print(f"  Trimming {n_trimmed} stuck-drift points "
+                  f"({stuck_duration:.0f}s of SLAM drift after progress stalled at "
+                  f"{max_prog:.1f}%)")
+            for key in data:
+                data[key] = data[key][:trim_idx]
 
     return data
 
@@ -356,13 +391,26 @@ def generate_figure(csv_path, data, planned_paths):
     max_cte = np.max(cte) if len(cte) > 0 else 0
     avg_cte = np.mean(cte) if len(cte) > 0 else 0
     avg_speed = np.mean(np.abs(data['v_meas'])) if len(data['v_meas']) > 0 else 0
+    avg_v_ref = np.nanmean(data['eff_v_ref_k0']) if len(data['eff_v_ref_k0']) > 0 else np.nan
+    v_ref_rmse = np.nan
+    if len(data['eff_v_ref_k0']) > 0:
+        valid = np.isfinite(data['eff_v_ref_k0'])
+        if np.any(valid):
+            err = data['v_meas'][valid] - data['eff_v_ref_k0'][valid]
+            v_ref_rmse = np.sqrt(np.mean(err * err))
+    avg_abs_delta_deg = np.degrees(np.mean(np.abs(data['delta_cmd']))) if len(data['delta_cmd']) > 0 else 0
 
     stats_text = (
         f"Duration: {duration:.1f}s\n"
         f"Max CTE: {max_cte:.3f}m\n"
         f"Avg CTE: {avg_cte:.3f}m\n"
-        f"Avg speed: {avg_speed:.2f} m/s"
+        f"Avg speed: {avg_speed:.2f} m/s\n"
+        f"Avg |delta|: {avg_abs_delta_deg:.1f} deg"
     )
+    if np.isfinite(avg_v_ref):
+        stats_text += f"\nAvg v_ref: {avg_v_ref:.2f} m/s"
+    if np.isfinite(v_ref_rmse):
+        stats_text += f"\nVtrack RMSE: {v_ref_rmse:.3f} m/s"
     ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))

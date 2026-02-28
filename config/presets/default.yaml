@@ -10,11 +10,15 @@
 # --- MPCC parameters (deployment-tuned Feb 2026) ---
 # contour=8: intermediate between 4 (too weak, CTE 0.673m) and 15 (too aggressive, swerving)
 # lag=15: strong progress to prevent circling
-reference_velocity: 0.45
-contour_weight: 8.0
+reference_velocity: 0.30
+contour_weight: 4.0
 lag_weight: 15.0
 horizon: 10
 boundary_weight: 0.0
+max_velocity: 0.35
+steering_rate_weight: 1.3
+heading_weight: 0.0
 use_direct_motor: true
 use_state_estimator: false
-steering_slew_rate: 1.0
+steering_slew_rate: 0.7
+speed_slew_rate: 2.0

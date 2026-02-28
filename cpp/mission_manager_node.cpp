@@ -886,6 +886,69 @@ private:
             align_path_to_vehicle_heading(mx, my, (*pose)[0], (*pose)[1], (*pose)[2]);
         }
 
+        // Replan safety gate: route endpoint must be near mission target.
+        // If the leg-sliced route snaps to a wrong branch, try a goal-directed
+        // fallback path before publishing.
+        if (!mx.empty() && !my.empty()) {
+            double end_err = std::hypot(mx.back() - leg.target_x, my.back() - leg.target_y);
+            if (end_err > 1.0) {
+                double goal_qx = 0.0, goal_qy = 0.0;
+                acc::map_to_qlabs_2d(leg.target_x, leg.target_y, tp_, goal_qx, goal_qy);
+                auto goal_path = road_graph_->plan_path(cur_qx, cur_qy, goal_qx, goal_qy);
+                if (goal_path && goal_path->first.size() >= 2) {
+                    auto alt_qx = goal_path->first;
+                    auto alt_qy = goal_path->second;
+                    std::vector<double> alt_mx, alt_my;
+                    acc::qlabs_path_to_map(alt_qx, alt_qy, tp_, alt_mx, alt_my);
+                    double alt_end_err = std::hypot(alt_mx.back() - leg.target_x,
+                                                    alt_my.back() - leg.target_y);
+                    if (alt_end_err <= 1.0) {
+                        RCLCPP_WARN(this->get_logger(),
+                            "Road-graph leg path endpoint %.2fm from target; "
+                            "switching to goal-directed fallback (%.2fm)",
+                            end_err, alt_end_err);
+                        qx = std::move(alt_qx);
+                        qy = std::move(alt_qy);
+                        mx = std::move(alt_mx);
+                        my = std::move(alt_my);
+                        end_err = alt_end_err;
+                    }
+                }
+                if (end_err > 1.0) {
+                    if (end_err <= 3.0) {
+                        // Bridge the final gap to the exact mission target so the
+                        // controller cannot get trapped at a near-but-wrong endpoint.
+                        const double bx0 = mx.back();
+                        const double by0 = my.back();
+                        int n_bridge = std::max(10, static_cast<int>(std::ceil(end_err / 0.05)));
+                        for (int i = 1; i <= n_bridge; ++i) {
+                            double a = static_cast<double>(i) / static_cast<double>(n_bridge);
+                            mx.push_back(bx0 + a * (leg.target_x - bx0));
+                            my.push_back(by0 + a * (leg.target_y - by0));
+                        }
+                        RCLCPP_WARN(this->get_logger(),
+                            "Road-graph endpoint %.2fm from target for %s; appended %d-point bridge",
+                            end_err, leg.label.c_str(), n_bridge);
+                    } else {
+                        RCLCPP_WARN(this->get_logger(),
+                            "Rejected road-graph path for %s: endpoint %.2fm from target (max 3.0m bridge)",
+                            leg.label.c_str(), end_err);
+                        if (current_path_) {
+                            RCLCPP_WARN(this->get_logger(),
+                                "Keeping previous path to avoid replan thrash");
+                            return;
+                        }
+                        if (mpcc_mode_) {
+                            RCLCPP_WARN(this->get_logger(),
+                                "Falling back to nav2 ComputePathToPose for %s", leg.label.c_str());
+                            send_compute_path_goal(leg_idx);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // Build Path message
         auto path_msg = nav_msgs::msg::Path();
         path_msg.header.frame_id = "map";
