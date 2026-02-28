@@ -1451,6 +1451,11 @@ private:
             reason = "no_progress_steering_saturated";
         }
 
+        if (!should_request && stuck_timer_ > REPLAN_HARD_NO_PROGRESS_DURATION_S) {
+            should_request = true;
+            reason = "no_progress_timeout";
+        }
+
         if (should_request) {
             char buf[512];
             std::snprintf(buf, sizeof(buf),
@@ -1580,6 +1585,7 @@ private:
     static constexpr double REPLAN_MIN_STUCK_TIME_FOR_CTE = 2.0;   // s
     static constexpr bool REPLAN_ENABLE_CTE = false;               // avoid route-thrash from CTE-triggered replans
     static constexpr double REPLAN_NO_PROGRESS_DURATION_S = 5.0;
+    static constexpr double REPLAN_HARD_NO_PROGRESS_DURATION_S = 8.0;
     static constexpr int REPLAN_SATURATION_COUNT_THRESHOLD = 30;
     static constexpr double RESUME_STABILIZE_S = 1.5;              // seconds
     static constexpr double RESUME_MAX_SPEED = 0.28;               // m/s
