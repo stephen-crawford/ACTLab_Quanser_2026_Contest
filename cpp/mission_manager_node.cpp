@@ -1122,10 +1122,13 @@ private:
         last_resume_time_ = now_sec();
         set_led(LED_DRIVING);
 
-        if (mpcc_mode_ && current_path_) {
-            RCLCPP_INFO(this->get_logger(), "Republishing existing path");
+        if (mpcc_mode_ && road_graph_ && leg_index_ < static_cast<int>(legs_.size())) {
+            // Re-anchor to current pose after stop events. Re-publishing a stale path
+            // can leave the controller with a mismatched warm-start near sharp turns.
+            RCLCPP_INFO(this->get_logger(), "Regenerating path from current pose after resume");
             state_ = MissionState::GO_LEG;
-            path_pub_->publish(*current_path_);
+            send_road_graph_path(leg_index_);
+            last_path_pub_time_ = now_sec();
         } else {
             state_ = MissionState::GO_LEG;
             send_goal(leg_index_);

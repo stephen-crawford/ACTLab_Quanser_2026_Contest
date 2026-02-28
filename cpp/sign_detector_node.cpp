@@ -34,6 +34,7 @@
 #include <cv_bridge/cv_bridge.h>
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <mutex>
 #include <sstream>
@@ -106,6 +107,11 @@ struct DetectorConfig {
 
     // Spatial cooldown for stop signs (pixel Y difference for "new" sign)
     int stop_sign_bbox_threshold = 50;
+
+    // Stop-sign geometric gating to avoid side-of-road false triggers in turns.
+    // Require the sign to be reasonably centered in the image and not too high.
+    double stop_sign_center_tolerance = 0.35;  // normalized x offset from center
+    double stop_sign_min_y_fraction = 0.30;    // bbox center y / image height
 };
 
 // ============================================================================
@@ -198,6 +204,7 @@ private:
 
         // Store image dimensions for bearing computation
         image_width_ = frame.cols;
+        image_height_ = frame.rows;
 
         // Mask out bottom of image (vehicle hood)
         int mask_rows = static_cast<int>(frame.rows * cfg_.mask_bottom_fraction);
@@ -577,7 +584,14 @@ private:
         // --- Stop sign logic ---
         if (best_stop.type == SignType::STOP_SIGN) {
             // Check if this is a different stop sign (spatial cooldown)
+            int bbox_center_x = best_stop.bbox.x + best_stop.bbox.width / 2;
             int bbox_center_y = best_stop.bbox.y + best_stop.bbox.height / 2;
+            double half_w = std::max(1.0, image_width_ * 0.5);
+            double x_offset_norm = std::abs(bbox_center_x - image_width_ * 0.5) / half_w;
+            double y_frac = static_cast<double>(bbox_center_y) / std::max(1, image_height_);
+            bool stop_geom_ok =
+                (x_offset_norm <= cfg_.stop_sign_center_tolerance) &&
+                (y_frac >= cfg_.stop_sign_min_y_fraction);
             bool is_new_sign = !last_stop_bbox_valid_ ||
                 std::abs(bbox_center_y - last_stop_bbox_y_) > cfg_.stop_sign_bbox_threshold;
 
@@ -585,7 +599,7 @@ private:
             bool on_cooldown = stop_sign_cooldown_start_ > 0 &&
                 (now - stop_sign_cooldown_start_) < cfg_.stop_sign_cooldown;
 
-            if ((is_new_sign || !on_cooldown) && !on_cooldown) {
+            if ((is_new_sign || !on_cooldown) && !on_cooldown && stop_geom_ok) {
                 stop_detect_frames_++;
                 if (stop_detect_frames_ >= cfg_.detection_threshold && !at_stop_sign_) {
                     at_stop_sign_ = true;
@@ -596,6 +610,8 @@ private:
                     RCLCPP_INFO(this->get_logger(), "STOP SIGN detected at %.2fm",
                                 best_stop.distance);
                 }
+            } else if (!stop_geom_ok) {
+                stop_detect_frames_ = 0;
             }
         } else {
             stop_detect_frames_ = 0;
@@ -932,6 +948,7 @@ private:
     double cone_bbox_center_x_ = 0.0;    // Bbox center x in image pixels
     int cone_image_width_ = 640;         // Image width for bearing computation
     int image_width_ = 640;              // Stored from last frame
+    int image_height_ = 480;             // Stored from last frame
 
     // Clear hysteresis
     int clear_frames_ = 0;

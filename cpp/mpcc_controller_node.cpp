@@ -330,9 +330,15 @@ public:
                     // intermittent detections from resetting auto-resume timer)
                     motion_enable_consecutive_++;
                     if (motion_enable_consecutive_ >= MOTION_ENABLE_HYSTERESIS) {
+                        bool was_disabled = !motion_enabled_;
                         motion_enabled_ = true;
                         motion_disabled_time_ = 0.0;
                         motion_enable_consecutive_ = 0;
+                        if (was_disabled) {
+                            resume_reanchor_pending_ = true;
+                            resume_stabilize_until_ = now_s + RESUME_STABILIZE_S;
+                            motion_resume_cooldown_time_ = now_s;
+                        }
                     }
                     // Don't reset motion_disabled_time_ on single true messages
                 } else {
@@ -956,6 +962,8 @@ private:
                 motion_enabled_ = true;
                 motion_disabled_time_ = 0.0;
                 motion_resume_cooldown_time_ = now_s;
+                resume_reanchor_pending_ = true;
+                resume_stabilize_until_ = now_s + RESUME_STABILIZE_S;
             } else if (!detected_obstacles_.empty() || !mapped_obstacles_.empty()) {
                 // Obstacles detected: don't fully stop, let the MPCC solver handle
                 // avoidance. Apply speed limit instead.
@@ -991,6 +999,21 @@ private:
         } else {
             new_progress = ref_path_.find_closest_progress(state_x_, state_y_);
             path_total_len = ref_path_.total_length;
+        }
+        if (resume_reanchor_pending_) {
+            // Re-anchor immediately after resume to avoid stale warm-start from
+            // pre-stop dynamics in high-curvature segments.
+            solver_.reset();
+            current_progress_ = new_progress;
+            state_delta_ = 0.0;
+            start_time_ = this->now();
+            stuck_timer_ = 0.0;
+            solver_failure_count_ = 0;
+            steering_saturated_count_ = 0;
+            sustained_cross_track_start_ = 0.0;
+            replan_requested_ = false;
+            resume_reanchor_pending_ = false;
+            log_event("Resume re-anchor: reset warm-start and progress");
         }
         // Strictly monotonic: only advance, never go backward.
         // NEVER reset progress backward — it causes the solver to chase old references,
@@ -1122,6 +1145,13 @@ private:
         // Apply obstacle speed limit: slow down but keep solver steering active
         if (obstacle_speed_limit_active) {
             v_cmd = std::min(v_cmd, 0.20);  // Creep at 0.20 m/s while avoiding
+        }
+
+        // Post-resume stabilization: avoid immediate large steering reversals.
+        double now_s_cmd = this->now().seconds();
+        if (now_s_cmd < resume_stabilize_until_) {
+            v_cmd = std::min(v_cmd, RESUME_MAX_SPEED);
+            delta_cmd = std::clamp(delta_cmd, -RESUME_MAX_STEERING, RESUME_MAX_STEERING);
         }
 
         v_cmd = std::clamp(v_cmd, config_.min_velocity, config_.max_velocity);
@@ -1513,6 +1543,8 @@ private:
     double motion_resume_cooldown_s_ = 10.0;  // Ignore re-disabling for 10s after auto-resume (must outlast sign_detector 8s suppression)
     int motion_enable_consecutive_ = 0;       // Consecutive true messages needed to re-enable
     static constexpr int MOTION_ENABLE_HYSTERESIS = 2;  // ~200ms at 100ms publish rate (fast re-enable)
+    bool resume_reanchor_pending_ = false;
+    double resume_stabilize_until_ = 0.0;
     int steering_saturated_count_ = 0;
     static constexpr int SATURATION_RESET_THRESHOLD = 10;  // Reset warm-start after 10 cycles (~0.5s) of saturated steering
 
@@ -1529,6 +1561,9 @@ private:
     static constexpr double REPLAN_MAX_SPEED_FOR_CTE = 0.25;       // m/s
     static constexpr double REPLAN_MIN_STUCK_TIME_FOR_CTE = 2.0;   // s
     static constexpr bool REPLAN_ENABLE_CTE = false;               // avoid route-thrash from CTE-triggered replans
+    static constexpr double RESUME_STABILIZE_S = 1.5;              // seconds
+    static constexpr double RESUME_MAX_SPEED = 0.28;               // m/s
+    static constexpr double RESUME_MAX_STEERING = 0.24;            // rad (~14 deg)
 
     bool mission_hold_ = false;
     std::string traffic_state_json_;
