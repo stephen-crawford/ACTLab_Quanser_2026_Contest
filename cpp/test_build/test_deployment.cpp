@@ -192,6 +192,8 @@ struct DeploymentPlant {
 struct DeploymentResult {
     double max_cte = 0.0;
     double avg_cte = 0.0;
+    int lane_violation_steps = 0;
+    double max_lane_overrun = 0.0;
     int steps = 0;
     double progress_frac = 0.0;
     double avg_speed = 0.0;
@@ -208,6 +210,19 @@ struct DeploymentResult {
     std::vector<double> trace_cost;
     std::vector<double> trace_startup_progress;
 };
+
+static double compute_signed_cte_to_path(const acc::CubicSplinePath& spline,
+                                         double x, double y)
+{
+    double s = spline.find_closest_progress(x, y);
+    s = std::clamp(s, 0.0, spline.total_length() - 1e-3);
+    double rx, ry, ct, st;
+    spline.get_path_reference(s, rx, ry, ct, st);
+    // left normal from tangent (ct, st)
+    double nx = -st;
+    double ny = ct;
+    return (x - rx) * nx + (y - ry) * ny;
+}
 
 // =========================================================================
 // Run full deployment simulation on a mission leg
@@ -316,6 +331,10 @@ DeploymentResult run_deployment_sim(
     int consecutive_failures = 0;
     constexpr int MAX_CONSECUTIVE_FAILURES = 5;
     constexpr double CTE_KILL_THRESHOLD = 1.0;  // 1m = clearly diverged
+    constexpr double LANE_HALF_WIDTH = 0.15;    // right-lane half width (0.30m lane)
+    constexpr double VEHICLE_HALF_WIDTH = 0.08;
+    constexpr double EDGE_MARGIN = 0.01;
+    constexpr double LANE_KEEPING_LIMIT = LANE_HALF_WIDTH - VEHICLE_HALF_WIDTH - EDGE_MARGIN;
 
     for (int step = 0; step < max_steps; step++) {
         if (progress >= total_len - 0.1) break;
@@ -382,16 +401,20 @@ DeploymentResult run_deployment_sim(
             progress = new_progress;
         }
 
-        // Compute CTE
-        double cp = spline.find_closest_progress(state(0), state(1));
-        double rx, ry;
-        spline.get_position(cp, rx, ry);
-        double cte = std::hypot(state(0) - rx, state(1) - ry);
+        // Compute CTE with respect to right-lane centerline (signed lateral distance)
+        double cte_signed = compute_signed_cte_to_path(spline, state(0), state(1));
+        double cte = std::abs(cte_signed);
 
         res.max_cte = std::max(res.max_cte, cte);
         cte_sum += cte;
         speed_sum += actual_v;
         res.steps++;
+
+        // Lane-edge violation metric: exceeded drivable corridor around right-lane center.
+        if (cte > LANE_KEEPING_LIMIT) {
+            res.lane_violation_steps++;
+            res.max_lane_overrun = std::max(res.max_lane_overrun, cte - LANE_KEEPING_LIMIT);
+        }
 
         // Early kill: CTE exceeds threshold — vehicle clearly diverged
         if (cte > CTE_KILL_THRESHOLD) {
@@ -474,14 +497,18 @@ void test_hub_to_pickup() {
     auto res = run_deployment_sim(route->first, route->second,
                                    "hub_to_pickup", 600, true);
 
-    std::printf("(max_cte=%.3f avg_cte=%.3f speed=%.2f steps=%d prog=%.1f%%) ",
-        res.max_cte, res.avg_cte, res.avg_speed, res.steps, res.progress_frac*100);
+    std::printf("(max_cte=%.3f avg_cte=%.3f lane_viol=%d max_overrun=%.3f speed=%.2f steps=%d prog=%.1f%%) ",
+        res.max_cte, res.avg_cte, res.lane_violation_steps, res.max_lane_overrun,
+        res.avg_speed, res.steps, res.progress_frac*100);
 
     write_csv(res, "deployment_hub_to_pickup.csv");
 
     if (!res.success) FAIL("Solver failed during simulation");
     if (res.max_cte > 0.30)
         FAIL("max CTE %.3f > 0.30m", res.max_cte);
+    if (res.lane_violation_steps > 0)
+        FAIL("lane violations detected: %d steps (max overrun %.3fm)",
+             res.lane_violation_steps, res.max_lane_overrun);
     if (res.progress_frac < 0.80)
         FAIL("progress %.1f%% < 80%%", res.progress_frac * 100);
     PASS();
@@ -498,14 +525,18 @@ void test_pickup_to_dropoff() {
     auto res = run_deployment_sim(route->first, route->second,
                                    "pickup_to_dropoff", 600, true);
 
-    std::printf("(max_cte=%.3f avg_cte=%.3f speed=%.2f steps=%d prog=%.1f%%) ",
-        res.max_cte, res.avg_cte, res.avg_speed, res.steps, res.progress_frac*100);
+    std::printf("(max_cte=%.3f avg_cte=%.3f lane_viol=%d max_overrun=%.3f speed=%.2f steps=%d prog=%.1f%%) ",
+        res.max_cte, res.avg_cte, res.lane_violation_steps, res.max_lane_overrun,
+        res.avg_speed, res.steps, res.progress_frac*100);
 
     write_csv(res, "deployment_pickup_to_dropoff.csv");
 
     if (!res.success) FAIL("Solver failed during simulation");
     if (res.max_cte > 0.30)
         FAIL("max CTE %.3f > 0.30m", res.max_cte);
+    if (res.lane_violation_steps > 0)
+        FAIL("lane violations detected: %d steps (max overrun %.3fm)",
+             res.lane_violation_steps, res.max_lane_overrun);
     if (res.progress_frac < 0.80)
         FAIL("progress %.1f%% < 80%%", res.progress_frac * 100);
     PASS();
@@ -522,14 +553,18 @@ void test_dropoff_to_hub() {
     auto res = run_deployment_sim(route->first, route->second,
                                    "dropoff_to_hub", 800, true);
 
-    std::printf("(max_cte=%.3f avg_cte=%.3f speed=%.2f steps=%d prog=%.1f%%) ",
-        res.max_cte, res.avg_cte, res.avg_speed, res.steps, res.progress_frac*100);
+    std::printf("(max_cte=%.3f avg_cte=%.3f lane_viol=%d max_overrun=%.3f speed=%.2f steps=%d prog=%.1f%%) ",
+        res.max_cte, res.avg_cte, res.lane_violation_steps, res.max_lane_overrun,
+        res.avg_speed, res.steps, res.progress_frac*100);
 
     write_csv(res, "deployment_dropoff_to_hub.csv");
 
     if (!res.success) FAIL("Solver failed during simulation");
     if (res.max_cte > 0.30)
         FAIL("max CTE %.3f > 0.30m", res.max_cte);
+    if (res.lane_violation_steps > 0)
+        FAIL("lane violations detected: %d steps (max overrun %.3fm)",
+             res.lane_violation_steps, res.max_lane_overrun);
     if (res.progress_frac < 0.80)
         FAIL("progress %.1f%% < 80%%", res.progress_frac * 100);
     PASS();
@@ -565,6 +600,8 @@ void test_full_mission() {
 
     double total_max_cte = 0.0;
     double total_avg_cte = 0.0;
+    int total_lane_violations = 0;
+    double total_max_lane_overrun = 0.0;
     int total_steps = 0;
 
     struct LegInfo {
@@ -590,18 +627,24 @@ void test_full_mission() {
 
         total_max_cte = std::max(total_max_cte, res.max_cte);
         total_avg_cte += res.avg_cte * res.steps;
+        total_lane_violations += res.lane_violation_steps;
+        total_max_lane_overrun = std::max(total_max_lane_overrun, res.max_lane_overrun);
         total_steps += res.steps;
 
-        std::printf("\n    %s: max=%.3f avg=%.3f prog=%.0f%% ",
-            leg.name.c_str(), res.max_cte, res.avg_cte, res.progress_frac*100);
+        std::printf("\n    %s: max=%.3f avg=%.3f lane_viol=%d overrun=%.3f prog=%.0f%% ",
+            leg.name.c_str(), res.max_cte, res.avg_cte,
+            res.lane_violation_steps, res.max_lane_overrun, res.progress_frac*100);
     }
 
     total_avg_cte /= std::max(1, total_steps);
-    std::printf("\n    TOTAL: max_cte=%.3f avg_cte=%.3f ",
-        total_max_cte, total_avg_cte);
+    std::printf("\n    TOTAL: max_cte=%.3f avg_cte=%.3f lane_viol=%d max_overrun=%.3f ",
+        total_max_cte, total_avg_cte, total_lane_violations, total_max_lane_overrun);
 
     if (total_max_cte > 0.30)
         FAIL("Mission max CTE %.3f > 0.30m", total_max_cte);
+    if (total_lane_violations > 0)
+        FAIL("Mission lane violations: %d steps (max overrun %.3fm)",
+             total_lane_violations, total_max_lane_overrun);
     PASS();
 }
 
@@ -646,9 +689,10 @@ void test_resampling_consistency() {
 
     std::printf("(deterministic, gaps: hp→pd=%.3fm pd→dh=%.3fm) ", gap_hp_pd, gap_pd_dh);
     // Legs start from the closest waypoint to the current position,
-    // so gaps depend on path geometry near waypoints. Allow 200mm.
-    if (gap_hp_pd > 0.200) FAIL("hp→pd gap %.3fm > 200mm", gap_hp_pd);
-    if (gap_pd_dh > 0.200) FAIL("pd→dh gap %.3fm > 200mm", gap_pd_dh);
+    // and right-lane-center references can shift approach/departure sides at
+    // handoff waypoints. Allow 300mm continuity gap.
+    if (gap_hp_pd > 0.300) FAIL("hp→pd gap %.3fm > 300mm", gap_hp_pd);
+    if (gap_pd_dh > 0.300) FAIL("pd→dh gap %.3fm > 300mm", gap_pd_dh);
     PASS();
 }
 

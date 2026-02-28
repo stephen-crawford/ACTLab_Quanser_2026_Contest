@@ -532,8 +532,11 @@ private:
                           waypoints.size(), ref_path_.total_length);
             log_event(buf);
         } else {
-            // Same path re-published — just update progress, keep warm-start
-            current_progress_ = ref_path_.find_closest_progress(state_x_, state_y_);
+            // Same path re-published — keep warm-start and preserve monotonic progress.
+            // On self-near paths, nearest-point can jump backward across close-by segments;
+            // allowing regressions here causes route thrash and steering saturation.
+            double p = ref_path_.find_closest_progress(state_x_, state_y_);
+            if (p > current_progress_) current_progress_ = p;
         }
     }
 
@@ -1374,7 +1377,8 @@ private:
         // - do not trigger near end-of-leg where local route tangents can flip
         // - require low speed + stagnation, otherwise let MPCC recover naturally
         bool near_goal = progress_pct > REPLAN_NEAR_GOAL_PROGRESS_PCT;
-        bool can_replan_for_cte = !near_goal &&
+        bool can_replan_for_cte = REPLAN_ENABLE_CTE &&
+                                  !near_goal &&
                                   (state_v_ < REPLAN_MAX_SPEED_FOR_CTE) &&
                                   (stuck_timer_ > REPLAN_MIN_STUCK_TIME_FOR_CTE);
         if (ct_abs > REPLAN_CROSS_TRACK_THRESHOLD && can_replan_for_cte) {
@@ -1524,6 +1528,7 @@ private:
     static constexpr double REPLAN_NEAR_GOAL_PROGRESS_PCT = 85.0;  // disable CTE replans near goal
     static constexpr double REPLAN_MAX_SPEED_FOR_CTE = 0.25;       // m/s
     static constexpr double REPLAN_MIN_STUCK_TIME_FOR_CTE = 2.0;   // s
+    static constexpr bool REPLAN_ENABLE_CTE = false;               // avoid route-thrash from CTE-triggered replans
 
     bool mission_hold_ = false;
     std::string traffic_state_json_;

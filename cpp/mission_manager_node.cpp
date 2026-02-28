@@ -1434,6 +1434,16 @@ private:
 
             // Goal timeout
             if (goal_sent_time_ > 0 && (now_sec() - goal_sent_time_) > goal_timeout_s_) {
+                if (mpcc_mode_) {
+                    // In MPCC mode, keep tracking instead of forcing recovery timeout loops.
+                    // The controller publishes explicit "Goal reached" and mission manager
+                    // also checks TF distance each cycle.
+                    goal_sent_time_ = now_sec();
+                    RCLCPP_WARN(this->get_logger(),
+                        "Goal timeout ignored in MPCC mode — continuing tracking");
+                    log_behavior("GOAL_TIMEOUT_IGNORED_MPCC", "continuing");
+                    break;
+                }
                 RCLCPP_WARN(this->get_logger(), "Goal timeout (%.0fs)", goal_timeout_s_);
                 log_behavior("GOAL_TIMEOUT", "");
                 goal_sent_time_ = 0;

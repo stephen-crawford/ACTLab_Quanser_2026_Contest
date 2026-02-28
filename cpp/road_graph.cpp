@@ -32,6 +32,37 @@ static double signed_angle_between(double v1x, double v1y, double v2x, double v2
     return wrap_to_pi(std::atan2(v2y, v2x) - std::atan2(v1y, v1x));
 }
 
+// Shift a centerline path to right-lane centerline.
+// For right-hand traffic, "right" is -left-normal, where left-normal = (-ty, tx).
+static void offset_path_to_right_lane_center(std::vector<double>& x,
+                                             std::vector<double>& y,
+                                             double offset_m)
+{
+    if (x.size() < 2 || y.size() != x.size() || std::abs(offset_m) < 1e-9) return;
+    std::vector<double> ox(x.size()), oy(y.size());
+    for (size_t i = 0; i < x.size(); ++i) {
+        size_t ip = (i == 0) ? 0 : i - 1;
+        size_t in = std::min(i + 1, x.size() - 1);
+        double tx = x[in] - x[ip];
+        double ty = y[in] - y[ip];
+        double tlen = std::hypot(tx, ty);
+        if (tlen < 1e-9) {
+            ox[i] = x[i];
+            oy[i] = y[i];
+            continue;
+        }
+        tx /= tlen;
+        ty /= tlen;
+        // left normal = (-ty, tx), right normal = (ty, -tx)
+        double nx_r = ty;
+        double ny_r = -tx;
+        ox[i] = x[i] + offset_m * nx_r;
+        oy[i] = y[i] + offset_m * ny_r;
+    }
+    x.swap(ox);
+    y.swap(oy);
+}
+
 // -------------------------------------------------------------------------
 // SCSPath
 // -------------------------------------------------------------------------
@@ -646,7 +677,10 @@ RoadGraph::RoadGraph(double ds) : ds_(ds) {
             xv *= 1.01;
         }
 
-        // Find waypoint indices closest to key locations.
+        offset_path_to_right_lane_center(loop_x_, loop_y_, 0.15);
+
+        // Find waypoint indices closest to key locations on the shifted right-lane
+        // path so leg slicing stays contiguous.
         // The loop path passes near Pickup TWICE (once via node 20 outbound,
         // once returning via inner track). Use find_first_local_min to get the
         // FIRST pass for correct mission leg ordering: Hub -> Pickup -> Dropoff -> Hub.
